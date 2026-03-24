@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+venv/
+.venv/
+env/
+.env.local
+serviceAccountKey.json
+*.json.key
+.pytest_cache/
+*.egg-info/
+dist/
+build/

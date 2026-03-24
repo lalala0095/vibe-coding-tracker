@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+google-cloud-firestore
+google-cloud-storage
+google-auth
+requests
+PyJWT
+python-multipart
+python-dotenv
+pytz
