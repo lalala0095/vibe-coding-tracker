@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import clients, goals, models, projects, tasks, trackers, sessions, auth_router
+from routers import clients, goals, models, projects, tasks, trackers, sessions, settings, invoices, auth_router
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -54,6 +54,8 @@ app.include_router(projects.router)
 app.include_router(tasks.router)
 app.include_router(trackers.router)
 app.include_router(sessions.router)
+app.include_router(settings.router)
+app.include_router(invoices.router)
 
 # ---------------------------------------------------------------------------
 # Health endpoint
