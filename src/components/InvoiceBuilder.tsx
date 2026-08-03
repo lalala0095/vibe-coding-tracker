@@ -218,6 +218,8 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
   const [lines, setLines] = useState<InvoiceLine[]>([]);
   const [currency, setCurrency] = useState(settings?.default_currency ?? 'SGD');
   const [runningCount, setRunningCount] = useState(0);
+  const [claimedCount, setClaimedCount] = useState(0);
+  const [claimedInvoices, setClaimedInvoices] = useState<string[]>([]);
   const [previewed, setPreviewed] = useState(false);
   const [staleSource, setStaleSource] = useState(false);
 
@@ -243,6 +245,8 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
     setLines([]);
     setPreviewed(false);
     setRunningCount(0);
+    setClaimedCount(0);
+    setClaimedInvoices([]);
   };
 
   const toggleProject = (id: string) => {
@@ -269,6 +273,11 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
       setLines(preview.lines ?? []);
       setCurrency(preview.currency || selectedClient?.currency || 'SGD');
       setRunningCount(preview.running_entry_count ?? 0);
+      setClaimedCount(preview.claimed_entry_count ?? 0);
+      // Distinct invoice numbers across every claimed line, first-seen order.
+      setClaimedInvoices([
+        ...new Set((preview.lines ?? []).flatMap((l) => l.claimed_by ?? [])),
+      ]);
       setPreviewed(true);
       setStaleSource(false);
     } catch {
@@ -430,6 +439,21 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
                 {runningCount} time {runningCount === 1 ? 'entry is' : 'entries are'} still running
                 and {runningCount === 1 ? 'was' : 'were'} excluded. Set an end time or manual hours
                 on {runningCount === 1 ? 'it' : 'them'} to bill {runningCount === 1 ? 'it' : 'them'}.
+              </p>
+            </div>
+          )}
+
+          {/* Already billed elsewhere (§12). This is the only build-time signal
+              the user gets — the entry badge names one claimant, not all. */}
+          {claimedCount > 0 && (
+            <div className="flex items-start gap-2.5 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2.5">
+              <svg className="w-4 h-4 text-red-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+              </svg>
+              <p className="text-xs text-red-300 leading-relaxed">
+                {claimedCount} time {claimedCount === 1 ? 'entry is' : 'entries are'} already billed
+                on {claimedInvoices.length > 0 ? claimedInvoices.join(', ') : 'another invoice'}.
+                Invoicing {claimedCount === 1 ? 'it' : 'them'} again will charge the same hours twice.
               </p>
             </div>
           )}

@@ -246,9 +246,17 @@ export interface InvoicePreviewResponse {
   currency: string;
   period_start: string;
   period_end: string;
-  lines: InvoiceLine[];
+  lines: InvoicePreviewLine[];
   subtotal: number;
   running_entry_count: number;  // entries with no end_time and no manual hours
+  claimed_entry_count: number;  // entries already billed on another invoice
+}
+
+// Build-time facts about a previewed line. Deliberately not on InvoiceLine —
+// a stored invoice never carries them. Always present; 0 / [] when clean.
+export interface InvoicePreviewLine extends InvoiceLine {
+  claimed_entry_count: number;
+  claimed_by: string[];         // invoice numbers already claiming these entries
 }
 
 export interface CreateInvoicePayload {
