@@ -1,7 +1,8 @@
 import { Link } from 'react-router-dom';
 import { useAuth } from '../auth';
 
-export type NavKey = 'sessions' | 'tasks' | 'trackers' | 'invoices' | 'models' | 'manage';
+export type NavKey =
+  | 'sessions' | 'tasks' | 'time' | 'trackers' | 'invoices' | 'models' | 'manage';
 
 interface Props {
   active: NavKey;
@@ -12,6 +13,7 @@ interface Props {
 const NAV_LINKS: { key: NavKey; to: string; label: string }[] = [
   { key: 'sessions', to: '/dashboard', label: 'Sessions' },
   { key: 'tasks',    to: '/tasks',     label: 'Tasks' },
+  { key: 'time',     to: '/time',      label: 'Time Entries' },
   { key: 'trackers', to: '/trackers',  label: 'Trackers' },
   { key: 'invoices', to: '/invoices',  label: 'Invoices' },
   { key: 'models',   to: '/models',    label: 'Models' },
