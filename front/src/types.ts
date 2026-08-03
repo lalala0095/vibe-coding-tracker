@@ -139,6 +139,10 @@ export interface Session {
   duration_minutes: number | null;
   hours: number | null;          // manual override; null = fall back to computed
   billable: boolean;
+  // An entry can be claimed by more than one invoice. The lists are the truth;
+  // the scalars are derived from the most recent claim, for display only.
+  invoice_ids: string[];
+  invoice_numbers: string[];
   invoice_id: string | null;
   invoice_number: string | null;
   effective_hours: number;       // hours ?? duration_minutes/60 ?? 0
