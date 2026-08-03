@@ -7,6 +7,7 @@ import ModelsPage from './pages/ModelsPage';
 import TasksPage from './pages/TasksPage';
 import ClientsProjectsPage from './pages/ClientsProjectsPage';
 import TrackersPage from './pages/TrackersPage';
+import TimeEntriesPage from './pages/TimeEntriesPage';
 import InvoicesPage from './pages/InvoicesPage';
 import InvoiceSettingsPage from './pages/InvoiceSettingsPage';
 import InvoicePrintPage from './components/InvoicePrintView';
@@ -51,6 +52,14 @@ function AppRoutes() {
           element={
             <ProtectedRoute>
               <ClientsProjectsPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/time"
+          element={
+            <ProtectedRoute>
+              <TimeEntriesPage />
             </ProtectedRoute>
           }
         />
