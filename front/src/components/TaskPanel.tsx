@@ -3,6 +3,7 @@ import type { Task, Project, Model, Goal, TaskStatus, TaskPriority, CreateTaskPa
 import { getTasks, updateTask, deleteTask, createTask, getGoals, createGoal, updateGoal, deleteGoal } from '../api';
 import TaskForm from './TaskForm';
 import GoalForm from './GoalForm';
+import TimeEntryList from './TimeEntryList';
 
 interface Props {
   task: Task;
@@ -451,6 +452,9 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
             </ul>
           )}
         </div>
+
+        {/* Time Entries — the `sessions` API. Not the "Sessions" block below. */}
+        <TimeEntryList taskId={task.id} />
 
         {/* Sessions */}
         <div>

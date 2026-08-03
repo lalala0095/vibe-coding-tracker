@@ -42,3 +42,61 @@
     overflow: hidden;
   }
 }
+
+/* ===========================================================================
+   Invoice print / PDF
+   ---------------------------------------------------------------------------
+   Printing goes through the browser — no PDF library, no server-side renderer.
+   The invoice document (.invoice-sheet) is already light-on-white on screen, so
+   the preview inside the dark app shell matches the paper. These rules only
+   strip the on-screen framing and fix pagination; they are scoped to the sheet
+   and do not affect the rest of the app.
+   =========================================================================== */
+
+@page {
+  size: A4;
+  margin: 14mm;
+}
+
+@media print {
+  /* The app shell is dark. Paper is not. */
+  html,
+  body {
+    background: #ffffff !important;
+    color: #0f172a !important;
+  }
+
+  /* Let the document fill the @page box instead of sitting on a screen sheet. */
+  .invoice-sheet {
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+
+  /* Repeat the line-table header at the top of every printed page. */
+  .invoice-sheet thead {
+    display: table-header-group;
+  }
+
+  .invoice-sheet tfoot {
+    display: table-footer-group;
+  }
+
+  /* Never split a line row, the totals block or the footer across a page. */
+  .invoice-sheet tr,
+  .invoice-break-avoid {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* Browsers drop background fills when printing; keep the badge and rules. */
+  .invoice-sheet,
+  .invoice-sheet * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}

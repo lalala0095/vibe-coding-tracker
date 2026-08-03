@@ -4,6 +4,9 @@ import type {
   Client, Project, Task, CreateTaskPayload, UpdateTaskPayload,
   Tracker, CreateTrackerPayload, UpdateTrackerPayload,
   Session, CreateSessionPayload, UpdateSessionPayload,
+  Invoice, InvoiceStatus, InvoicePreviewRequest, InvoicePreviewResponse,
+  CreateInvoicePayload, UpdateInvoicePayload,
+  InvoiceSettings, UpdateInvoiceSettingsPayload,
 } from './types';
 
 const apiClient = axios.create({
@@ -94,8 +97,23 @@ export async function getClients(): Promise<Client[]> {
   return res.data;
 }
 
-export async function createClient(name: string): Promise<Client> {
-  const res = await apiClient.post<Client>('/clients', { name });
+export interface ClientOptions {
+  default_rate?: number | null;  // pass null to clear
+  currency?: string;             // server defaults to "SGD"
+  billing_email?: string;        // pass "null" to clear
+  billing_address?: string;      // pass "null" to clear
+}
+
+export async function createClient(name: string, options?: ClientOptions): Promise<Client> {
+  const res = await apiClient.post<Client>('/clients', { name, ...options });
+  return res.data;
+}
+
+export async function updateClient(
+  id: string,
+  payload: { name?: string } & ClientOptions
+): Promise<Client> {
+  const res = await apiClient.put<Client>(`/clients/${id}`, payload);
   return res.data;
 }
 
@@ -111,8 +129,24 @@ export async function getProjects(clientId?: string): Promise<Project[]> {
   return res.data;
 }
 
-export async function createProject(name: string, clientId: string): Promise<Project> {
-  const res = await apiClient.post<Project>('/projects', { name, client_id: clientId });
+export interface ProjectOptions {
+  rate?: number | null;  // pass null to clear
+}
+
+export async function createProject(
+  name: string,
+  clientId: string,
+  options?: ProjectOptions
+): Promise<Project> {
+  const res = await apiClient.post<Project>('/projects', { name, client_id: clientId, ...options });
+  return res.data;
+}
+
+export async function updateProject(
+  id: string,
+  payload: { name?: string; client_id?: string } & ProjectOptions
+): Promise<Project> {
+  const res = await apiClient.put<Project>(`/projects/${id}`, payload);
   return res.data;
 }
 
@@ -222,6 +256,12 @@ export async function deleteTracker(id: string): Promise<void> {
 export async function getSessions(params?: {
   task_id?: string;
   tracker_id?: string;
+  client_id?: string;
+  project_id?: string;
+  date_from?: string;        // "YYYY-MM-DD"
+  date_to?: string;          // "YYYY-MM-DD"
+  billable?: boolean;
+  uninvoiced_only?: boolean;
 }): Promise<Session[]> {
   const res = await apiClient.get<Session[]>('/sessions', { params });
   return res.data;
@@ -244,4 +284,58 @@ export async function updateSession(id: string, payload: UpdateSessionPayload): 
 
 export async function deleteSession(id: string): Promise<void> {
   await apiClient.delete(`/sessions/${id}`);
+}
+
+// ── Invoices ──────────────────────────────────────────────────────────────────
+
+export async function getInvoices(params?: {
+  client_id?: string;
+  status?: string;
+}): Promise<Invoice[]> {
+  const res = await apiClient.get<Invoice[]>('/invoices', { params });
+  return res.data;
+}
+
+export async function getInvoice(id: string): Promise<Invoice> {
+  const res = await apiClient.get<Invoice>(`/invoices/${id}`);
+  return res.data;
+}
+
+// Builds draft lines from time entries without persisting anything.
+export async function previewInvoice(payload: InvoicePreviewRequest): Promise<InvoicePreviewResponse> {
+  const res = await apiClient.post<InvoicePreviewResponse>('/invoices/preview', payload);
+  return res.data;
+}
+
+export async function createInvoice(payload: CreateInvoicePayload): Promise<Invoice> {
+  const res = await apiClient.post<Invoice>('/invoices', payload);
+  return res.data;
+}
+
+export async function updateInvoice(id: string, payload: UpdateInvoicePayload): Promise<Invoice> {
+  const res = await apiClient.put<Invoice>(`/invoices/${id}`, payload);
+  return res.data;
+}
+
+export async function updateInvoiceStatus(id: string, status: InvoiceStatus): Promise<Invoice> {
+  const res = await apiClient.patch<Invoice>(`/invoices/${id}/status`, { status });
+  return res.data;
+}
+
+export async function deleteInvoice(id: string): Promise<void> {
+  await apiClient.delete(`/invoices/${id}`);
+}
+
+// ── Invoice settings ──────────────────────────────────────────────────────────
+
+export async function getInvoiceSettings(): Promise<InvoiceSettings> {
+  const res = await apiClient.get<InvoiceSettings>('/settings/invoice');
+  return res.data;
+}
+
+export async function updateInvoiceSettings(
+  payload: UpdateInvoiceSettingsPayload
+): Promise<InvoiceSettings> {
+  const res = await apiClient.put<InvoiceSettings>('/settings/invoice', payload);
+  return res.data;
 }
