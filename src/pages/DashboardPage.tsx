@@ -1,8 +1,8 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Link } from 'react-router-dom';
 import { useAuth } from '../auth';
 import { getGoals, getModels, getTasks, createGoal } from '../api';
 import type { Goal, Model, Task } from '../types';
+import AppNav from '../components/AppNav';
 import GoalCard from '../components/GoalCard';
 import GoalPanel from '../components/GoalPanel';
 import GoalForm from '../components/GoalForm';
@@ -20,7 +20,7 @@ export default function DashboardPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [sortDir, setSortDir] = useState<'desc' | 'asc'>('desc');
 
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -44,10 +44,6 @@ export default function DashboardPage() {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
-
-  const handleLogout = () => {
-    logout();
-  };
 
   const handleCreate = async (data: {
     model_id: string;
@@ -97,89 +93,7 @@ export default function DashboardPage() {
 
   return (
     <div className="min-h-screen bg-slate-950 flex flex-col">
-      {/* ── Navigation Header ── */}
-      <header className="sticky top-0 z-40 bg-slate-950/90 backdrop-blur-sm border-b border-slate-800 shrink-0">
-        <div className="max-w-5xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
-          {/* Left: brand */}
-          <div className="flex items-center gap-3">
-            <div
-              className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-600 to-indigo-600
-                         flex items-center justify-center shrink-0"
-            >
-              <svg
-                className="w-4 h-4 text-white"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={2}
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"
-                />
-              </svg>
-            </div>
-            <span className="text-base font-semibold text-slate-100 hidden sm:block">
-              Vibe Coding Tracker
-            </span>
-          </div>
-
-          {/* Right: nav links + user */}
-          <nav className="flex items-center gap-1">
-            <Link
-              to="/dashboard"
-              className="px-3 py-1.5 text-sm text-slate-100 bg-slate-800 rounded-lg transition-colors font-medium"
-            >
-              Sessions
-            </Link>
-            <Link
-              to="/tasks"
-              className="px-3 py-1.5 text-sm text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded-lg transition-colors"
-            >
-              Tasks
-            </Link>
-            <Link
-              to="/models"
-              className="px-3 py-1.5 text-sm text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded-lg transition-colors"
-            >
-              Models
-            </Link>
-            <Link
-              to="/trackers"
-              className="px-3 py-1.5 text-sm text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded-lg transition-colors"
-            >
-              Trackers
-            </Link>
-            <Link
-              to="/manage"
-              className="px-3 py-1.5 text-sm text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded-lg transition-colors"
-            >
-              Clients &amp; Projects
-            </Link>
-
-            {user?.picture ? (
-              <img
-                src={user.picture}
-                alt={user.name ?? 'User'}
-                className="w-8 h-8 rounded-full border border-slate-700 ml-1"
-              />
-            ) : (
-              <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-xs text-slate-300 ml-1">
-                {user?.name?.[0] ?? user?.email?.[0] ?? '?'}
-              </div>
-            )}
-
-            <button
-              onClick={handleLogout}
-              className="px-3 py-1.5 text-sm text-slate-400 hover:text-red-400
-                         hover:bg-slate-800 rounded-lg transition-colors"
-            >
-              Sign out
-            </button>
-          </nav>
-        </div>
-      </header>
+      <AppNav active="sessions" />
 
       <div className="flex flex-1 overflow-hidden">
       <main className="flex-1 min-w-0 overflow-y-auto">

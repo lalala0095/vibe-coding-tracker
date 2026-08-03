@@ -7,6 +7,9 @@ import ModelsPage from './pages/ModelsPage';
 import TasksPage from './pages/TasksPage';
 import ClientsProjectsPage from './pages/ClientsProjectsPage';
 import TrackersPage from './pages/TrackersPage';
+import InvoicesPage from './pages/InvoicesPage';
+import InvoiceSettingsPage from './pages/InvoiceSettingsPage';
+import InvoicePrintPage from './components/InvoicePrintView';
 import ProtectedRoute from './components/ProtectedRoute';
 
 function AppRoutes() {
@@ -56,6 +59,30 @@ function AppRoutes() {
           element={
             <ProtectedRoute>
               <TrackersPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/invoices"
+          element={
+            <ProtectedRoute>
+              <InvoicesPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/invoices/settings"
+          element={
+            <ProtectedRoute>
+              <InvoiceSettingsPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/invoices/:id/print"
+          element={
+            <ProtectedRoute>
+              <InvoicePrintPage />
             </ProtectedRoute>
           }
         />
