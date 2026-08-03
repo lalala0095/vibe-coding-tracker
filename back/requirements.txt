@@ -1,4 +1,5 @@
 fastapi
+pydantic>=2
 uvicorn[standard]
 google-cloud-firestore
 google-cloud-storage
