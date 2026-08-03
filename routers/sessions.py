@@ -163,6 +163,7 @@ def _doc_to_session(doc) -> SessionResponse:
     start_time = data.get("start_time", "")
     end_time = data.get("end_time")
     hours = data.get("hours")
+    invoice_ids, invoice_numbers = invoice_claims(data)
     return SessionResponse(
         id=doc.id,
         task_id=data.get("task_id", ""),
@@ -293,7 +294,7 @@ async def list_sessions(
         if billable is not None and bool(data.get("billable", True)) != billable:
             continue
 
-        if uninvoiced_only and data.get("invoice_id"):
+        if uninvoiced_only and invoice_claims(data)[0]:
             continue
 
         matched.append(doc)
@@ -361,6 +362,8 @@ async def create_session(
             "billable": payload.billable,
             "invoice_id": None,
             "invoice_number": None,
+            "invoice_ids": [],
+            "invoice_numbers": [],
             "notes": payload.notes,
             "datetime_inserted": now,
             "datetime_updated": now,

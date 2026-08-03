@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from auth import get_current_user
-from routers.sessions import compute_effective_hours
+from routers.sessions import compute_effective_hours, invoice_claims
 from routers.settings import get_invoice_settings
 from services.firestore_service import get_firestore_client
 from services.invoice_service import (
@@ -257,27 +257,42 @@ def _fetch_projects(db, project_ids) -> dict:
     return projects
 
 
-def _current_session_owners(db, session_ids) -> dict:
+def _current_session_claims(db, session_ids) -> dict:
     """
-    Return ``{session_id: current invoice_id}`` for sessions that still exist.
+    Return ``{session_id: (invoice_ids, invoice_numbers)}`` for live sessions.
 
     Serves two purposes in one bulk read.  Presence in the map means the
     document exists — a batched update against a deleted document fails the
     whole batch, so a session deleted after invoicing is filtered out rather
-    than being allowed to break the write.  The value is the invoice that
-    currently owns the session, which is what lets a clear skip entries another
-    invoice has since claimed.
+    than being allowed to break the write.  The value is every invoice
+    currently claiming the entry, which is what lets a clear remove only this
+    invoice's claim and leave the others standing.
     """
     unique_ids = [sid for sid in dict.fromkeys(session_ids) if sid]
     if not unique_ids:
         return {}
 
     refs = [db.collection("sessions").document(sid) for sid in unique_ids]
-    owners: dict = {}
+    claims: dict = {}
     for snapshot in db.get_all(refs):
         if snapshot.exists:
-            owners[snapshot.id] = (snapshot.to_dict() or {}).get("invoice_id")
-    return owners
+            claims[snapshot.id] = invoice_claims(snapshot.to_dict() or {})
+    return claims
+
+
+def _claim_payload(ids, numbers) -> dict:
+    """
+    Build the session fields for a claim list.
+
+    The scalar pair is derived from the tail of the list — the most recent
+    claimant — so display keeps working while the list stays authoritative.
+    """
+    return {
+        "invoice_ids": ids,
+        "invoice_numbers": numbers,
+        "invoice_id": ids[-1] if ids else None,
+        "invoice_number": (numbers[-1] or None) if numbers else None,
+    }
 
 
 def _sync_session_links(
@@ -294,35 +309,50 @@ def _sync_session_links(
     informational only — they mark an entry as invoiced for display and never
     make it harder to edit or re-use.
 
-    A clear only applies to sessions this invoice still owns.  An entry pulled
-    onto a newer invoice belongs to that invoice now, so dropping it from this
-    one — or deleting this one outright — must leave the newer link alone;
-    otherwise the entry would read as un-invoiced and silently reappear in the
-    next preview.
+    An entry can legitimately sit on several invoices at once — a corrected
+    re-issue bills the same hours again — so the claim is a list.  Adding
+    appends this invoice; removing takes out only this invoice's claim and
+    leaves every other one standing.  That is what stops the *correct* action of
+    removing a duplicated entry from one invoice from also unlinking it from
+    the other, which would leave it reading as never invoiced.
 
     Args:
         db: Firestore client.
-        invoice_id: The invoice being reconciled.  Written to ``set_ids`` and
-            used as the ownership key for ``clear_ids``, so it is always the
-            real id — including on delete, where nothing is set.
+        invoice_id: The invoice being reconciled.  Added for ``set_ids`` and
+            removed for ``clear_ids``, so it is always the real id — including
+            on delete, where nothing is added.
         invoice_number: Denormalised number stored alongside the id.
-        set_ids: Session ids to point at this invoice.
-        clear_ids: Session ids to unlink, subject to the ownership check.
+        set_ids: Session ids to claim for this invoice.
+        clear_ids: Session ids to release this invoice's claim on.
     """
     set_ids = [sid for sid in dict.fromkeys(set_ids) if sid]
     clear_ids = [sid for sid in dict.fromkeys(clear_ids) if sid and sid not in set_ids]
 
-    # One bulk read serves both the existence filter and the ownership check.
-    owners = _current_session_owners(db, set_ids + clear_ids)
-    operations = [
-        (sid, {"invoice_id": invoice_id, "invoice_number": invoice_number})
-        for sid in set_ids
-        if sid in owners
-    ] + [
-        (sid, {"invoice_id": None, "invoice_number": None})
-        for sid in clear_ids
-        if owners.get(sid) == invoice_id
-    ]
+    # One bulk read serves both the existence filter and the current claims.
+    claims = _current_session_claims(db, set_ids + clear_ids)
+    operations = []
+
+    for sid in set_ids:
+        if sid not in claims:
+            continue
+        ids, numbers = (list(part) for part in claims[sid])
+        if invoice_id in ids:
+            numbers[ids.index(invoice_id)] = invoice_number or ""
+        else:
+            ids.append(invoice_id)
+            numbers.append(invoice_number or "")
+        operations.append((sid, _claim_payload(ids, numbers)))
+
+    for sid in clear_ids:
+        if sid not in claims:
+            continue
+        ids, numbers = (list(part) for part in claims[sid])
+        if invoice_id not in ids:
+            continue  # Another invoice's claim — not ours to release.
+        index = ids.index(invoice_id)
+        del ids[index]
+        del numbers[index]
+        operations.append((sid, _claim_payload(ids, numbers)))
     if not operations:
         return
 
@@ -601,7 +631,8 @@ async def preview_invoice(
         if entry_date < payload.period_start or entry_date > payload.period_end:
             continue
 
-        if not payload.include_invoiced and data.get("invoice_id"):
+        claim_ids, claim_numbers = invoice_claims(data)
+        if not payload.include_invoiced and claim_ids:
             continue
 
         hours = data.get("hours")
@@ -638,11 +669,12 @@ async def preview_invoice(
         # An entry already on another invoice is still billable here — a
         # corrected re-issue is legitimate — but the caller must be told, since
         # the earlier invoice keeps listing it and keeps charging for it.
-        if data.get("invoice_id"):
+        if claim_ids:
             group["claimed_entry_count"] += 1
-            claimed_by = data.get("invoice_number") or data.get("invoice_id")
-            if claimed_by not in group["claimed_by"]:
-                group["claimed_by"].append(claimed_by)
+            for claim_id, claim_number in zip(claim_ids, claim_numbers):
+                label = claim_number or claim_id
+                if label not in group["claimed_by"]:
+                    group["claimed_by"].append(label)
 
     projects = _fetch_projects(db, [key[1] for key in groups])
     settings_default_rate = settings_data.get("default_rate")
@@ -894,6 +926,11 @@ async def update_invoice(
 
     updates["lines"] = money["lines"]
     updates["subtotal"] = money["subtotal"]
+    # Written back even when the payload did not touch them, so a document
+    # holding a null from before the guard was fixed is repaired by any edit
+    # rather than staying poisoned until someone happens to set the field.
+    updates["discount_value"] = discount_value
+    updates["tax_percent"] = tax_percent
     updates["discount_amount"] = money["discount_amount"]
     updates["tax_amount"] = money["tax_amount"]
     updates["total"] = money["total"]
