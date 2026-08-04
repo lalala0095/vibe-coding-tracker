@@ -17,10 +17,12 @@ SETTINGS_DOC_ID = "invoice"
 
 DEFAULT_SETTINGS: dict = {
     "business_name": "",
+    # The person issuing the invoice, printed under the business name.
+    "contact_name": "",
     "address": "",
     "email": "",
     "logo_url": None,
-    "default_currency": "SGD",
+    "default_currency": "USD",
     "default_payment_terms": "Net 14",
     "default_due_days": 14,
     "default_tax_label": "GST",
@@ -37,6 +39,7 @@ DEFAULT_SETTINGS: dict = {
 
 class InvoiceSettingsUpdate(BaseModel):
     business_name: Optional[str] = None
+    contact_name: Optional[str] = None
     address: Optional[str] = None
     email: Optional[str] = None
     logo_url: Optional[str] = None
@@ -52,6 +55,7 @@ class InvoiceSettingsUpdate(BaseModel):
 
 class InvoiceSettingsResponse(BaseModel):
     business_name: str
+    contact_name: str
     address: str
     email: str
     logo_url: Optional[str]
@@ -80,6 +84,7 @@ def _now_sgt() -> str:
 def _data_to_settings(data: dict) -> InvoiceSettingsResponse:
     return InvoiceSettingsResponse(
         business_name=data.get("business_name", DEFAULT_SETTINGS["business_name"]),
+        contact_name=data.get("contact_name") or DEFAULT_SETTINGS["contact_name"],
         address=data.get("address", DEFAULT_SETTINGS["address"]),
         email=data.get("email", DEFAULT_SETTINGS["email"]),
         logo_url=data.get("logo_url", DEFAULT_SETTINGS["logo_url"]),
@@ -177,6 +182,7 @@ async def update_settings(
 
     for field in (
         "business_name",
+        "contact_name",
         "address",
         "email",
         "default_currency",

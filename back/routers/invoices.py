@@ -80,6 +80,10 @@ class InvoiceCreate(BaseModel):
     tax_percent: Optional[float] = None
     notes: Optional[str] = None
     payment_terms: Optional[str] = None
+    # Print-only visibility switches.  They hide a block on the printed
+    # document; the underlying value is still stored and still editable.
+    show_due_date: Optional[bool] = None
+    show_payment_terms: Optional[bool] = None
 
 
 class InvoiceUpdate(BaseModel):
@@ -96,6 +100,8 @@ class InvoiceUpdate(BaseModel):
     tax_percent: Optional[float] = None
     notes: Optional[str] = None
     payment_terms: Optional[str] = None
+    show_due_date: Optional[bool] = None
+    show_payment_terms: Optional[bool] = None
 
 
 class InvoiceStatusUpdate(BaseModel):
@@ -126,6 +132,8 @@ class InvoiceResponse(BaseModel):
     total: float
     notes: Optional[str]
     payment_terms: Optional[str]
+    show_due_date: bool
+    show_payment_terms: bool
     bill_to: str
     issued_by: dict
     datetime_inserted: str
@@ -465,7 +473,7 @@ def _doc_to_invoice(doc) -> InvoiceResponse:
         due_date=data.get("due_date"),
         period_start=data.get("period_start"),
         period_end=data.get("period_end"),
-        currency=_value_or(data, "currency", "SGD"),
+        currency=_value_or(data, "currency", "USD"),
         lines=[_doc_to_line(line) for line in _value_or(data, "lines", [])],
         subtotal=_value_or(data, "subtotal", 0.0),
         discount_type=data.get("discount_type"),
@@ -477,6 +485,10 @@ def _doc_to_invoice(doc) -> InvoiceResponse:
         total=_value_or(data, "total", 0.0),
         notes=data.get("notes"),
         payment_terms=data.get("payment_terms"),
+        # An invoice created before these existed prints both blocks, which is
+        # exactly what it printed before.
+        show_due_date=_value_or(data, "show_due_date", True),
+        show_payment_terms=_value_or(data, "show_payment_terms", True),
         bill_to=_value_or(data, "bill_to", ""),
         issued_by=_value_or(data, "issued_by", {}),
         datetime_inserted=_value_or(data, "datetime_inserted", ""),
@@ -709,7 +721,7 @@ async def preview_invoice(
         client_id=payload.client_id,
         client_name=client_data.get("name", ""),
         currency=resolve_currency(
-            client_data, settings_data.get("default_currency", "SGD")
+            client_data, settings_data.get("default_currency", "USD")
         ),
         period_start=payload.period_start,
         period_end=payload.period_end,
@@ -805,7 +817,7 @@ async def create_invoice(
         "period_start": payload.period_start,
         "period_end": payload.period_end,
         "currency": payload.currency
-        or resolve_currency(client_data, settings_data.get("default_currency", "SGD")),
+        or resolve_currency(client_data, settings_data.get("default_currency", "USD")),
         "lines": money["lines"],
         "subtotal": money["subtotal"],
         "discount_type": discount_type,
@@ -817,6 +829,10 @@ async def create_invoice(
         "total": money["total"],
         "notes": notes,
         "payment_terms": payment_terms,
+        "show_due_date": True if payload.show_due_date is None else payload.show_due_date,
+        "show_payment_terms": (
+            True if payload.show_payment_terms is None else payload.show_payment_terms
+        ),
         "bill_to": build_bill_to(client_data),
         "issued_by": build_issued_by(settings_data),
         "datetime_inserted": now,
@@ -889,6 +905,14 @@ async def update_invoice(
 
     if payload.payment_terms is not None:
         updates["payment_terms"] = _clear_sentinel(payload.payment_terms)
+
+    # Booleans, so `is not None` is the right guard — `if payload.x:` would make
+    # switching a block off impossible.
+    if payload.show_due_date is not None:
+        updates["show_due_date"] = payload.show_due_date
+
+    if payload.show_payment_terms is not None:
+        updates["show_payment_terms"] = payload.show_payment_terms
 
     if payload.discount_type is not None:
         updates["discount_type"] = _validate_discount_type(

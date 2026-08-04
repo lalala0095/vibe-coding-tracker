@@ -245,11 +245,14 @@ def build_issued_by(settings_data: Optional[dict]) -> dict:
         settings_data: The ``settings/invoice`` dict, or None.
 
     Returns:
-        A dict with ``business_name``, ``address``, and ``email``.
+        A dict with ``business_name``, ``contact_name``, ``address``, and
+        ``email``.  ``contact_name`` is the person issuing the invoice; older
+        invoices predate it and simply carry an empty string.
     """
     settings_data = settings_data or {}
     return {
         "business_name": settings_data.get("business_name", ""),
+        "contact_name": settings_data.get("contact_name") or "",
         "address": settings_data.get("address", ""),
         "email": settings_data.get("email", ""),
     }

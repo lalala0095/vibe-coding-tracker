@@ -39,7 +39,7 @@ def resolve_rate(
 
 def resolve_currency(
     client_data: Optional[dict],
-    settings_default_currency: str = "SGD",
+    settings_default_currency: str = "USD",
 ) -> str:
     """
     Resolve the currency label for an invoice.

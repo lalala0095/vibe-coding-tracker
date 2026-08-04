@@ -27,6 +27,22 @@ class AttachmentInfo(BaseModel):
     gcs_url: str
 
 
+class TaskBulkCreate(BaseModel):
+    """
+    Several tasks created in one call, from a pasted list of titles.
+
+    JSON rather than multipart because bulk-created tasks carry no
+    attachments — the single-task endpoint stays the one that handles uploads.
+    """
+
+    project_id: str
+    titles: list[str]
+    parent_task_id: Optional[str] = None
+    status: str = "todo"
+    priority: str = "medium"
+    due_date: Optional[str] = None
+
+
 class TaskResponse(BaseModel):
     id: str
     title: str
@@ -259,6 +275,77 @@ async def create_task(
 
     doc = doc_ref.get()
     return _doc_to_task(doc)
+
+
+@router.post(
+    "/bulk", response_model=list[TaskResponse], status_code=status.HTTP_201_CREATED
+)
+async def create_tasks_bulk(
+    payload: TaskBulkCreate,
+    _user: Annotated[dict, Depends(get_current_user)],
+) -> list[TaskResponse]:
+    """
+    Create several tasks under one project in a single call.
+
+    Built for pasting a list of task titles — from a spreadsheet, a plan
+    document, or a chat message — instead of filling the form once per task.
+
+    - ``titles``         – one task per entry.  Blank and duplicate titles are
+      dropped, and the surviving order is preserved.
+    - ``project_id``     – ID of an existing project (required).
+    - ``parent_task_id`` – (optional) nest every created task under this one.
+    - ``status`` / ``priority`` / ``due_date`` – applied to all of them.
+
+    Returns the created tasks in the order they were given.
+    """
+    db = get_firestore_client()
+    project_data = _fetch_project(db, payload.project_id)
+
+    titles: list[str] = []
+    seen: set[str] = set()
+    for raw in payload.titles:
+        title = (raw or "").strip()
+        if not title or title in seen:
+            continue
+        titles.append(title)
+        seen.add(title)
+
+    if not titles:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Field 'titles' must contain at least one non-empty title.",
+        )
+
+    now = _now_sgt()
+    # Firestore caps a batch at 500 writes; a pasted list never gets near it,
+    # but chunking keeps that true whatever gets pasted.
+    doc_refs = [db.collection("tasks").document() for _ in titles]
+    for start in range(0, len(titles), 400):
+        batch = db.batch()
+        for doc_ref, title in zip(
+            doc_refs[start : start + 400], titles[start : start + 400]
+        ):
+            batch.set(
+                doc_ref,
+                {
+                    "title": title,
+                    "description": "",
+                    "project_id": payload.project_id,
+                    "project_name": project_data["project_name"],
+                    "client_id": project_data["client_id"],
+                    "client_name": project_data["client_name"],
+                    "parent_task_id": payload.parent_task_id or None,
+                    "status": payload.status,
+                    "priority": payload.priority,
+                    "due_date": payload.due_date or None,
+                    "attachments": [],
+                    "datetime_inserted": now,
+                    "datetime_updated": now,
+                },
+            )
+        batch.commit()
+
+    return [_doc_to_task(doc_ref.get()) for doc_ref in doc_refs]
 
 
 @router.put("/{task_id}", response_model=TaskResponse)

@@ -20,7 +20,7 @@ SGT = pytz.timezone("Asia/Singapore")
 class ClientCreate(BaseModel):
     name: str
     default_rate: Optional[float] = None
-    currency: str = "SGD"
+    currency: str = "USD"
     billing_email: Optional[str] = None
     billing_address: Optional[str] = None
 
@@ -59,7 +59,7 @@ def _doc_to_client(doc) -> ClientResponse:
         id=doc.id,
         name=data.get("name", ""),
         default_rate=data.get("default_rate"),
-        currency=data.get("currency", "SGD"),
+        currency=data.get("currency", "USD"),
         billing_email=data.get("billing_email"),
         billing_address=data.get("billing_address"),
         datetime_inserted=data.get("datetime_inserted", ""),
@@ -107,7 +107,7 @@ async def create_client(
 
     - ``name``            – client name (required).
     - ``default_rate``    – (optional) fallback hourly rate for invoicing.
-    - ``currency``        – currency label for the client, defaults to ``"SGD"``.
+    - ``currency``        – currency label for the client, defaults to ``"USD"``.
     - ``billing_email``   – (optional) email used for billing.
     - ``billing_address`` – (optional) multi-line address used in invoice Bill-To.
     """
