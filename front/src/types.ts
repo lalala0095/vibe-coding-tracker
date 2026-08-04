@@ -276,6 +276,11 @@ export interface InvoicePreviewRequest {
   // Trackers whose span falls in the period are offered as their own lines,
   // billed from elapsed time. Defaults to true server-side.
   include_trackers?: boolean;
+  // Set when re-previewing for an invoice that already exists, so its own
+  // claims are ignored. Without it an invoice's entries read as already
+  // billed — by that very invoice — and regenerating would drop every line
+  // it currently holds.
+  for_invoice_id?: string;
 }
 
 // Mirrors InvoicePreviewResponse in back/routers/invoices.py — the preview does
