@@ -67,6 +67,11 @@ class TrackerResponse(BaseModel):
     end_time: Optional[str]
     notes: Optional[str]
     tasks: list[TaskRef]
+    # Written only by the invoices router, when an invoice bills the tracker as
+    # a line of its own.  Informational — a claimed tracker stays fully editable
+    # and can be billed again.
+    invoice_ids: list[str] = []
+    invoice_numbers: list[str] = []
     datetime_inserted: str
     datetime_updated: str
 
@@ -99,6 +104,10 @@ def _doc_to_tracker(doc) -> TrackerResponse:
         end_time=data.get("end_time"),
         notes=data.get("notes"),
         tasks=tasks,
+        # ``or []`` as well as the default: a tracker written before invoicing
+        # existed has no key, and one written by an older path may hold null.
+        invoice_ids=data.get("invoice_ids", []) or [],
+        invoice_numbers=data.get("invoice_numbers", []) or [],
         datetime_inserted=data.get("datetime_inserted", ""),
         datetime_updated=data.get("datetime_updated", ""),
     )
@@ -289,6 +298,8 @@ async def create_tracker(
             "end_time": payload.end_time,
             "notes": payload.notes,
             "tasks": task_refs,
+            "invoice_ids": [],
+            "invoice_numbers": [],
             "datetime_inserted": now,
             "datetime_updated": now,
         }
