@@ -86,6 +86,13 @@ export function InvoicePrintView({ invoice }: { invoice: Invoice }) {
   // than printed blank.
   const periodLabel = formatDateRange(invoice.period_start, invoice.period_end);
 
+  // Print-only switches. `!== false` rather than a truthy test so an invoice
+  // created before the fields existed keeps printing both blocks, as it did.
+  // A row with nothing to show is dropped regardless of the switch.
+  const showDueDate = invoice.show_due_date !== false && Boolean(invoice.due_date);
+  const showPaymentTerms =
+    invoice.show_payment_terms !== false && Boolean(invoice.payment_terms);
+
   return (
     <article className="invoice-sheet mx-auto w-full max-w-[210mm] bg-white p-10 text-slate-900 shadow-2xl print:shadow-none">
       {/* Header ------------------------------------------------------------ */}
@@ -94,6 +101,13 @@ export function InvoicePrintView({ invoice }: { invoice: Invoice }) {
           <h1 className="text-xl font-semibold tracking-tight text-slate-900">
             {invoice.issued_by.business_name}
           </h1>
+          {/* Snapshotted like everything else in this block, and absent on
+              invoices created before the field existed. */}
+          {invoice.issued_by.contact_name && (
+            <p className="mt-0.5 text-sm font-medium text-slate-700">
+              {invoice.issued_by.contact_name}
+            </p>
+          )}
           {invoice.issued_by.address && (
             <p className="mt-1 whitespace-pre-line text-sm leading-relaxed text-slate-600">
               {invoice.issued_by.address}
@@ -132,26 +146,32 @@ export function InvoicePrintView({ invoice }: { invoice: Invoice }) {
           </p>
         </div>
 
-        <dl className="shrink-0 space-y-1 text-right text-sm">
-          <div className="flex justify-end gap-6">
-            <dt className="text-slate-500">Issue date</dt>
-            <dd className="w-32 font-medium text-slate-900">
-              {formatDate(invoice.issue_date)}
-            </dd>
-          </div>
-          {invoice.due_date && (
-            <div className="flex justify-end gap-6">
-              <dt className="text-slate-500">Due date</dt>
-              <dd className="w-32 font-medium text-slate-900">
+        {/* A two-column grid, not a fixed-width column: a period reading
+            "1 Jul 2026 – 31 Jul 2026" is far wider than a single date, and the
+            old w-32 value column forced it onto a second line. The grid sizes
+            itself to the widest value and nowrap keeps every row on one line. */}
+        <dl className="grid shrink-0 grid-cols-[auto_auto] gap-x-6 gap-y-1 text-sm">
+          <dt className="whitespace-nowrap text-slate-500">Issue date</dt>
+          <dd className="whitespace-nowrap text-right font-medium text-slate-900">
+            {formatDate(invoice.issue_date)}
+          </dd>
+
+          {showDueDate && (
+            <>
+              <dt className="whitespace-nowrap text-slate-500">Due date</dt>
+              <dd className="whitespace-nowrap text-right font-medium text-slate-900">
                 {formatDate(invoice.due_date)}
               </dd>
-            </div>
+            </>
           )}
+
           {periodLabel && (
-            <div className="flex justify-end gap-6">
-              <dt className="text-slate-500">Period</dt>
-              <dd className="w-32 font-medium text-slate-900">{periodLabel}</dd>
-            </div>
+            <>
+              <dt className="whitespace-nowrap text-slate-500">Period</dt>
+              <dd className="whitespace-nowrap text-right font-medium text-slate-900">
+                {periodLabel}
+              </dd>
+            </>
           )}
         </dl>
       </section>
@@ -241,9 +261,9 @@ export function InvoicePrintView({ invoice }: { invoice: Invoice }) {
       </section>
 
       {/* Footer ------------------------------------------------------------- */}
-      {(invoice.payment_terms || invoice.notes) && (
+      {(showPaymentTerms || invoice.notes) && (
         <footer className="invoice-break-avoid mt-10 border-t border-slate-300 pt-4 text-sm">
-          {invoice.payment_terms && (
+          {showPaymentTerms && (
             <div className="mb-3">
               <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
                 Payment terms

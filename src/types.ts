@@ -38,7 +38,7 @@ export interface Client {
   id: string;
   name: string;
   default_rate: number | null;
-  currency: string;              // e.g. "SGD"
+  currency: string;              // e.g. "USD"
   billing_email: string | null;
   billing_address: string | null;
   datetime_inserted: string;
@@ -85,6 +85,17 @@ export interface CreateTaskPayload {
 
 export interface UpdateTaskPayload extends Partial<CreateTaskPayload> {}
 
+// Several tasks from one pasted list. JSON, not multipart — bulk-created tasks
+// carry no attachments.
+export interface BulkCreateTasksPayload {
+  project_id: string;
+  titles: string[];
+  parent_task_id?: string;
+  status?: TaskStatus;
+  priority?: TaskPriority;
+  due_date?: string;
+}
+
 // ── Trackers ──────────────────────────────────────────────────────────────────
 
 export interface TrackerTaskRef {
@@ -118,6 +129,15 @@ export interface UpdateTrackerPayload {
   start_time?: string;
   end_time?: string;  // pass "null" to clear
   notes?: string;     // pass "null" to clear
+}
+
+// Turning a tracker's elapsed time into billable time entries — the bridge from
+// a tracker to an invoice. A tracker alone carries no billable time.
+export interface BillTrackerPayload {
+  split?: 'even' | 'full';   // share the hours out, or bill the span per task
+  hours?: number;            // overrides the tracker's own span
+  billable?: boolean;
+  task_ids?: string[];       // defaults to every task on the tracker
 }
 
 // ── Time Entries ──────────────────────────────────────────────────────────────
@@ -196,6 +216,7 @@ export interface InvoiceLine {
 
 export interface InvoiceIssuedBy {
   business_name: string;
+  contact_name: string;   // the person issuing it; "" on invoices predating it
   address: string;
   email: string;
 }
@@ -224,6 +245,10 @@ export interface Invoice {
   total: number;
   notes: string | null;
   payment_terms: string | null;
+  // Print-only switches. They hide a block on the printed document; the stored
+  // value is untouched and stays editable.
+  show_due_date: boolean;
+  show_payment_terms: boolean;
   bill_to: string;             // snapshot at creation
   issued_by: InvoiceIssuedBy;  // snapshot at creation
   datetime_inserted: string;
@@ -275,12 +300,15 @@ export interface CreateInvoicePayload {
   tax_percent?: number;
   notes?: string;
   payment_terms?: string;
+  show_due_date?: boolean;
+  show_payment_terms?: boolean;
 }
 
 export interface UpdateInvoicePayload extends Partial<CreateInvoicePayload> {}
 
 export interface InvoiceSettings {
   business_name: string;
+  contact_name: string;
   address: string;
   email: string;
   logo_url: string | null;

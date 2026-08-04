@@ -2,7 +2,8 @@ import axios from 'axios';
 import type {
   Goal, Model, CreateGoalPayload, UpdateGoalPayload,
   Client, Project, Task, CreateTaskPayload, UpdateTaskPayload,
-  Tracker, CreateTrackerPayload, UpdateTrackerPayload,
+  BulkCreateTasksPayload,
+  Tracker, CreateTrackerPayload, UpdateTrackerPayload, BillTrackerPayload,
   Session, CreateSessionPayload, UpdateSessionPayload,
   Invoice, InvoiceStatus, InvoicePreviewRequest, InvoicePreviewResponse,
   CreateInvoicePayload, UpdateInvoicePayload,
@@ -99,7 +100,7 @@ export async function getClients(): Promise<Client[]> {
 
 export interface ClientOptions {
   default_rate?: number | null;  // pass null to clear
-  currency?: string;             // server defaults to "SGD"
+  currency?: string;             // server defaults to "USD"
   billing_email?: string;        // pass "null" to clear
   billing_address?: string;      // pass "null" to clear
 }
@@ -189,6 +190,13 @@ export async function createTask(payload: CreateTaskPayload, files: File[]): Pro
   return res.data;
 }
 
+// Create many tasks from one pasted list. JSON rather than multipart — these
+// carry no attachments — and one round trip rather than one call per title.
+export async function createTasksBulk(payload: BulkCreateTasksPayload): Promise<Task[]> {
+  const res = await apiClient.post<Task[]>('/tasks/bulk', payload);
+  return res.data;
+}
+
 export async function updateTask(
   id: string,
   payload: UpdateTaskPayload,
@@ -244,6 +252,14 @@ export async function addTasksToTracker(id: string, taskIds: string[]): Promise<
 
 export async function removeTaskFromTracker(trackerId: string, taskId: string): Promise<Tracker> {
   const res = await apiClient.delete<Tracker>(`/trackers/${trackerId}/tasks/${taskId}`);
+  return res.data;
+}
+
+// Turn a tracker's elapsed time into time entries — the only route by which a
+// tracker's hours reach an invoice. Returns the entries created; an empty array
+// means every task was already billed from this tracker.
+export async function billTracker(id: string, payload: BillTrackerPayload = {}): Promise<Session[]> {
+  const res = await apiClient.post<Session[]>(`/trackers/${id}/time-entries`, payload);
   return res.data;
 }
 

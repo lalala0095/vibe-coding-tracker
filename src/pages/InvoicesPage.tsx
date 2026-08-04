@@ -138,6 +138,8 @@ export default function InvoicesPage() {
         tax_percent: meta.tax_percent,
         notes: clearable(meta.notes),
         payment_terms: clearable(meta.payment_terms),
+        show_due_date: meta.show_due_date,
+        show_payment_terms: meta.show_payment_terms,
       };
       // The server recomputes every total, so its response is the truth (§5).
       const saved = await updateInvoice(selected.id, payload);

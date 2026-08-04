@@ -196,7 +196,7 @@ export function formatMoney(value: number, currency: string): string {
   try {
     return new Intl.NumberFormat('en-SG', {
       style: 'currency',
-      currency: currency || 'SGD',
+      currency: currency || 'USD',
     }).format(value);
   } catch {
     return `${currency} ${value.toFixed(2)}`;
