@@ -10,11 +10,25 @@ interface Props {
   taxLabel: string;
   taxPercent: number;
   onChange: (lines: InvoiceLine[]) => void;
+  // ── Selection (builder only) ────────────────────────────────────────────────
+  // All optional: the edit surface passes none of them and gets exactly the
+  // table it has today, same column count included.
+  excludedIds?: Set<string>;
+  onToggleExclude?: (lineId: string) => void;
+  // A per-line caveat from the parent — e.g. "this tracker's time entries are
+  // already listed above". Rendered as a note; it never blocks anything.
+  reasonForLine?: (lineId: string) => string | null;
 }
 
 const CELL_INPUT =
   'w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-2 py-1.5 text-sm ' +
   'placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent';
+
+// Sub-items are detail under the description, not headings of their own, so
+// they read a size down and a shade dimmer than CELL_INPUT.
+const SUB_INPUT =
+  'flex-1 min-w-0 bg-slate-800 border border-slate-700 text-slate-300 rounded px-1.5 py-0.5 text-xs ' +
+  'placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-transparent';
 
 function todaySGT(): string {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Singapore' });
@@ -35,6 +49,8 @@ function newLine(): InvoiceLine {
     rate: 0,
     amount: 0,
     session_ids: [],        // …and no time-entry provenance
+    tracker_id: null,       // …and no tracker behind it
+    sub_items: [],          // but it may still be given a task list by hand
   };
 }
 
@@ -45,16 +61,45 @@ function newLine(): InvoiceLine {
 
 export default function InvoiceLineTable({
   lines, currency, discountType, discountValue, taxLabel, taxPercent, onChange,
+  excludedIds, onToggleExclude, reasonForLine,
 }: Props) {
   // Raw text for numeric cells while they are being typed, so a half-typed
   // "1." or a momentarily empty field is not snapped back to 0.
   const [drafts, setDrafts] = useState<Record<string, string>>({});
 
-  const money = computeMoney(lines, discountType, discountValue, taxPercent);
+  const selectable = onToggleExclude !== undefined;
+  const isExcluded = (lineId: string) => excludedIds?.has(lineId) ?? false;
+
+  // Every line gets its amount computed, excluded ones included — an unticked
+  // row still shows what it would bill rather than going blank (§1).
+  const rows = computeMoney(lines, discountType, discountValue, taxPercent).lines;
+
+  // The totals, however, cover only what will actually be billed, so the footer
+  // matches the invoice about to be created rather than the rows on screen.
+  // With nothing excluded this is the same call as before.
+  const billed = selectable ? lines.filter((l) => !isExcluded(l.line_id)) : lines;
+  const money = computeMoney(billed, discountType, discountValue, taxPercent);
   const overDiscounted = money.discount_amount > money.subtotal;
 
   const patch = (lineId: string, changes: Partial<InvoiceLine>) => {
     onChange(lines.map((l) => (l.line_id === lineId ? { ...l, ...changes } : l)));
+  };
+
+  // Sub-items are read off the source lines, not off `rows`, and always through
+  // `?? []` — an invoice stored before sub_items existed has no array at all.
+  const subItemsOf = (lineId: string): string[] =>
+    lines.find((l) => l.line_id === lineId)?.sub_items ?? [];
+
+  const setSubItem = (lineId: string, index: number, value: string) => {
+    patch(lineId, { sub_items: subItemsOf(lineId).map((v, i) => (i === index ? value : v)) });
+  };
+
+  const removeSubItem = (lineId: string, index: number) => {
+    patch(lineId, { sub_items: subItemsOf(lineId).filter((_, i) => i !== index) });
+  };
+
+  const addSubItem = (lineId: string) => {
+    patch(lineId, { sub_items: [...subItemsOf(lineId), ''] });
   };
 
   const numericValue = (lineId: string, field: 'hours' | 'rate', value: number) => {
@@ -84,6 +129,7 @@ export default function InvoiceLineTable({
         <table className="w-full min-w-[720px] text-sm">
           <thead>
             <tr className="text-xs text-slate-500 uppercase tracking-wider">
+              {selectable && <th className="w-8 pb-2" />}
               <th className="text-left font-medium pb-2 pr-2">Description</th>
               <th className="text-left font-medium pb-2 px-2 w-36">From</th>
               <th className="text-left font-medium pb-2 px-2 w-36">To</th>
@@ -96,13 +142,34 @@ export default function InvoiceLineTable({
           <tbody>
             {lines.length === 0 ? (
               <tr>
-                <td colSpan={7} className="py-6 text-center text-sm text-slate-600">
+                <td colSpan={selectable ? 8 : 7} className="py-6 text-center text-sm text-slate-600">
                   No lines yet. Load time entries or add a line manually.
                 </td>
               </tr>
             ) : (
-              money.lines.map((line) => (
-                <tr key={line.line_id} className="border-t border-slate-800 align-top">
+              rows.map((line) => {
+                const excluded = isExcluded(line.line_id);
+                const reason = reasonForLine?.(line.line_id) ?? null;
+                const subItems = line.sub_items ?? [];
+
+                return (
+                <tr
+                  key={line.line_id}
+                  // Dimmed, never disabled: an unticked line stays fully
+                  // editable, and its inputs and amount keep rendering (§1).
+                  className={`border-t border-slate-800 align-top ${excluded ? 'opacity-50' : ''}`}
+                >
+                  {selectable && (
+                    <td className="py-2 pt-4">
+                      <input
+                        type="checkbox"
+                        checked={!excluded}
+                        onChange={() => onToggleExclude?.(line.line_id)}
+                        title={excluded ? 'Include this line' : 'Leave this line off the invoice'}
+                        className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0"
+                      />
+                    </td>
+                  )}
                   <td className="py-2 pr-2">
                     <input
                       type="text"
@@ -117,6 +184,43 @@ export default function InvoiceLineTable({
                         {line.project_name ? ` · ${line.project_name}` : ''}
                       </p>
                     )}
+
+                    {reason && (
+                      <p className="text-xs text-amber-300/90 mt-1 leading-snug">{reason}</p>
+                    )}
+
+                    {/* Task bullets printed under the description. Keyed by
+                        index because the value IS the identity here — there is
+                        nothing else on a bare string to key by. */}
+                    <div className="mt-1.5 flex flex-col gap-1">
+                      {subItems.map((item, i) => (
+                        <div key={i} className="flex items-center gap-1">
+                          <span className="text-slate-600 text-xs select-none">•</span>
+                          <input
+                            type="text"
+                            value={item}
+                            onChange={(e) => setSubItem(line.line_id, i, e.target.value)}
+                            placeholder="Task"
+                            className={SUB_INPUT}
+                          />
+                          <button
+                            onClick={() => removeSubItem(line.line_id, i)}
+                            className="px-1 text-xs text-slate-600 hover:text-red-400 transition-colors leading-none"
+                            title="Remove task"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                      {/* Offered on every line, not just tracker lines — a
+                          manual line may want a task list too. */}
+                      <button
+                        onClick={() => addSubItem(line.line_id)}
+                        className="self-start text-[11px] text-slate-500 hover:text-violet-300 transition-colors"
+                      >
+                        + Add task
+                      </button>
+                    </div>
                   </td>
                   <td className="py-2 px-2">
                     <input
@@ -169,7 +273,8 @@ export default function InvoiceLineTable({
                     </button>
                   </td>
                 </tr>
-              ))
+                );
+              })
             )}
           </tbody>
         </table>

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type {
   Client, Project, Invoice, InvoiceLine, InvoiceSettings, CreateInvoicePayload,
+  InvoiceLineSource,
 } from '../types';
 import { previewInvoice, createInvoice } from '../api';
 import { computeMoney, formatMoney, type DiscountType } from '../lib/money';
@@ -236,6 +237,15 @@ export function InvoiceMetaFields({
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
+// Build-time facts about a previewed line that the stored shape cannot hold.
+// Builder line state is InvoiceLine[], which carries neither `source` nor
+// `duplicate_reason`, so they are kept beside it keyed by line_id — the same
+// workaround the claimed-invoice list already uses.
+interface PreviewMeta {
+  source: InvoiceLineSource;
+  duplicate_reason: string | null;
+}
+
 interface Props {
   clients: Client[];
   projects: Project[];
@@ -250,12 +260,20 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
   const [periodStart, setPeriodStart] = useState(startOfMonthSGT());
   const [periodEnd, setPeriodEnd] = useState(todaySGT());
   const [includeInvoiced, setIncludeInvoiced] = useState(false);
+  const [includeTrackers, setIncludeTrackers] = useState(true);
 
   const [lines, setLines] = useState<InvoiceLine[]>([]);
   const [currency, setCurrency] = useState(settings?.default_currency ?? 'USD');
   const [runningCount, setRunningCount] = useState(0);
   const [claimedCount, setClaimedCount] = useState(0);
   const [claimedInvoices, setClaimedInvoices] = useState<string[]>([]);
+  const [trackerLineCount, setTrackerLineCount] = useState(0);
+  const [duplicateTrackerCount, setDuplicateTrackerCount] = useState(0);
+  const [previewMeta, setPreviewMeta] = useState<Map<string, PreviewMeta>>(new Map());
+  // Lines the user has ticked off. Only lines the preview marked
+  // `include_by_default: false` start in here — everything else is included,
+  // which is what task lines have always done.
+  const [excluded, setExcluded] = useState<Set<string>>(new Set());
   const [previewed, setPreviewed] = useState(false);
   const [staleSource, setStaleSource] = useState(false);
 
@@ -268,9 +286,15 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
   const clientProjects = projects.filter((p) => p.client_id === clientId);
   const selectedClient = clients.find((c) => c.id === clientId);
 
+  // What the POST will actually carry. An excluded line stays on screen and
+  // stays editable — it just is not billed.
+  const includedLines = lines.filter((l) => !excluded.has(l.line_id));
+
   // Derived through lib/money, not by re-adding the `amount` values the preview
   // returned — those go stale the moment a line's hours or rate is edited.
-  const footerMoney = computeMoney(lines, meta.discount_type, meta.discount_value, meta.tax_percent);
+  const footerMoney = computeMoney(
+    includedLines, meta.discount_type, meta.discount_value, meta.tax_percent
+  );
 
   // Any change to what the preview is built FROM invalidates the lines it
   // produced. Without this, switching client after a preview left the previous
@@ -283,6 +307,10 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
     setRunningCount(0);
     setClaimedCount(0);
     setClaimedInvoices([]);
+    setTrackerLineCount(0);
+    setDuplicateTrackerCount(0);
+    setPreviewMeta(new Map());
+    setExcluded(new Set());
   };
 
   const toggleProject = (id: string) => {
@@ -304,16 +332,30 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
         period_start: periodStart,
         period_end: periodEnd,
         include_invoiced: includeInvoiced,
+        include_trackers: includeTrackers,
       });
 
-      setLines(preview.lines ?? []);
+      const previewLines = preview.lines ?? [];
+
+      setLines(previewLines);
       setCurrency(preview.currency || selectedClient?.currency || 'USD');
       setRunningCount(preview.running_entry_count ?? 0);
       setClaimedCount(preview.claimed_entry_count ?? 0);
+      setTrackerLineCount(preview.tracker_line_count ?? 0);
+      setDuplicateTrackerCount(preview.duplicate_tracker_count ?? 0);
       // Distinct invoice numbers across every claimed line, first-seen order.
       setClaimedInvoices([
-        ...new Set((preview.lines ?? []).flatMap((l) => l.claimed_by ?? [])),
+        ...new Set(previewLines.flatMap((l) => l.claimed_by ?? [])),
       ]);
+      // Kept beside the lines because InvoiceLine cannot carry them.
+      setPreviewMeta(new Map(previewLines.map((l) => [
+        l.line_id, { source: l.source, duplicate_reason: l.duplicate_reason ?? null },
+      ])));
+      // Only an explicit `false` excludes. A line from an older server that
+      // omits the field, and every manually added line, stays included.
+      setExcluded(new Set(
+        previewLines.filter((l) => l.include_by_default === false).map((l) => l.line_id)
+      ));
       setPreviewed(true);
       setStaleSource(false);
     } catch {
@@ -321,6 +363,14 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
     } finally {
       setLoadingPreview(false);
     }
+  };
+
+  const toggleExclude = (lineId: string) => {
+    setExcluded((prev) => {
+      const next = new Set(prev);
+      if (next.has(lineId)) next.delete(lineId); else next.add(lineId);
+      return next;
+    });
   };
 
   const handleSave = async () => {
@@ -337,7 +387,10 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
         // currency is deliberately NOT clearable — see the note on CLEAR.
         // Omitted when blank so the server resolves it from the client.
         ...(currency.trim() ? { currency: currency.trim() } : {}),
-        lines,
+        // Only the ticked lines are billed. Un-ticking is the whole point of
+        // the checkbox column, so the excluded ones are dropped here rather
+        // than sent and filtered server-side.
+        lines: includedLines,
         // An emptied field means "none", so it sends the sentinel rather than
         // being omitted, which would take the settings default instead.
         due_date: clearable(meta.due_date),
@@ -438,15 +491,26 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
             )}
 
             <div className="flex items-center justify-between gap-3 flex-wrap">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={includeInvoiced}
-                  onChange={(e) => { setIncludeInvoiced(e.target.checked); invalidatePreview(); }}
-                  className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0"
-                />
-                <span className="text-xs text-slate-400">Include already-invoiced entries</span>
-              </label>
+              <div className="flex items-center gap-4 flex-wrap">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={includeInvoiced}
+                    onChange={(e) => { setIncludeInvoiced(e.target.checked); invalidatePreview(); }}
+                    className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0"
+                  />
+                  <span className="text-xs text-slate-400">Include already-invoiced entries</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={includeTrackers}
+                    onChange={(e) => { setIncludeTrackers(e.target.checked); invalidatePreview(); }}
+                    className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0"
+                  />
+                  <span className="text-xs text-slate-400">Include trackers</span>
+                </label>
+              </div>
               <button
                 onClick={handlePreview}
                 disabled={loadingPreview}
@@ -496,6 +560,23 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
             </div>
           )}
 
+          {/* Tracker lines whose hours are already on the invoice as task
+              lines. They arrive unticked, but stay tickable — warn, never
+              block (§ no locking). */}
+          {duplicateTrackerCount > 0 && (
+            <div className="flex items-start gap-2.5 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2.5">
+              <svg className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+              </svg>
+              <p className="text-xs text-amber-300 leading-relaxed">
+                {duplicateTrackerCount} tracker {duplicateTrackerCount === 1 ? 'line' : 'lines'} arrived
+                unticked because {duplicateTrackerCount === 1 ? 'its' : 'their'} time entries are
+                already listed as {duplicateTrackerCount === 1 ? 'a line of its own' : 'lines of their own'}.
+                Ticking {duplicateTrackerCount === 1 ? 'it' : 'one'} would bill the same hours twice.
+              </p>
+            </div>
+          )}
+
           {previewed && (
             <>
               <div className="border-t border-slate-800 pt-4">
@@ -507,6 +588,11 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
                   taxLabel={meta.tax_label}
                   taxPercent={meta.tax_percent}
                   onChange={setLines}
+                  excludedIds={excluded}
+                  onToggleExclude={toggleExclude}
+                  // A manually added line has no preview entry, so it has no
+                  // caveat — and is never auto-excluded.
+                  reasonForLine={(id) => previewMeta.get(id)?.duplicate_reason ?? null}
                 />
               </div>
 
@@ -524,10 +610,15 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
         </div>
 
         <div className="flex items-center justify-between px-5 py-3 border-t border-slate-700 shrink-0 bg-slate-900">
+          {/* Counts what will be billed, not what is on screen — an unticked
+              line is still listed and still editable. */}
           <span className="text-xs text-slate-500">
             {lines.length > 0
-              ? `${lines.length} line${lines.length !== 1 ? 's' : ''} · ${
-                  formatMoney(footerMoney.subtotal, currency)} before discount and tax`
+              ? `${includedLines.length} of ${lines.length} line${lines.length !== 1 ? 's' : ''}` +
+                (trackerLineCount > 0
+                  ? ` (${trackerLineCount} from ${trackerLineCount === 1 ? 'a tracker' : 'trackers'})`
+                  : '') +
+                ` · ${formatMoney(footerMoney.subtotal, currency)} before discount and tax`
               : 'Server assigns the invoice number on save.'}
           </span>
           <div className="flex gap-2">

@@ -196,30 +196,48 @@ export function InvoicePrintView({ invoice }: { invoice: Invoice }) {
             </tr>
           )}
 
-          {invoice.lines.map((line) => (
-            <tr key={line.line_id} className="border-b border-slate-200 align-top">
-              <td className="py-2 pr-4 text-slate-900">
-                {line.description || line.task_title}
-                {line.project_name && (
-                  <span className="block text-xs text-slate-500">
-                    {line.project_name}
-                  </span>
-                )}
-              </td>
-              <td className="py-2 pr-4 whitespace-nowrap text-slate-700">
-                {formatDateRange(line.date_from, line.date_to) || '—'}
-              </td>
-              <td className="py-2 pr-4 text-right tabular-nums text-slate-900">
-                {roundHours(line.hours).toFixed(2)}
-              </td>
-              <td className="py-2 pr-4 text-right tabular-nums text-slate-900">
-                {formatMoney(line.rate, currency)}
-              </td>
-              <td className="py-2 text-right tabular-nums font-medium text-slate-900">
-                {formatMoney(line.amount, currency)}
-              </td>
-            </tr>
-          ))}
+          {invoice.lines.map((line) => {
+            // Tracker-billed lines carry the tracker's task titles. Read
+            // defensively and drop blanks: invoices stored before the field
+            // existed have none, and the editor allows an empty bullet.
+            const subItems = (line.sub_items ?? []).filter((item) => item.trim());
+
+            return (
+              <tr key={line.line_id} className="border-b border-slate-200 align-top">
+                <td className="py-2 pr-4 text-slate-900">
+                  {line.description || line.task_title}
+                  {line.project_name && (
+                    <span className="block text-xs text-slate-500">
+                      {line.project_name}
+                    </span>
+                  )}
+                  {subItems.length > 0 && (
+                    <ul className="mt-1 list-disc space-y-0.5 pl-5 text-xs leading-snug text-slate-600">
+                      {subItems.map((item, index) => (
+                        // Titles are free text and can repeat, so the index is the
+                        // only stable key. The list is render-only, never reordered.
+                        <li key={index} className="break-words">
+                          {item}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </td>
+                <td className="py-2 pr-4 whitespace-nowrap text-slate-700">
+                  {formatDateRange(line.date_from, line.date_to) || '—'}
+                </td>
+                <td className="py-2 pr-4 text-right tabular-nums text-slate-900">
+                  {roundHours(line.hours).toFixed(2)}
+                </td>
+                <td className="py-2 pr-4 text-right tabular-nums text-slate-900">
+                  {formatMoney(line.rate, currency)}
+                </td>
+                <td className="py-2 text-right tabular-nums font-medium text-slate-900">
+                  {formatMoney(line.amount, currency)}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
 

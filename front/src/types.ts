@@ -112,6 +112,10 @@ export interface Tracker {
   end_time: string | null;
   notes: string | null;
   tasks: TrackerTaskRef[];
+  // Invoices billing this tracker directly as a line. Maintained by the
+  // invoice router, the same way a time entry records its claims.
+  invoice_ids: string[];
+  invoice_numbers: string[];
   datetime_inserted: string;
   datetime_updated: string;
 }
@@ -212,6 +216,14 @@ export interface InvoiceLine {
   rate: number;
   amount: number;              // server-computed
   session_ids: string[];       // provenance; empty for manual lines
+  // Provenance for a line billed from a tracker rather than from time entries.
+  // null on task lines and manual lines.
+  tracker_id: string | null;
+  // The task titles printed as a bullet list under the description. A snapshot
+  // taken at build time, like task_title — editable per line, and never
+  // re-read from the tasks afterwards, so a renamed task cannot rewrite a
+  // past invoice.
+  sub_items: string[];
 }
 
 export interface InvoiceIssuedBy {
@@ -261,6 +273,9 @@ export interface InvoicePreviewRequest {
   period_start: string;
   period_end: string;
   include_invoiced?: boolean;
+  // Trackers whose span falls in the period are offered as their own lines,
+  // billed from elapsed time. Defaults to true server-side.
+  include_trackers?: boolean;
 }
 
 // Mirrors InvoicePreviewResponse in back/routers/invoices.py — the preview does
@@ -275,13 +290,28 @@ export interface InvoicePreviewResponse {
   subtotal: number;
   running_entry_count: number;  // entries with no end_time and no manual hours
   claimed_entry_count: number;  // entries already billed on another invoice
+  tracker_line_count: number;   // how many of the lines came from a tracker
+  // Tracker lines arriving unticked because including them would bill hours
+  // that are already on the invoice as task lines.
+  duplicate_tracker_count: number;
 }
+
+// Where a previewed line came from. A stored invoice does not record this —
+// it only matters while deciding what to bill.
+export type InvoiceLineSource = 'time_entry' | 'tracker';
 
 // Build-time facts about a previewed line. Deliberately not on InvoiceLine —
 // a stored invoice never carries them. Always present; 0 / [] when clean.
 export interface InvoicePreviewLine extends InvoiceLine {
   claimed_entry_count: number;
   claimed_by: string[];         // invoice numbers already claiming these entries
+  source: InvoiceLineSource;
+  // false when ticking this line would double-bill, or when a tracker is still
+  // running so there are no hours to derive. The line is still offered and
+  // still tickable — warn, never block (§ no locking).
+  include_by_default: boolean;
+  // Plain-language reason behind include_by_default === false; null when clean.
+  duplicate_reason: string | null;
 }
 
 export interface CreateInvoicePayload {
