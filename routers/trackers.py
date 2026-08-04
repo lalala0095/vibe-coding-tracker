@@ -6,11 +6,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from auth import get_current_user
+from routers.sessions import SessionResponse, _doc_to_session
 from services.firestore_service import get_firestore_client
 
 router = APIRouter(prefix="/trackers", tags=["trackers"])
 
 SGT = pytz.timezone("Asia/Singapore")
+
+VALID_SPLITS = ("even", "full")
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas
@@ -41,6 +44,20 @@ class TrackerUpdate(BaseModel):
 
 class TrackerAddTasks(BaseModel):
     task_ids: list[str]
+
+
+class TrackerBillRequest(BaseModel):
+    """
+    How to turn a tracker's elapsed time into billable time entries.
+
+    ``hours`` overrides the tracker's own span, which is what makes a still
+    running tracker billable without stopping it.
+    """
+
+    split: str = "even"  # "even" – share the hours out | "full" – each task gets all
+    hours: Optional[float] = None
+    billable: bool = True
+    task_ids: Optional[list[str]] = None  # default: every task on the tracker
 
 
 class TrackerResponse(BaseModel):
@@ -87,6 +104,73 @@ def _doc_to_tracker(doc) -> TrackerResponse:
     )
 
 
+def _tracker_hours(start_time: str, end_time: Optional[str]) -> Optional[float]:
+    """
+    Return a tracker's elapsed hours to 2dp, or None when it cannot be derived.
+
+    None means the tracker is still running or its timestamps are unparseable —
+    the caller must then supply hours explicitly.
+    """
+    if not end_time:
+        return None
+    try:
+        delta = datetime.fromisoformat(end_time) - datetime.fromisoformat(start_time)
+    except (ValueError, TypeError):
+        return None
+    return round(max(0.0, delta.total_seconds() / 3600), 2)
+
+
+def _split_hours(total: float, count: int, split: str) -> list[float]:
+    """
+    Share ``total`` hours across ``count`` time entries.
+
+    ``"full"`` bills the whole span against every task — right when the tasks
+    were worked in parallel.  ``"even"`` divides it, and the rounding remainder
+    lands on the first entry so the parts add back up to the total exactly
+    rather than losing a cent's worth of time to three-way rounding.
+
+    ``count`` must be the number of entries that will actually be written.  A
+    caller that discards a share after the fact silently loses those hours.
+    """
+    if count <= 0:
+        return []
+    if split == "full":
+        return [round(total, 2)] * count
+
+    each = round(total / count, 2)
+    parts = [each] * count
+    parts[0] = round(total - each * (count - 1), 2)
+    return parts
+
+
+def _validate_split(value: str) -> str:
+    """
+    Check a split mode against the known set.
+
+    Anything unrecognised used to fall through to ``"even"``, so a typo such as
+    ``"Full"`` quietly divided the hours instead of duplicating them.  Rejecting
+    it is a correction of the request, not a constraint on the user's hours.
+    """
+    if value not in VALID_SPLITS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Split must be one of: {', '.join(VALID_SPLITS)}.",
+        )
+    return value
+
+
+def _existing_tracker_task_ids(db, tracker_id: str) -> set:
+    """
+    Return the task ids that already have a time entry for this tracker.
+
+    Billing a tracker twice must not double the hours, so the second call skips
+    what the first one wrote.  Entries the user has since deleted are billed
+    again, which is the intent.
+    """
+    docs = db.collection("sessions").where("tracker_id", "==", tracker_id).stream()
+    return {(doc.to_dict() or {}).get("task_id") for doc in docs}
+
+
 def _fetch_task_ref(db, task_id: str) -> dict:
     """Fetch a task and return its denormalized fields. Raises 404 if not found."""
     doc = db.collection("tasks").document(task_id).get()
@@ -102,6 +186,32 @@ def _fetch_task_ref(db, task_id: str) -> dict:
         "project_name": data.get("project_name", ""),
         "client_name": data.get("client_name", ""),
     }
+
+
+def _resolve_tracker_tasks(db, task_refs: list[dict]) -> list[tuple[str, dict]]:
+    """
+    Resolve a tracker's TaskRefs to live task documents in one round trip.
+
+    Returns ``[(task_id, task_data), ...]`` for the tasks that still exist, in
+    the order they appear on the tracker.  Deleting a task does not strip its
+    TaskRef from ``tracker.tasks``, so a tracker routinely points at documents
+    that are gone; those are dropped here rather than by the caller.
+
+    ``db.get_all`` does not promise to return snapshots in the order the refs
+    were passed, hence the id-keyed map and the re-walk of ``task_refs``.
+    """
+    ordered_ids = [t.get("task_id", "") for t in task_refs]
+    unique_ids = [tid for tid in dict.fromkeys(ordered_ids) if tid]
+    if not unique_ids:
+        return []
+
+    refs = [db.collection("tasks").document(tid) for tid in unique_ids]
+    tasks: dict = {}
+    for snapshot in db.get_all(refs):
+        if snapshot.exists:
+            tasks[snapshot.id] = snapshot.to_dict() or {}
+
+    return [(tid, tasks[tid]) for tid in ordered_ids if tid in tasks]
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +380,130 @@ async def add_tasks_to_tracker(
 
     updated_doc = doc_ref.get()
     return _doc_to_tracker(updated_doc)
+
+
+@router.post(
+    "/{tracker_id}/time-entries",
+    response_model=list[SessionResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def bill_tracker(
+    tracker_id: str,
+    payload: TrackerBillRequest,
+    _user: Annotated[dict, Depends(get_current_user)],
+) -> list[SessionResponse]:
+    """
+    Turn a tracker's elapsed time into billable time entries.
+
+    This is the bridge from a tracker to an invoice.  A tracker on its own is a
+    grouping and carries no billable time; only the ``sessions`` collection
+    feeds the invoice preview.  One time entry is created per linked task,
+    spanning the tracker's start and end, with the hours written as a manual
+    override so they stay editable afterwards.
+
+    - ``split``     – ``"even"`` divides the elapsed hours across the tasks;
+      ``"full"`` bills the whole span against each of them.
+    - ``hours``     – (optional) use this total instead of the tracker's span.
+      Required while the tracker is still running.
+    - ``task_ids``  – (optional) bill only these tasks; defaults to all of them.
+    - ``billable``  – (optional) defaults to true.
+
+    Tasks that have since been deleted are dropped before the hours are
+    divided, so an ``"even"`` split always adds back up to the total.
+
+    Re-running skips tasks that already have an entry for this tracker, so
+    billing twice never doubles the hours.  Everything written here is a
+    starting point: hours, dates and the billable flag stay fully editable on
+    the Time Entries page.
+    """
+    _validate_split(payload.split)
+
+    db = get_firestore_client()
+    doc_ref = db.collection("trackers").document(tracker_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tracker '{tracker_id}' not found.",
+        )
+
+    data = doc.to_dict() or {}
+    tracker_tasks: list[dict] = data.get("tasks", [])
+
+    if payload.task_ids is not None:
+        wanted = set(payload.task_ids)
+        tracker_tasks = [t for t in tracker_tasks if t.get("task_id") in wanted]
+
+    if not tracker_tasks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Add at least one task to the tracker before billing it.",
+        )
+
+    if payload.hours is not None:
+        if payload.hours < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Field 'hours' cannot be negative.",
+            )
+        total_hours = round(float(payload.hours), 2)
+    else:
+        derived = _tracker_hours(data.get("start_time", ""), data.get("end_time"))
+        if derived is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Stop the tracker or supply 'hours' before billing it.",
+            )
+        total_hours = derived
+
+    already_billed = _existing_tracker_task_ids(db, tracker_id)
+    pending = [t for t in tracker_tasks if t.get("task_id") not in already_billed]
+    if not pending:
+        return []
+
+    # Resolve the tasks BEFORE splitting, never after.  The shares list is
+    # index-aligned with the tasks it was sized for, so skipping a task inside
+    # the write loop threw its share away instead of redistributing it — a
+    # tracker with a deleted task silently billed less than the total.  Read the
+    # tasks fresh rather than trusting the denormalised copy on the tracker: a
+    # time entry needs project_id and client_id, which the TaskRef does not
+    # carry.  Do not move the split back above this call.
+    resolved = _resolve_tracker_tasks(db, pending)
+    if not resolved:
+        return []
+
+    shares = _split_hours(total_hours, len(resolved), payload.split)
+
+    now = _now_sgt()
+    created = []
+    for (task_id, task_data), hours in zip(resolved, shares):
+        _, session_ref = db.collection("sessions").add(
+            {
+                "task_id": task_id,
+                "task_title": task_data.get("title", ""),
+                "project_id": task_data.get("project_id", ""),
+                "project_name": task_data.get("project_name", ""),
+                "client_id": task_data.get("client_id", ""),
+                "client_name": task_data.get("client_name", ""),
+                "tracker_id": tracker_id,
+                "start_time": data.get("start_time", ""),
+                "end_time": data.get("end_time"),
+                # Stored as an override so the split survives — the tracker's
+                # span would otherwise recompute every entry to the full length.
+                "hours": hours,
+                "billable": payload.billable,
+                "invoice_id": None,
+                "invoice_number": None,
+                "invoice_ids": [],
+                "invoice_numbers": [],
+                "notes": data.get("notes"),
+                "datetime_inserted": now,
+                "datetime_updated": now,
+            }
+        )
+        created.append(_doc_to_session(session_ref.get()))
+
+    return created
 
 
 @router.delete("/{tracker_id}/tasks/{task_id}", response_model=TrackerResponse)
