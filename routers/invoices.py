@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from auth import get_current_user
 from routers.sessions import compute_effective_hours, invoice_claims
 from routers.settings import get_invoice_settings
+from routers.trackers import _tracker_hours
 from services.firestore_service import get_firestore_client
 from services.invoice_service import (
     assign_invoice_number,
@@ -46,6 +47,11 @@ class InvoiceLineInput(BaseModel):
     hours: float = 0.0
     rate: float = 0.0
     session_ids: list[str] = []
+    # A line billing a whole tracker rather than a task's time entries.  Both
+    # are snapshots like ``task_title`` — the tracker is never re-read to
+    # rebuild them, so renaming or deleting it never rewrites a past invoice.
+    tracker_id: Optional[str] = None
+    sub_items: list[str] = []
     # ``amount`` is deliberately absent — the server always recomputes it.
 
 
@@ -62,6 +68,8 @@ class InvoiceLineResponse(BaseModel):
     rate: float
     amount: float
     session_ids: list[str]
+    tracker_id: Optional[str] = None
+    sub_items: list[str] = []
 
 
 class InvoiceCreate(BaseModel):
@@ -146,6 +154,7 @@ class InvoicePreviewRequest(BaseModel):
     period_start: str
     period_end: str
     include_invoiced: bool = False
+    include_trackers: bool = True
 
 
 class InvoicePreviewLine(InvoiceLineResponse):
@@ -153,11 +162,20 @@ class InvoicePreviewLine(InvoiceLineResponse):
     A preview line, plus the provenance a stored line does not carry.
 
     Kept separate from ``InvoiceLineResponse`` so the stored invoice shape is
-    unchanged — these two fields describe the build-time moment, not the line.
+    unchanged — these fields describe the build-time moment, not the line.
+
+    ``source`` says where the line came from.  A tracker line covers the same
+    ground as the time entries billed off it, so ``include_by_default`` tells
+    the builder which lines to tick and ``duplicate_reason`` says, in words the
+    user can act on, why the rest are left unticked.  Neither is a block: every
+    line stays selectable.
     """
 
     claimed_entry_count: int = 0
     claimed_by: list[str] = []
+    source: str = "time_entry"
+    include_by_default: bool = True
+    duplicate_reason: Optional[str] = None
 
 
 class InvoicePreviewResponse(BaseModel):
@@ -170,6 +188,8 @@ class InvoicePreviewResponse(BaseModel):
     subtotal: float
     running_entry_count: int
     claimed_entry_count: int
+    tracker_line_count: int = 0
+    duplicate_tracker_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -265,22 +285,126 @@ def _fetch_projects(db, project_ids) -> dict:
     return projects
 
 
-def _current_session_claims(db, session_ids) -> dict:
+def _tracker_candidates(
+    db,
+    client_id: str,
+    project_filter: set,
+    period_start: str,
+    period_end: str,
+) -> list:
     """
-    Return ``{session_id: (invoice_ids, invoice_numbers)}`` for live sessions.
+    Return the in-period trackers billable to this client, with their tasks.
+
+    A tracker document carries no ``client_id`` or ``project_id`` of its own —
+    only a list of TaskRefs — so who it bills to has to come from its tasks.
+    Every task across every in-period tracker is read in one bulk ``get_all``,
+    then each tracker keeps only the tasks matching the client, and the project
+    filter when one is set.  A tracker with no surviving task is dropped: it
+    belongs to somebody else's invoice.
+
+    The period filter is applied in Python on the same inclusive string
+    comparison the time entries use, so no composite index is needed.
+
+    Returns:
+        ``[(tracker_doc, tracker_data, [task_data, ...]), ...]`` with the tasks
+        in the order the tracker lists them.
+    """
+    docs = list(
+        db.collection("trackers")
+        .order_by("start_time", direction="DESCENDING")
+        .stream()
+    )
+
+    candidates = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+
+        tracker_date = _entry_date(data.get("start_time"))
+        if tracker_date is None:
+            continue
+        if tracker_date < period_start or tracker_date > period_end:
+            continue
+
+        task_refs = data.get("tasks") or []
+        if not task_refs:
+            continue
+
+        candidates.append((doc, data, task_refs))
+
+    ordered_ids = [
+        ref.get("task_id", "") for _, _, task_refs in candidates for ref in task_refs
+    ]
+    unique_ids = [tid for tid in dict.fromkeys(ordered_ids) if tid]
+    tasks: dict = {}
+    if unique_ids:
+        refs = [db.collection("tasks").document(tid) for tid in unique_ids]
+        for snapshot in db.get_all(refs):
+            if snapshot.exists:
+                tasks[snapshot.id] = snapshot.to_dict() or {}
+
+    resolved = []
+    for doc, data, task_refs in candidates:
+        # Read the tasks fresh rather than trusting the TaskRefs on the tracker:
+        # a TaskRef carries no client_id or project_id, and a task deleted since
+        # is simply absent from the map.
+        matched = [
+            tasks[ref.get("task_id", "")]
+            for ref in task_refs
+            if ref.get("task_id", "") in tasks
+        ]
+        matched = [
+            task
+            for task in matched
+            if task.get("client_id") == client_id
+            and (not project_filter or task.get("project_id") in project_filter)
+        ]
+        if matched:
+            resolved.append((doc, data, matched))
+    return resolved
+
+
+def _single_project_id(task_datas) -> Optional[str]:
+    """
+    Return the one project every task shares, or None when they differ.
+
+    A tracker spanning two projects has no single project to bill under, so its
+    line carries none and the rate falls back to the client's.
+    """
+    project_ids = {task.get("project_id") for task in task_datas}
+    if len(project_ids) == 1:
+        return next(iter(project_ids)) or None
+    return None
+
+
+def _claim_labels(claim_ids, claim_numbers) -> list:
+    """Name each claiming invoice by its number, falling back to its id."""
+    labels: list = []
+    for claim_id, claim_number in zip(claim_ids, claim_numbers):
+        label = claim_number or claim_id
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _current_claims(db, collection: str, doc_ids) -> dict:
+    """
+    Return ``{doc_id: (invoice_ids, invoice_numbers)}`` for live documents.
 
     Serves two purposes in one bulk read.  Presence in the map means the
     document exists — a batched update against a deleted document fails the
-    whole batch, so a session deleted after invoicing is filtered out rather
-    than being allowed to break the write.  The value is every invoice
-    currently claiming the entry, which is what lets a clear remove only this
-    invoice's claim and leave the others standing.
+    whole batch, so a session or tracker deleted after invoicing is filtered out
+    rather than being allowed to break the write.  The value is every invoice
+    currently claiming it, which is what lets a clear remove only this invoice's
+    claim and leave the others standing.
+
+    Sessions and trackers carry the identical claim shape, so one reader serves
+    both collections.
     """
-    unique_ids = [sid for sid in dict.fromkeys(session_ids) if sid]
+    unique_ids = [did for did in dict.fromkeys(doc_ids) if did]
     if not unique_ids:
         return {}
 
-    refs = [db.collection("sessions").document(sid) for sid in unique_ids]
+    refs = [db.collection(collection).document(did) for did in unique_ids]
     claims: dict = {}
     for snapshot in db.get_all(refs):
         if snapshot.exists:
@@ -303,19 +427,20 @@ def _claim_payload(ids, numbers) -> dict:
     }
 
 
-def _sync_session_links(
+def _sync_claim_links(
     db,
+    collection: str,
     invoice_id: str,
     invoice_number: Optional[str],
     set_ids,
     clear_ids,
 ) -> None:
     """
-    Reconcile ``invoice_id``/``invoice_number`` back-links on time entries.
+    Reconcile ``invoice_id``/``invoice_number`` back-links on claimed documents.
 
-    Written in batches rather than one update per session.  These fields are
-    informational only — they mark an entry as invoiced for display and never
-    make it harder to edit or re-use.
+    Written in batches rather than one update per document.  These fields are
+    informational only — they mark a time entry or a tracker as invoiced for
+    display and never make it harder to edit or re-use.
 
     An entry can legitimately sit on several invoices at once — a corrected
     re-issue bills the same hours again — so the claim is a list.  Adding
@@ -326,54 +451,89 @@ def _sync_session_links(
 
     Args:
         db: Firestore client.
+        collection: ``"sessions"`` or ``"trackers"`` — both carry the same
+            claim fields, so the reconciliation is identical either way.
         invoice_id: The invoice being reconciled.  Added for ``set_ids`` and
             removed for ``clear_ids``, so it is always the real id — including
             on delete, where nothing is added.
         invoice_number: Denormalised number stored alongside the id.
-        set_ids: Session ids to claim for this invoice.
-        clear_ids: Session ids to release this invoice's claim on.
+        set_ids: Document ids to claim for this invoice.
+        clear_ids: Document ids to release this invoice's claim on.
     """
-    set_ids = [sid for sid in dict.fromkeys(set_ids) if sid]
-    clear_ids = [sid for sid in dict.fromkeys(clear_ids) if sid and sid not in set_ids]
+    set_ids = [did for did in dict.fromkeys(set_ids) if did]
+    clear_ids = [did for did in dict.fromkeys(clear_ids) if did and did not in set_ids]
 
     # One bulk read serves both the existence filter and the current claims.
-    claims = _current_session_claims(db, set_ids + clear_ids)
+    claims = _current_claims(db, collection, set_ids + clear_ids)
     operations = []
 
-    for sid in set_ids:
-        if sid not in claims:
+    for did in set_ids:
+        if did not in claims:
             continue
-        ids, numbers = (list(part) for part in claims[sid])
+        ids, numbers = (list(part) for part in claims[did])
         if invoice_id in ids:
             numbers[ids.index(invoice_id)] = invoice_number or ""
         else:
             ids.append(invoice_id)
             numbers.append(invoice_number or "")
-        operations.append((sid, _claim_payload(ids, numbers)))
+        operations.append((did, _claim_payload(ids, numbers)))
 
-    for sid in clear_ids:
-        if sid not in claims:
+    for did in clear_ids:
+        if did not in claims:
             continue
-        ids, numbers = (list(part) for part in claims[sid])
+        ids, numbers = (list(part) for part in claims[did])
         if invoice_id not in ids:
             continue  # Another invoice's claim — not ours to release.
         index = ids.index(invoice_id)
         del ids[index]
         del numbers[index]
-        operations.append((sid, _claim_payload(ids, numbers)))
+        operations.append((did, _claim_payload(ids, numbers)))
     if not operations:
         return
 
     for start in range(0, len(operations), _BATCH_LIMIT):
         batch = db.batch()
-        for session_id, payload in operations[start : start + _BATCH_LIMIT]:
-            batch.update(db.collection("sessions").document(session_id), payload)
+        for doc_id, payload in operations[start : start + _BATCH_LIMIT]:
+            batch.update(db.collection(collection).document(doc_id), payload)
         batch.commit()
+
+
+def _sync_session_links(
+    db,
+    invoice_id: str,
+    invoice_number: Optional[str],
+    set_ids,
+    clear_ids,
+) -> None:
+    """Reconcile this invoice's back-links on the time entries it bills."""
+    _sync_claim_links(db, "sessions", invoice_id, invoice_number, set_ids, clear_ids)
+
+
+def _sync_tracker_links(
+    db,
+    invoice_id: str,
+    invoice_number: Optional[str],
+    set_ids,
+    clear_ids,
+) -> None:
+    """
+    Reconcile this invoice's back-links on the trackers it bills.
+
+    Without it the same tracker could be billed onto a second invoice with
+    nothing to warn about it — the preview reads these claims exactly as it
+    reads a time entry's.
+    """
+    _sync_claim_links(db, "trackers", invoice_id, invoice_number, set_ids, clear_ids)
 
 
 def _line_session_ids(lines) -> list:
     """Flatten every ``session_ids`` entry across a list of line dicts."""
     return [sid for line in lines for sid in (line.get("session_ids") or [])]
+
+
+def _line_tracker_ids(lines) -> list:
+    """Flatten the non-null ``tracker_id`` of each line dict."""
+    return [line.get("tracker_id") for line in lines if line.get("tracker_id")]
 
 
 def _build_lines(line_inputs) -> list:
@@ -382,6 +542,10 @@ def _build_lines(line_inputs) -> list:
 
     Assigns a ``line_id`` where absent and defaults ``description`` to the task
     title.  ``amount`` is left to the money math, which always recomputes it.
+
+    ``tracker_id`` and ``sub_items`` are copied verbatim, never re-derived from
+    the tracker: they are snapshots, so a tracker that later gains, loses or
+    renames a task does not rewrite an invoice already sent.
     """
     lines = []
     for line in line_inputs:
@@ -398,6 +562,8 @@ def _build_lines(line_inputs) -> list:
                 "hours": line.hours,
                 "rate": line.rate,
                 "session_ids": list(line.session_ids or []),
+                "tracker_id": line.tracker_id,
+                "sub_items": [str(item) for item in (line.sub_items or [])],
             }
         )
     return lines
@@ -441,6 +607,8 @@ def _doc_to_line(data: dict) -> InvoiceLineResponse:
         rate=_value_or(data, "rate", 0.0),
         amount=_value_or(data, "amount", 0.0),
         session_ids=_value_or(data, "session_ids", []),
+        tracker_id=data.get("tracker_id"),
+        sub_items=_value_or(data, "sub_items", []),
     )
 
 
@@ -450,12 +618,17 @@ def _doc_to_preview_line(data: dict) -> InvoicePreviewLine:
 
     ``claimed_by`` names the invoices that already reference this line's time
     entries, so the builder can warn which invoice the hours are also on.
+    ``include_by_default`` and ``duplicate_reason`` are advisory in the same
+    way — they steer the initial ticks, never the user's final choice.
     """
     base = _doc_to_line(data)
     return InvoicePreviewLine(
         **base.model_dump(),
         claimed_entry_count=data.get("claimed_entry_count", 0),
         claimed_by=data.get("claimed_by", []) or [],
+        source=data.get("source", "time_entry"),
+        include_by_default=data.get("include_by_default", True),
+        duplicate_reason=data.get("duplicate_reason"),
     )
 
 
@@ -599,9 +772,18 @@ async def preview_invoice(
     entry's effective hours, and the rate resolved from project then client then
     settings.
 
+    A tracker in the period is also offered as a line of its own, titled after
+    the tracker with its task titles as ``sub_items`` and its hours taken from
+    its elapsed span.  Such a line claims no sessions — the tracker's time
+    entries are billed by their own lines — so the two are alternatives, not
+    additions.  When both are present the tracker line comes back unticked
+    (``include_by_default=False``) with ``duplicate_reason`` saying why; nothing
+    is hidden or blocked, and the user is free to tick it anyway.
+
     - ``project_ids``      – (optional) narrow to specific projects.
     - ``include_invoiced`` – when false, entries already on an invoice are
       skipped.
+    - ``include_trackers`` – when false, no tracker lines are built at all.
 
     Entries still running with no manual hours are excluded and reported via
     ``running_entry_count`` so the caller can warn about them.
@@ -627,6 +809,9 @@ async def preview_invoice(
     project_filter = set(payload.project_ids or [])
     groups: dict = {}
     running_entry_count = 0
+    # Counted off the same stream the groups are built from, so spotting a
+    # tracker whose entries are already listed costs no extra Firestore read.
+    sessions_by_tracker: dict = {}
 
     for doc in docs:
         data = doc.to_dict() or {}
@@ -678,6 +863,12 @@ async def preview_invoice(
         group["hours"] += effective_hours
         group["session_ids"].append(doc.id)
 
+        entry_tracker_id = data.get("tracker_id")
+        if entry_tracker_id:
+            sessions_by_tracker[entry_tracker_id] = (
+                sessions_by_tracker.get(entry_tracker_id, 0) + 1
+            )
+
         # An entry already on another invoice is still billable here — a
         # corrected re-issue is legitimate — but the caller must be told, since
         # the earlier invoice keeps listing it and keeps charging for it.
@@ -688,7 +879,24 @@ async def preview_invoice(
                 if label not in group["claimed_by"]:
                     group["claimed_by"].append(label)
 
-    projects = _fetch_projects(db, [key[1] for key in groups])
+    tracker_candidates = (
+        _tracker_candidates(
+            db,
+            payload.client_id,
+            project_filter,
+            payload.period_start,
+            payload.period_end,
+        )
+        if payload.include_trackers
+        else []
+    )
+
+    # One bulk project read serves both kinds of line.
+    projects = _fetch_projects(
+        db,
+        [key[1] for key in groups]
+        + [_single_project_id(tasks) for _, _, tasks in tracker_candidates],
+    )
     settings_default_rate = settings_data.get("default_rate")
 
     lines = []
@@ -711,11 +919,84 @@ async def preview_invoice(
                 "session_ids": group["session_ids"],
                 "claimed_entry_count": group["claimed_entry_count"],
                 "claimed_by": group["claimed_by"],
+                "source": "time_entry",
+                "include_by_default": True,
+                "duplicate_reason": None,
+            }
+        )
+
+    for doc, data, task_datas in tracker_candidates:
+        claim_ids, claim_numbers = invoice_claims(data)
+        if not payload.include_invoiced and claim_ids:
+            continue
+
+        project_id = _single_project_id(task_datas)
+        project_name = next(
+            (
+                task.get("project_name", "")
+                for task in task_datas
+                if project_id and task.get("project_id") == project_id
+            ),
+            "",
+        )
+
+        title = data.get("title", "")
+        start_time = data.get("start_time", "")
+        end_time = data.get("end_time")
+        date_from = _entry_date(start_time) or ""
+        hours = _tracker_hours(start_time, end_time)
+
+        # First match wins.  Neither state hides or blocks the line — it comes
+        # back unticked with the reason spelled out, and the user may still
+        # bill it.
+        if not end_time:
+            include_by_default = False
+            duplicate_reason = (
+                "Still running — it has no end time, so there are no hours to derive."
+            )
+        elif sessions_by_tracker.get(doc.id):
+            include_by_default = False
+            duplicate_reason = (
+                f"Its {sessions_by_tracker[doc.id]} time entries are already listed "
+                "above as their own lines. Billing both charges the same hours twice."
+            )
+        else:
+            include_by_default = True
+            duplicate_reason = None
+
+        lines.append(
+            {
+                "line_id": str(uuid.uuid4()),
+                "task_id": None,
+                "task_title": title,
+                "project_id": project_id,
+                "project_name": project_name,
+                "description": title,
+                "date_from": date_from,
+                "date_to": _entry_date(end_time) or date_from,
+                "hours": hours if hours is not None else 0.0,
+                "rate": resolve_rate(
+                    None, projects.get(project_id), client_data, settings_default_rate
+                ),
+                # Deliberately empty.  A tracker line bills the span, not the
+                # entries, so claiming them here would steal the claim from the
+                # time-entry lines that actually charge for them.
+                "session_ids": [],
+                "sub_items": [task.get("title", "") for task in task_datas],
+                "tracker_id": doc.id,
+                "source": "tracker",
+                "claimed_entry_count": 1 if claim_ids else 0,
+                "claimed_by": _claim_labels(claim_ids, claim_numbers),
+                "include_by_default": include_by_default,
+                "duplicate_reason": duplicate_reason,
             }
         )
 
     lines.sort(key=lambda line: (line["date_from"] or "", line["task_title"] or ""))
     money = compute_money(lines, None, 0.0, 0.0)
+    tracker_lines = [
+        line for line in money["lines"] if line.get("source") == "tracker"
+    ]
 
     return InvoicePreviewResponse(
         client_id=payload.client_id,
@@ -729,6 +1010,10 @@ async def preview_invoice(
         subtotal=money["subtotal"],
         running_entry_count=running_entry_count,
         claimed_entry_count=sum(line["claimed_entry_count"] for line in money["lines"]),
+        tracker_line_count=len(tracker_lines),
+        duplicate_tracker_count=sum(
+            1 for line in tracker_lines if line.get("include_by_default") is False
+        ),
     )
 
 
@@ -848,6 +1133,13 @@ async def create_invoice(
         _line_session_ids(money["lines"]),
         [],
     )
+    _sync_tracker_links(
+        db,
+        doc_ref.id,
+        invoice_number,
+        _line_tracker_ids(money["lines"]),
+        [],
+    )
 
     return _doc_to_invoice(doc_ref.get())
 
@@ -861,11 +1153,11 @@ async def update_invoice(
     """
     Update an invoice's lines and meta.
 
-    All monetary figures are recomputed from the submitted lines, and session
-    back-links are reconciled — entries dropped from the invoice are unlinked
-    unless another invoice has since claimed them, and newly referenced entries
-    are linked.  A sent or paid invoice is editable like any other; status never
-    blocks a change.
+    All monetary figures are recomputed from the submitted lines, and the
+    session and tracker back-links are reconciled — anything dropped from the
+    invoice is unlinked unless another invoice has since claimed it, and newly
+    referenced entries and trackers are linked.  A sent or paid invoice is
+    editable like any other; status never blocks a change.
 
     - Pass ``"null"`` for ``due_date``, ``discount_type``, ``tax_label``,
       ``notes``, or ``payment_terms`` to clear that field — the same five that
@@ -974,6 +1266,16 @@ async def update_invoice(
         [sid for sid in old_session_ids if sid not in set(new_session_ids)],
     )
 
+    new_tracker_ids = _line_tracker_ids(money["lines"])
+    old_tracker_ids = _line_tracker_ids(existing.get("lines", []) or [])
+    _sync_tracker_links(
+        db,
+        invoice_id,
+        existing.get("invoice_number", ""),
+        new_tracker_ids,
+        [tid for tid in old_tracker_ids if tid not in set(new_tracker_ids)],
+    )
+
     return _doc_to_invoice(doc_ref.get())
 
 
@@ -1007,10 +1309,10 @@ async def delete_invoice(
     _user: Annotated[dict, Depends(get_current_user)],
 ) -> None:
     """
-    Delete an invoice and clear the back-links on its time entries.
+    Delete an invoice and clear the back-links on its time entries and trackers.
 
-    Only entries still linked to this invoice are cleared — any that have since
-    been pulled onto another invoice keep that newer link.
+    Only documents still linked to this invoice are cleared — any that have
+    since been pulled onto another invoice keep that newer link.
     """
     db = get_firestore_client()
     doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
@@ -1022,5 +1324,12 @@ async def delete_invoice(
         existing.get("invoice_number", ""),
         [],
         _line_session_ids(existing.get("lines", []) or []),
+    )
+    _sync_tracker_links(
+        db,
+        invoice_id,
+        existing.get("invoice_number", ""),
+        [],
+        _line_tracker_ids(existing.get("lines", []) or []),
     )
     doc_ref.delete()
