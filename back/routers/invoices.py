@@ -155,6 +155,12 @@ class InvoicePreviewRequest(BaseModel):
     period_end: str
     include_invoiced: bool = False
     include_trackers: bool = True
+    # Not a filter — it narrows nothing.  It names the invoice whose own claims
+    # are to be ignored, so re-previewing an existing invoice sees the entries
+    # and trackers *it* already claims as unclaimed.  Without it, regenerating
+    # an invoice's lines would drop every one of them as "already invoiced" and
+    # come back empty.  Claims held by any other invoice are unaffected.
+    for_invoice_id: Optional[str] = None
 
 
 class InvoicePreviewLine(InvoiceLineResponse):
@@ -374,6 +380,48 @@ def _single_project_id(task_datas) -> Optional[str]:
     if len(project_ids) == 1:
         return next(iter(project_ids)) or None
     return None
+
+
+def _visible_claims(claims: tuple, exclude_invoice_id: Optional[str]) -> tuple:
+    """
+    Drop one invoice's own claim from an ``invoice_claims`` result.
+
+    Not a filter over documents — nothing is skipped or narrowed here.  When an
+    invoice re-previews its own period, the entries and trackers it already
+    bills are claimed *by it*, and treating that as "already invoiced" would
+    empty the very invoice being rebuilt.  Excluding its id makes its own claim
+    invisible so those lines come back exactly as they would have the first
+    time, while a claim held by any other invoice is still reported and still
+    honoured by ``include_invoiced``.
+
+    The two lists are parallel, so both are rebuilt together — dropping from one
+    alone would shift every following number onto the wrong invoice.
+
+    Args:
+        claims: The ``(invoice_ids, invoice_numbers)`` pair from
+            ``invoice_claims``.
+        exclude_invoice_id: The invoice to make invisible, or None to pass the
+            claims through untouched.
+    """
+    claim_ids, claim_numbers = claims
+    if not exclude_invoice_id:
+        return claim_ids, claim_numbers
+
+    # Indexed rather than zipped.  ``invoice_claims`` pads the numbers to match
+    # the ids, but zip would silently truncate to the shorter list if that ever
+    # stopped being true, dropping a real claim held by another invoice — and a
+    # dropped claim reads as never invoiced, which bills the client twice.  A
+    # missing number is only a missing label, so it degrades to "".
+    kept_ids: list = []
+    kept_numbers: list = []
+    for index, claim_id in enumerate(claim_ids):
+        if claim_id == exclude_invoice_id:
+            continue
+        kept_ids.append(claim_id)
+        kept_numbers.append(
+            claim_numbers[index] if index < len(claim_numbers) else ""
+        )
+    return kept_ids, kept_numbers
 
 
 def _claim_labels(claim_ids, claim_numbers) -> list:
@@ -784,6 +832,8 @@ async def preview_invoice(
     - ``include_invoiced`` – when false, entries already on an invoice are
       skipped.
     - ``include_trackers`` – when false, no tracker lines are built at all.
+    - ``for_invoice_id``   – the invoice being rebuilt, whose own claims are
+      ignored so its entries and trackers read as unclaimed.
 
     Entries still running with no manual hours are excluded and reported via
     ``running_entry_count`` so the caller can warn about them.
@@ -828,7 +878,9 @@ async def preview_invoice(
         if entry_date < payload.period_start or entry_date > payload.period_end:
             continue
 
-        claim_ids, claim_numbers = invoice_claims(data)
+        claim_ids, claim_numbers = _visible_claims(
+            invoice_claims(data), payload.for_invoice_id
+        )
         if not payload.include_invoiced and claim_ids:
             continue
 
@@ -926,7 +978,9 @@ async def preview_invoice(
         )
 
     for doc, data, task_datas in tracker_candidates:
-        claim_ids, claim_numbers = invoice_claims(data)
+        claim_ids, claim_numbers = _visible_claims(
+            invoice_claims(data), payload.for_invoice_id
+        )
         if not payload.include_invoiced and claim_ids:
             continue
 
