@@ -13,6 +13,7 @@ import InvoiceLineTable from '../components/InvoiceLineTable';
 import InvoiceBuilder, {
   InvoiceMetaFields, metaFromInvoice, clearable, CLEAR, type InvoiceMeta,
 } from '../components/InvoiceBuilder';
+import RegenerateModal from '../components/RegenerateModal';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -70,6 +71,11 @@ export default function InvoicesPage() {
   const [saving, setSaving] = useState(false);
   const [busyStatus, setBusyStatus] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showRegenerate, setShowRegenerate] = useState(false);
+  // A period a regenerate settled on, held until the next save. The lines and
+  // the printed period have to move together, so this rides along with `lines`
+  // rather than being written when the modal closes.
+  const [pendingPeriod, setPendingPeriod] = useState<{ start: string; end: string } | null>(null);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -104,12 +110,18 @@ export default function InvoicesPage() {
     setLines(invoice.lines ?? []);
     setMeta(metaFromInvoice(invoice));
     setDirty(false);
+    // Keyed on selectedId, so without this a period regenerated for one invoice
+    // would be saved onto whichever invoice is selected next.
+    setPendingPeriod(null);
   };
 
   useEffect(() => {
-    if (!selected) { setLines([]); setMeta(null); setDirty(false); return; }
+    if (!selected) {
+      setLines([]); setMeta(null); setDirty(false); setPendingPeriod(null); return;
+    }
     loadEditor(selected);
     setConfirmDelete(false);
+    setShowRegenerate(false);
     setDetailError('');
   }, [selectedId]);
 
@@ -123,6 +135,16 @@ export default function InvoicesPage() {
     setSaving(true);
     setDetailError('');
     try {
+      // A regenerate rebuilt the lines from a different period, so the period
+      // that prints has to follow them. Sent only when it actually moved —
+      // these are plain dates with no clearing sentinel, so an empty one is
+      // never sent at all.
+      const periodMoved =
+        pendingPeriod !== null &&
+        pendingPeriod.start !== '' && pendingPeriod.end !== '' &&
+        (pendingPeriod.start !== (selected.period_start ?? '') ||
+          pendingPeriod.end !== (selected.period_end ?? ''));
+
       const payload: UpdateInvoicePayload = {
         // issue_date is not optional server-side and has no sentinel, so an
         // emptied field omits the key and keeps the stored date.
@@ -130,6 +152,9 @@ export default function InvoicesPage() {
         // currency is deliberately absent — it is not a clearable field, and
         // the detail editor offers no way to change it.
         due_date: clearable(meta.due_date),
+        ...(periodMoved
+          ? { period_start: pendingPeriod!.start, period_end: pendingPeriod!.end }
+          : {}),
         lines,
         // "null" clears; a real JSON null would be read as "field absent".
         discount_type: (meta.discount_type ?? CLEAR) as UpdateInvoicePayload['discount_type'],
@@ -279,11 +304,16 @@ export default function InvoicesPage() {
                         {STATUS_LABEL[selected.status]}
                       </span>
                     </div>
+                    {/* A regenerated period is shown before it is saved — it is
+                        what the lines below now cover, and what will print. */}
                     <p className="text-xs text-slate-400">
                       {selected.client_name}
-                      {selected.period_start && selected.period_end
-                        ? ` · ${formatDate(selected.period_start)} – ${formatDate(selected.period_end)}`
-                        : ''}
+                      {pendingPeriod
+                        ? ` · ${formatDate(pendingPeriod.start)} – ${formatDate(pendingPeriod.end)}`
+                        : selected.period_start && selected.period_end
+                          ? ` · ${formatDate(selected.period_start)} – ${formatDate(selected.period_end)}`
+                          : ''}
+                      {pendingPeriod && <span className="text-amber-300/80"> · period unsaved</span>}
                     </p>
                     <p className="text-xs text-slate-500 mt-0.5">
                       Issued {formatDate(selected.issue_date)} · Due {formatDate(selected.due_date)}
@@ -301,6 +331,12 @@ export default function InvoicesPage() {
                         Mark {STATUS_LABEL[s].toLowerCase()}
                       </button>
                     ))}
+                    <button
+                      onClick={() => setShowRegenerate(true)}
+                      className="px-2.5 py-1 text-xs rounded-lg bg-slate-800 border border-slate-700 text-violet-300 hover:text-violet-200 transition-colors"
+                    >
+                      Regenerate
+                    </button>
                     <Link
                       to={`/invoices/${selected.id}/print`}
                       className="px-2.5 py-1 text-xs rounded-lg bg-slate-800 border border-slate-700 text-slate-300 hover:text-white transition-colors"
@@ -419,6 +455,22 @@ export default function InvoicesPage() {
             setShowBuilder(false);
           }}
           onClose={() => setShowBuilder(false)}
+        />
+      )}
+
+      {showRegenerate && selected && (
+        <RegenerateModal
+          invoice={selected}
+          projects={projects}
+          // The working lines, not the stored ones, so unsaved hand-edits take
+          // part in the merge instead of being silently reverted by it.
+          currentLines={lines}
+          onApply={(merged, periodStart, periodEnd) => {
+            setLines(merged);
+            setPendingPeriod({ start: periodStart, end: periodEnd });
+            setDirty(true);   // nothing is written until the user saves
+          }}
+          onClose={() => setShowRegenerate(false)}
         />
       )}
     </div>
