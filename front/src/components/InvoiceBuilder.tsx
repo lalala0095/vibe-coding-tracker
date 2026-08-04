@@ -65,6 +65,10 @@ export interface InvoiceMeta {
   tax_percent: number;
   notes: string;
   payment_terms: string;
+  // Print-only. These hide a block on the printed invoice; the value itself is
+  // still stored and still editable above.
+  show_due_date: boolean;
+  show_payment_terms: boolean;
 }
 
 export function defaultMeta(settings: InvoiceSettings | null): InvoiceMeta {
@@ -78,6 +82,8 @@ export function defaultMeta(settings: InvoiceSettings | null): InvoiceMeta {
     tax_percent: settings?.default_tax_percent ?? 0,
     notes: '',
     payment_terms: settings?.default_payment_terms ?? '',
+    show_due_date: true,
+    show_payment_terms: true,
   };
 }
 
@@ -91,6 +97,10 @@ export function metaFromInvoice(invoice: Invoice): InvoiceMeta {
     tax_percent: invoice.tax_percent ?? 0,
     notes: invoice.notes ?? '',
     payment_terms: invoice.payment_terms ?? '',
+    // `!== false`, so an invoice stored before these fields existed reads as
+    // showing both — which is what it already prints.
+    show_due_date: invoice.show_due_date !== false,
+    show_payment_terms: invoice.show_payment_terms !== false,
   };
 }
 
@@ -194,6 +204,32 @@ export function InvoiceMetaFields({
           className={`${FIELD} resize-none`}
         />
       </div>
+
+      {/* Print visibility. These hide a block on the printed document only —
+          the due date and payment terms above stay stored and stay editable. */}
+      <div>
+        <label className={LABEL}>Show on the printed invoice</label>
+        <div className="flex flex-wrap gap-x-6 gap-y-2">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={meta.show_due_date}
+              onChange={(e) => set({ show_due_date: e.target.checked })}
+              className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0"
+            />
+            <span className="text-sm text-slate-300">Due date</span>
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={meta.show_payment_terms}
+              onChange={(e) => set({ show_payment_terms: e.target.checked })}
+              className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0"
+            />
+            <span className="text-sm text-slate-300">Payment terms</span>
+          </label>
+        </div>
+      </div>
     </div>
   );
 }
@@ -216,7 +252,7 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
   const [includeInvoiced, setIncludeInvoiced] = useState(false);
 
   const [lines, setLines] = useState<InvoiceLine[]>([]);
-  const [currency, setCurrency] = useState(settings?.default_currency ?? 'SGD');
+  const [currency, setCurrency] = useState(settings?.default_currency ?? 'USD');
   const [runningCount, setRunningCount] = useState(0);
   const [claimedCount, setClaimedCount] = useState(0);
   const [claimedInvoices, setClaimedInvoices] = useState<string[]>([]);
@@ -271,7 +307,7 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
       });
 
       setLines(preview.lines ?? []);
-      setCurrency(preview.currency || selectedClient?.currency || 'SGD');
+      setCurrency(preview.currency || selectedClient?.currency || 'USD');
       setRunningCount(preview.running_entry_count ?? 0);
       setClaimedCount(preview.claimed_entry_count ?? 0);
       // Distinct invoice numbers across every claimed line, first-seen order.
@@ -314,6 +350,8 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
         discount_type: meta.discount_type,
         discount_value: meta.discount_value,
         tax_percent: meta.tax_percent,
+        show_due_date: meta.show_due_date,
+        show_payment_terms: meta.show_payment_terms,
       };
       onCreated(await createInvoice(payload));
     } catch {

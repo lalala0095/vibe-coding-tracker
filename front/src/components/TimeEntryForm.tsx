@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import type { TimeEntry } from '../types';
+import DateTimeInput from './DateTimeInput';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 // Duplicated from TrackersPage.tsx, matching how this codebase already repeats
@@ -145,25 +146,13 @@ export default function TimeEntryForm({ initial, onSubmit, onCancel, submitLabel
           <label className="text-sm font-medium text-slate-300">
             Start <span className="text-red-400">*</span>
           </label>
-          <input
-            type="datetime-local"
-            value={start}
-            onChange={(e) => setStart(e.target.value)}
-            className="w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-3 py-2 text-sm
-                       focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent"
-          />
+          <DateTimeInput value={start} onChange={setStart} />
         </div>
         <div className="flex flex-col gap-1.5">
           <label className="text-sm font-medium text-slate-300">
             End <span className="text-slate-500 font-normal">(optional)</span>
           </label>
-          <input
-            type="datetime-local"
-            value={end}
-            onChange={(e) => setEnd(e.target.value)}
-            className="w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-3 py-2 text-sm
-                       focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent"
-          />
+          <DateTimeInput value={end} onChange={setEnd} />
         </div>
       </div>
 

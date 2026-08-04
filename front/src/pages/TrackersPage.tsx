@@ -1,11 +1,14 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
+import axios from 'axios';
 import AppNav from '../components/AppNav';
+import DateTimeInput from '../components/DateTimeInput';
 import {
   getTrackers, createTracker, updateTracker, deleteTracker,
-  addTasksToTracker, removeTaskFromTracker,
-  getTasks, getClients, getProjects,
+  addTasksToTracker, removeTaskFromTracker, billTracker,
+  getTasks, getClients, getProjects, createTasksBulk, getSessions,
 } from '../api';
+import { parseTaskList } from '../lib/taskPaste';
 import type {
   Tracker, Task, Client, Project,
   CreateTrackerPayload, UpdateTrackerPayload,
@@ -44,6 +47,31 @@ function toISOWithOffset(local: string): string {
   if (!local) return '';
   if (local.includes('+') || local.toLowerCase().includes('z')) return local;
   return `${local}:00+08:00`;
+}
+
+// The API answers a rejected write with a `detail` string worth showing verbatim
+// ("Stop the tracker or supply 'hours' before billing it."). Anything else falls
+// back to the caller's message. No request is made here — this only reads an
+// error that api.ts already produced.
+function errorDetail(e: unknown, fallback: string): string {
+  if (axios.isAxiosError(e)) {
+    const data: unknown = e.response?.data;
+    if (data && typeof data === 'object' && 'detail' in data) {
+      const detail = (data as { detail: unknown }).detail;
+      if (typeof detail === 'string' && detail.trim()) return detail;
+    }
+  }
+  return fallback;
+}
+
+// A tracker's own span, in hours to 2dp. Null while it is still running — the
+// server then requires the hours to be supplied by hand.
+function elapsedHours(tracker: Tracker): number | null {
+  if (!tracker.end_time) return null;
+  const start = new Date(tracker.start_time).getTime();
+  const end = new Date(tracker.end_time).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end)) return null;
+  return Math.round(((end - start) / 3600000) * 100) / 100;
 }
 
 // ── Tracker Form Modal ────────────────────────────────────────────────────────
@@ -104,21 +132,11 @@ function TrackerForm({ initial, onSave, onClose }: TrackerFormProps) {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-xs text-slate-400 mb-1">Start time</label>
-              <input
-                type="datetime-local"
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
-                value={startTime}
-                onChange={e => setStartTime(e.target.value)}
-              />
+              <DateTimeInput value={startTime} onChange={setStartTime} />
             </div>
             <div>
               <label className="block text-xs text-slate-400 mb-1">End time (optional)</label>
-              <input
-                type="datetime-local"
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
-                value={endTime}
-                onChange={e => setEndTime(e.target.value)}
-              />
+              <DateTimeInput value={endTime} onChange={setEndTime} />
             </div>
           </div>
           <div>
@@ -162,8 +180,13 @@ interface AddTasksModalProps {
   clients: Client[];
   projects: Project[];
   onAdd: (taskIds: string[]) => Promise<void>;
+  // Create the pasted titles as new tasks under a project and link them to the
+  // tracker. The page owns both calls so its task list stays in step.
+  onCreateTasks: (projectId: string, titles: string[]) => Promise<void>;
   onClose: () => void;
 }
+
+type AddTasksMode = 'pick' | 'paste';
 
 // ── Recursive task row used inside AddTasksModal ──────────────────────────────
 
@@ -279,9 +302,10 @@ function TaskTreeRow({
   );
 }
 
-function AddTasksModal({ tracker, allTasks, clients, projects, onAdd, onClose }: AddTasksModalProps) {
+function AddTasksModal({ tracker, allTasks, clients, projects, onAdd, onCreateTasks, onClose }: AddTasksModalProps) {
   const existingIds = new Set(tracker.tasks.map(t => t.task_id));
 
+  const [mode, setMode] = useState<AddTasksMode>('pick');
   const [expandedClients, setExpandedClients] = useState<Set<string>>(
     () => new Set(clients.map(c => c.id))
   );
@@ -289,6 +313,14 @@ function AddTasksModal({ tracker, allTasks, clients, projects, onAdd, onClose }:
   const [expandedTasks, setExpandedTasks] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
+
+  // Paste mode: the textarea is the source, `titles` the editable result of
+  // parsing it. The splitter can guess wrong, so every title stays editable.
+  const [pasteProjectId, setPasteProjectId] = useState('');
+  const [pasteText, setPasteText] = useState('');
+  const [titles, setTitles] = useState<string[]>([]);
+  const filledTitles = titles.map(t => t.trim()).filter(Boolean);
 
   // Build subtask map from allTasks (already fully loaded)
   const subtasksOf: Record<string, Task[]> = {};
@@ -335,12 +367,44 @@ function AddTasksModal({ tracker, allTasks, clients, projects, onAdd, onClose }:
     });
   }
 
+  function handlePasteChange(text: string) {
+    setPasteText(text);
+    setTitles(parseTaskList(text));
+  }
+
+  function updateTitle(index: number, value: string) {
+    setTitles(prev => prev.map((t, i) => (i === index ? value : t)));
+  }
+
+  function removeTitle(index: number) {
+    setTitles(prev => prev.filter((_, i) => i !== index));
+  }
+
   async function handleAdd() {
     if (selected.size === 0) return;
     setSaving(true);
+    setErr('');
     try {
       await onAdd(Array.from(selected));
       onClose();
+    } catch (e) {
+      setErr(errorDetail(e, 'Failed to add the tasks. Please try again.'));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // Both calls have to land — created tasks that never reached the tracker
+  // would be invisible here — so the modal stays open on any failure.
+  async function handleCreate() {
+    if (!pasteProjectId || filledTitles.length === 0) return;
+    setSaving(true);
+    setErr('');
+    try {
+      await onCreateTasks(pasteProjectId, filledTitles);
+      onClose();
+    } catch (e) {
+      setErr(errorDetail(e, 'Failed to create the tasks. Please try again.'));
     } finally {
       setSaving(false);
     }
@@ -359,7 +423,25 @@ function AddTasksModal({ tracker, allTasks, clients, projects, onAdd, onClose }:
           </button>
         </div>
 
-        {/* Body: sidebar + task tree */}
+        {/* Mode tabs */}
+        <div className="flex gap-1 px-5 pt-3 pb-2 border-b border-slate-800 shrink-0">
+          {([['pick', 'Pick existing'], ['paste', 'Paste new tasks']] as const).map(([value, label]) => (
+            <button
+              key={value}
+              onClick={() => { setMode(value); setErr(''); }}
+              className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${
+                mode === value
+                  ? 'bg-slate-800 text-white'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {mode === 'pick' ? (
+        /* Body: sidebar + task tree */
         <div className="flex flex-1 overflow-hidden">
           {/* Left: client/project tree */}
           <aside className="w-48 shrink-0 border-r border-slate-800 overflow-y-auto bg-slate-950/50">
@@ -439,26 +521,120 @@ function AddTasksModal({ tracker, allTasks, clients, projects, onAdd, onClose }:
             )}
           </div>
         </div>
+        ) : (
+        /* Body: paste a block of text, review it, create the tasks */
+        <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">Project</label>
+            <select
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+              value={pasteProjectId}
+              onChange={e => setPasteProjectId(e.target.value)}
+            >
+              <option value="">Select a project…</option>
+              {clientProjectGroups.map(({ client, projects: cProjects }) => (
+                cProjects.length > 0 && (
+                  <optgroup key={client.id} label={client.name}>
+                    {cProjects.map(p => (
+                      <option key={p.id} value={p.id}>{client.name} / {p.name}</option>
+                    ))}
+                  </optgroup>
+                )
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">Paste your tasks</label>
+            <textarea
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500 resize-none"
+              rows={5}
+              value={pasteText}
+              onChange={e => handlePasteChange(e.target.value)}
+              placeholder="One per line, or a paragraph — each sentence becomes a task."
+            />
+          </div>
+
+          {titles.length === 0 ? (
+            <p className="text-xs text-slate-500">
+              Nothing parsed yet. Everything below stays editable before you create it.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                  Preview
+                </span>
+                <span className="text-xs text-slate-500">
+                  {filledTitles.length} task{filledTitles.length !== 1 ? 's' : ''}
+                </span>
+              </div>
+              {titles.map((title, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <span className="w-5 shrink-0 text-xs text-slate-600 text-right">{i + 1}</span>
+                  <input
+                    className="flex-1 min-w-0 bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                    value={title}
+                    onChange={e => updateTitle(i, e.target.value)}
+                  />
+                  <button
+                    onClick={() => removeTitle(i)}
+                    className="shrink-0 text-slate-600 hover:text-red-400 transition-colors"
+                    title="Remove this task"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+              ))}
+              <p className="text-xs text-slate-500">
+                Blank titles are dropped. The tasks are created in the project above and linked to this tracker.
+              </p>
+            </div>
+          )}
+        </div>
+        )}
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-5 py-3 border-t border-slate-700 shrink-0 bg-slate-900">
-          <span className="text-xs text-slate-400">
-            {selected.size > 0 ? `${selected.size} task${selected.size !== 1 ? 's' : ''} selected` : 'Click tasks to select'}
-          </span>
-          <div className="flex gap-2">
+        <div className="flex items-center justify-between gap-3 px-5 py-3 border-t border-slate-700 shrink-0 bg-slate-900">
+          {err ? (
+            <span className="text-xs text-red-400">{err}</span>
+          ) : mode === 'pick' ? (
+            <span className="text-xs text-slate-400">
+              {selected.size > 0 ? `${selected.size} task${selected.size !== 1 ? 's' : ''} selected` : 'Click tasks to select'}
+            </span>
+          ) : (
+            <span className="text-xs text-slate-400">
+              {filledTitles.length > 0
+                ? `${filledTitles.length} task${filledTitles.length !== 1 ? 's' : ''} ready`
+                : 'Paste something to get started'}
+            </span>
+          )}
+          <div className="flex gap-2 shrink-0">
             <button
               onClick={onClose}
               className="px-4 py-2 text-sm rounded-lg text-slate-300 hover:bg-slate-800 transition-colors"
             >
               Cancel
             </button>
-            <button
-              onClick={handleAdd}
-              disabled={saving || selected.size === 0}
-              className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors disabled:opacity-50"
-            >
-              {saving ? 'Adding…' : `Add${selected.size > 0 ? ` (${selected.size})` : ''}`}
-            </button>
+            {mode === 'pick' ? (
+              <button
+                onClick={handleAdd}
+                disabled={saving || selected.size === 0}
+                className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors disabled:opacity-50"
+              >
+                {saving ? 'Adding…' : `Add${selected.size > 0 ? ` (${selected.size})` : ''}`}
+              </button>
+            ) : (
+              <button
+                onClick={handleCreate}
+                disabled={saving || !pasteProjectId || filledTitles.length === 0}
+                className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors disabled:opacity-50"
+              >
+                {saving ? 'Creating…' : `Create${filledTitles.length > 0 ? ` (${filledTitles.length})` : ''}`}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -480,6 +656,71 @@ interface TrackerPanelProps {
 function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveTask }: TrackerPanelProps) {
   const isActive = !tracker.end_time;
   const navigate = useNavigate();
+
+  // Billing the tracker: turning its span into time entries on the `sessions`
+  // collection, which is what an invoice reads.
+  const [billOpen, setBillOpen] = useState(false);
+  const [billSplit, setBillSplit] = useState<'even' | 'full'>('even');
+  const [billHours, setBillHours] = useState('');
+  const [billable, setBillable] = useState(true);
+  const [billing, setBilling] = useState(false);
+  const [billErr, setBillErr] = useState('');
+  const [billCount, setBillCount] = useState<number | null>(null);
+  const [billedTaskIds, setBilledTaskIds] = useState<string[]>([]);
+
+  // The server bills only the tasks it has not already billed from this tracker,
+  // so hours entered on a second pass land entirely on the newcomers. Knowing
+  // which tasks are already covered is what lets us warn about that.
+  const alreadyBilled = tracker.tasks.filter(t => billedTaskIds.includes(t.task_id)).length;
+  const remaining = tracker.tasks.length - alreadyBilled;
+
+  // Best-effort: a failed lookup costs the warning, never the billing.
+  function refreshBilledTasks() {
+    getSessions({ tracker_id: tracker.id })
+      .then(entries => setBilledTaskIds(entries.map(s => s.task_id)))
+      .catch(() => setBilledTaskIds([]));
+  }
+
+  function openBilling() {
+    const elapsed = elapsedHours(tracker);
+    // The tracker's own span is only the starting number — it stays editable,
+    // and is never quietly reduced to a share. The warning tells; it decides.
+    setBillHours(elapsed !== null ? elapsed.toFixed(2) : '');
+    setBillSplit('even');
+    setBillable(true);
+    setBillErr('');
+    setBillCount(null);
+    setBilledTaskIds([]);
+    setBillOpen(true);
+    refreshBilledTasks();
+  }
+
+  async function handleBill(e: React.FormEvent) {
+    e.preventDefault();
+    const trimmed = billHours.trim();
+    const hours = trimmed ? Number(trimmed) : undefined;
+    if (hours !== undefined && !Number.isFinite(hours)) {
+      setBillErr('Hours must be a number.');
+      return;
+    }
+    setBilling(true);
+    setBillErr('');
+    setBillCount(null);
+    try {
+      const created = await billTracker(tracker.id, {
+        split: billSplit,
+        ...(hours !== undefined ? { hours } : {}),
+        billable,
+      });
+      setBillCount(created.length);
+      // The panel stays open, so the warning has to reflect what was just billed.
+      refreshBilledTasks();
+    } catch (e) {
+      setBillErr(errorDetail(e, 'Failed to create time entries. Please try again.'));
+    } finally {
+      setBilling(false);
+    }
+  }
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -532,17 +773,139 @@ function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveT
       <div className="flex-1 overflow-y-auto">
         {/* Tasks section */}
         <div className="px-5 py-4">
-          <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center justify-between gap-3 mb-3">
             <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
               Tasks ({tracker.tasks.length})
             </h3>
-            <button
-              onClick={onAddTasks}
-              className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
-            >
-              + Add tasks
-            </button>
+            <div className="flex items-center gap-3 shrink-0">
+              <button
+                onClick={onAddTasks}
+                className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+              >
+                + Add tasks
+              </button>
+              <button
+                onClick={() => (billOpen ? setBillOpen(false) : openBilling())}
+                disabled={tracker.tasks.length === 0}
+                className="px-2.5 py-1 text-xs rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors disabled:opacity-50"
+              >
+                Create time entries
+              </button>
+            </div>
           </div>
+
+          {/* Billing panel — the bridge from tracked time to billable hours */}
+          {billOpen && (
+            <form
+              onSubmit={handleBill}
+              className="flex flex-col gap-3 mb-4 p-4 rounded-lg bg-slate-900 border border-slate-700"
+            >
+              <div>
+                <span className="block text-xs text-slate-400 mb-1.5">How should the hours land?</span>
+                <div className="flex flex-col gap-1.5">
+                  <label className="flex items-center gap-2 text-sm text-slate-200 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="split"
+                      checked={billSplit === 'even'}
+                      onChange={() => setBillSplit('even')}
+                      className="accent-blue-500"
+                    />
+                    Divide across tasks
+                  </label>
+                  <label className="flex items-center gap-2 text-sm text-slate-200 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="split"
+                      checked={billSplit === 'full'}
+                      onChange={() => setBillSplit('full')}
+                      className="accent-blue-500"
+                    />
+                    Full span for each task
+                  </label>
+                </div>
+                <p className="mt-1.5 text-xs text-slate-500">
+                  Divide = the tracker's hours shared out; full = each task billed the whole span, for work done in parallel.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Hours</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  className="w-32 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+                  value={billHours}
+                  onChange={e => setBillHours(e.target.value)}
+                  placeholder="0.00"
+                />
+                <p className="mt-1 text-xs text-slate-500">
+                  {isActive
+                    ? 'This tracker is still running, so enter the hours yourself — the server needs a number.'
+                    : "Prefilled from the tracker's span. Change it freely."}
+                </p>
+              </div>
+
+              <label className="flex items-center gap-2 text-sm text-slate-200 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={billable}
+                  onChange={e => setBillable(e.target.checked)}
+                  className="accent-blue-500"
+                />
+                Billable
+              </label>
+
+              {alreadyBilled > 0 && (
+                <p className="text-xs text-amber-300 bg-amber-400/10 border border-amber-400/20 rounded-lg px-3 py-2">
+                  {remaining === 0 ? (
+                    'Every task on this tracker already has a time entry from it. Submitting creates nothing new — add a task first, or edit the existing entries on the Time Entries page.'
+                  ) : (
+                    <>
+                      {alreadyBilled} of {tracker.tasks.length} task{tracker.tasks.length !== 1 ? 's' : ''}
+                      {alreadyBilled === 1 ? ' already has a time entry' : ' already have time entries'}.{' '}
+                      {remaining === 1
+                        ? 'The hours you enter will go entirely to the 1 remaining task — set them to just that task’s share.'
+                        : billSplit === 'even'
+                        ? `The hours you enter will be split across only the ${remaining} remaining tasks — set them to just those tasks’ share.`
+                        : `Each of the ${remaining} remaining tasks will be billed the full hours you enter — set them to just that share.`}
+                    </>
+                  )}
+                </p>
+              )}
+
+              {billErr && <p className="text-xs text-red-400">{billErr}</p>}
+
+              {billCount !== null && (
+                billCount > 0 ? (
+                  <p className="text-xs text-green-400">
+                    Created {billCount} time {billCount === 1 ? 'entry' : 'entries'}.{' '}
+                    <Link to="/time" className="text-blue-400 hover:text-blue-300 underline transition-colors">
+                      Time Entries
+                    </Link>
+                  </p>
+                ) : (
+                  <p className="text-xs text-slate-400">
+                    Every task on this tracker already has a time entry. Nothing new was created.
+                  </p>
+                )
+              )}
+
+              <div className="flex items-center justify-between gap-3 pt-1">
+                <p className="text-xs text-slate-500">
+                  A starting point — hours, dates and rates stay editable on the Time Entries page.
+                </p>
+                <button
+                  type="submit"
+                  disabled={billing}
+                  className="shrink-0 px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors disabled:opacity-50"
+                >
+                  {billing ? 'Creating…' : 'Create'}
+                </button>
+              </div>
+            </form>
+          )}
           {tracker.tasks.length === 0 ? (
             <p className="text-xs text-slate-500">No tasks linked yet.</p>
           ) : (
@@ -674,6 +1037,17 @@ export default function TrackersPage() {
     setSelectedTracker(updated);
   }
 
+  // Pasted titles become real tasks, which are then linked to the tracker. The
+  // new tasks are merged into `tasks` so the "Pick existing" tree isn't stale.
+  async function handleCreateTasks(projectId: string, titles: string[]) {
+    if (!selectedTracker) return;
+    const created = await createTasksBulk({ project_id: projectId, titles });
+    setTasks(prev => [...created, ...prev]);
+    const updated = await addTasksToTracker(selectedTracker.id, created.map(t => t.id));
+    setTrackers(prev => prev.map(t => t.id === updated.id ? updated : t));
+    setSelectedTracker(updated);
+  }
+
   async function handleRemoveTask(taskId: string) {
     if (!selectedTracker) return;
     const updated = await removeTaskFromTracker(selectedTracker.id, taskId);
@@ -771,6 +1145,7 @@ export default function TrackersPage() {
       <div className="flex-1 overflow-hidden">
         {selectedTracker ? (
           <TrackerPanel
+            key={selectedTracker.id}
             tracker={selectedTracker}
             onEdit={() => setModal({ kind: 'edit_tracker', tracker: selectedTracker })}
             onDelete={() => handleDeleteTracker(selectedTracker)}
@@ -806,6 +1181,7 @@ export default function TrackersPage() {
           clients={clients}
           projects={projects}
           onAdd={handleAddTasks}
+          onCreateTasks={handleCreateTasks}
           onClose={() => setModal({ kind: 'none' })}
         />
       )}

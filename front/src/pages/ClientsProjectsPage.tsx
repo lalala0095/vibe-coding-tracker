@@ -83,7 +83,7 @@ export default function ClientsProjectsPage() {
   const [clientsError, setClientsError] = useState('');
   const [newClientName, setNewClientName] = useState('');
   const [newClientRate, setNewClientRate] = useState('');
-  const [newClientCurrency, setNewClientCurrency] = useState('SGD');
+  const [newClientCurrency, setNewClientCurrency] = useState('USD');
   const [newClientEmail, setNewClientEmail] = useState('');
   const [newClientAddress, setNewClientAddress] = useState('');
   const [addingClient, setAddingClient] = useState(false);
@@ -186,7 +186,7 @@ export default function ClientsProjectsPage() {
       setClients((prev) => [...prev, created]);
       setNewClientName('');
       setNewClientRate('');
-      setNewClientCurrency('SGD');
+      setNewClientCurrency('USD');
       setNewClientEmail('');
       setNewClientAddress('');
       // Auto-select new client for project form
@@ -434,7 +434,7 @@ export default function ClientsProjectsPage() {
                       type="text"
                       value={newClientCurrency}
                       onChange={(e) => setNewClientCurrency(e.target.value)}
-                      placeholder="SGD"
+                      placeholder="USD"
                       className="bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-3 py-2
                                  text-sm placeholder:text-slate-500
                                  focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent"
@@ -570,7 +570,7 @@ export default function ClientsProjectsPage() {
                                 type="text"
                                 value={clientDraft.currency}
                                 onChange={(e) => setClientDraft({ ...clientDraft, currency: e.target.value })}
-                                placeholder="SGD"
+                                placeholder="USD"
                                 className="bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-3 py-2
                                            text-sm placeholder:text-slate-500
                                            focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent"
@@ -844,7 +844,7 @@ export default function ClientsProjectsPage() {
                     // Display only: the server snapshots the real rate at invoice
                     // build time. A null project rate inherits the client default.
                     const owner = clients.find((c) => c.id === project.client_id);
-                    const currency = owner?.currency ?? 'SGD';
+                    const currency = owner?.currency ?? 'USD';
                     const effectiveRate = project.rate ?? owner?.default_rate ?? null;
                     const inherited = project.rate === null && effectiveRate !== null;
 

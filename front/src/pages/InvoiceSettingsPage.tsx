@@ -14,6 +14,7 @@ const LABEL = 'text-xs text-slate-400 mb-1 block';
 // while being typed. Converted back to the wire types on save.
 interface FormState {
   business_name: string;
+  contact_name: string;
   address: string;
   email: string;
   logo_url: string;
@@ -30,10 +31,11 @@ interface FormState {
 function toForm(s: InvoiceSettings): FormState {
   return {
     business_name: s.business_name ?? '',
+    contact_name: s.contact_name ?? '',
     address: s.address ?? '',
     email: s.email ?? '',
     logo_url: s.logo_url ?? '',
-    default_currency: s.default_currency ?? 'SGD',
+    default_currency: s.default_currency ?? 'USD',
     default_payment_terms: s.default_payment_terms ?? '',
     default_due_days: String(s.default_due_days ?? 14),
     default_tax_label: s.default_tax_label ?? '',
@@ -82,6 +84,7 @@ export default function InvoiceSettingsPage() {
     try {
       const payload: UpdateInvoiceSettingsPayload = {
         business_name: form.business_name,
+        contact_name: form.contact_name,
         address: form.address,
         email: form.email,
         // logo_url is a string field, so the repo's "null" sentinel clears it.
@@ -157,6 +160,18 @@ export default function InvoiceSettingsPage() {
                     />
                   </div>
                   <div>
+                    <label className={LABEL}>
+                      Your name <span className="text-slate-600">(printed under the business name)</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={form.contact_name}
+                      onChange={(e) => set({ contact_name: e.target.value })}
+                      placeholder="Jane Tan"
+                      className={FIELD}
+                    />
+                  </div>
+                  <div>
                     <label className={LABEL}>Email</label>
                     <input
                       type="email"
@@ -202,7 +217,7 @@ export default function InvoiceSettingsPage() {
                     type="text"
                     value={form.default_currency}
                     onChange={(e) => set({ default_currency: e.target.value })}
-                    placeholder="SGD"
+                    placeholder="USD"
                     className={FIELD}
                   />
                 </div>
