@@ -1,8 +1,9 @@
+import math
 from datetime import datetime
 from typing import Annotated, Optional
 
 import pytz
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from auth import get_current_user
@@ -30,7 +31,22 @@ DEFAULT_SETTINGS: dict = {
     "default_rate": 0.0,
     "invoice_prefix": "INV",
     "reset_sequence_yearly": True,
+    # Billing increment for hours, in hours: 0.25 is a quarter hour, 0 is off.
+    #
+    # A DEFAULT ONLY.  Nothing on the server rounds hours, and nothing should
+    # start to on the strength of this field existing.  Rounding happens when
+    # the user explicitly asks for it, on the lines they picked; this value only
+    # pre-fills that action.  Reading it as "the server rounds hours" would turn
+    # a suggestion into a constraint on hours the owner must stay able to type
+    # by hand.
+    "hours_rounding_increment": 0.25,
+    "hours_rounding_direction": "nearest",
 }
+
+VALID_ROUNDING_DIRECTIONS = ("nearest", "up", "down")
+
+# An increment longer than a day is a typo, not a billing policy.
+MAX_ROUNDING_INCREMENT = 24.0
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas
@@ -51,6 +67,8 @@ class InvoiceSettingsUpdate(BaseModel):
     default_rate: Optional[float] = None
     invoice_prefix: Optional[str] = None
     reset_sequence_yearly: Optional[bool] = None
+    hours_rounding_increment: Optional[float] = None
+    hours_rounding_direction: Optional[str] = None
 
 
 class InvoiceSettingsResponse(BaseModel):
@@ -67,6 +85,8 @@ class InvoiceSettingsResponse(BaseModel):
     default_rate: float
     invoice_prefix: str
     reset_sequence_yearly: bool
+    hours_rounding_increment: float
+    hours_rounding_direction: str
     datetime_inserted: str
     datetime_updated: str
 
@@ -108,9 +128,62 @@ def _data_to_settings(data: dict) -> InvoiceSettingsResponse:
         reset_sequence_yearly=data.get(
             "reset_sequence_yearly", DEFAULT_SETTINGS["reset_sequence_yearly"]
         ),
+        # Settings documents written before rounding existed carry neither key,
+        # so both fall back to the default rather than 500ing the read.
+        hours_rounding_increment=data.get(
+            "hours_rounding_increment", DEFAULT_SETTINGS["hours_rounding_increment"]
+        ),
+        hours_rounding_direction=data.get(
+            "hours_rounding_direction", DEFAULT_SETTINGS["hours_rounding_direction"]
+        ),
         datetime_inserted=data.get("datetime_inserted", ""),
         datetime_updated=data.get("datetime_updated", ""),
     )
+
+
+def _validate_rounding_direction(value: str) -> str:
+    """
+    Check a rounding direction against the known set.
+
+    Matched exactly, like the tracker split modes: ``"Up"`` is rejected rather
+    than falling through to ``"nearest"``, because a direction that silently
+    became something else would pre-fill the user's rounding action with the
+    opposite of what they asked for.
+    """
+    if value not in VALID_ROUNDING_DIRECTIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Hours rounding direction must be one of: "
+                f"{', '.join(VALID_ROUNDING_DIRECTIONS)}."
+            ),
+        )
+    return value
+
+
+def _validate_rounding_increment(value: float) -> float:
+    """
+    Check a billing increment and return it quantised to 4 decimal places.
+
+    ``0`` is legal and means rounding is off.  A negative, a non-finite, or
+    anything over a day is refused — this is a correction of an unusable
+    request, not a limit on the hours anyone may bill.  The quantisation stops a
+    pasted ``0.250000000001`` from becoming the increment every line snaps to.
+    """
+    if not math.isfinite(value):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Hours rounding increment must be a finite number.",
+        )
+    if value < 0 or value > MAX_ROUNDING_INCREMENT:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Hours rounding increment must be between 0 and "
+                f"{MAX_ROUNDING_INCREMENT:g} hours (0 turns rounding off)."
+            ),
+        )
+    return round(float(value), 4)
 
 
 def get_invoice_settings(db) -> dict:
@@ -172,8 +245,22 @@ async def update_settings(
     - Only fields present in the payload are updated.
 
     Changing these defaults never rewrites existing invoices — issuer details
-    and rates are snapshotted onto each invoice at creation.
+    and rates are snapshotted onto each invoice at creation.  The same goes for
+    the rounding fields: they pre-fill an action the user takes on chosen lines,
+    so changing them rounds nothing that already exists.
     """
+    # Validated before the document is read or created, so a bad value 400s
+    # without writing anything.  Neither field takes the ``"null"`` sentinel:
+    # the increment is a number, and the direction always holds one of the three
+    # valid values rather than being cleared.
+    increment = (
+        None
+        if payload.hours_rounding_increment is None
+        else _validate_rounding_increment(payload.hours_rounding_increment)
+    )
+    if payload.hours_rounding_direction is not None:
+        _validate_rounding_direction(payload.hours_rounding_direction)
+
     db = get_firestore_client()
     doc_ref = db.collection("settings").document(SETTINGS_DOC_ID)
     get_invoice_settings(db)  # Ensure the document exists before updating.
@@ -193,10 +280,16 @@ async def update_settings(
         "default_rate",
         "invoice_prefix",
         "reset_sequence_yearly",
+        "hours_rounding_increment",
+        "hours_rounding_direction",
     ):
         value = getattr(payload, field)
         if value is not None:
             updates[field] = value
+
+    # Store the quantised increment, not the number as pasted.
+    if increment is not None:
+        updates["hours_rounding_increment"] = increment
 
     if payload.logo_url is not None:
         updates["logo_url"] = (
