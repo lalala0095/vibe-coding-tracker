@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
-import type { InvoiceSettings, UpdateInvoiceSettingsPayload } from '../types';
+import type {
+  InvoiceSettings, UpdateInvoiceSettingsPayload, HoursRoundingDirection,
+} from '../types';
 import { getInvoiceSettings, updateInvoiceSettings } from '../api';
 import AppNav from '../components/AppNav';
 
@@ -24,6 +26,10 @@ interface FormState {
   default_tax_label: string;
   default_tax_percent: string;
   default_rate: string;
+  hours_rounding_increment: string;
+  // A closed set chosen from a select, so it is kept as its union rather than a
+  // loose string — there is no half-typed intermediate state to preserve.
+  hours_rounding_direction: HoursRoundingDirection;
   invoice_prefix: string;
   reset_sequence_yearly: boolean;
 }
@@ -41,6 +47,8 @@ function toForm(s: InvoiceSettings): FormState {
     default_tax_label: s.default_tax_label ?? '',
     default_tax_percent: String(s.default_tax_percent ?? 0),
     default_rate: String(s.default_rate ?? 0),
+    hours_rounding_increment: String(s.hours_rounding_increment ?? 0.25),
+    hours_rounding_direction: s.hours_rounding_direction ?? 'nearest',
     invoice_prefix: s.invoice_prefix ?? 'INV',
     reset_sequence_yearly: s.reset_sequence_yearly ?? true,
   };
@@ -95,6 +103,10 @@ export default function InvoiceSettingsPage() {
         default_tax_label: form.default_tax_label,
         default_tax_percent: num(form.default_tax_percent),
         default_rate: num(form.default_rate),
+        // Neither takes the "null" sentinel: one is a number, the other a
+        // constrained string that is never cleared, only switched.
+        hours_rounding_increment: num(form.hours_rounding_increment),
+        hours_rounding_direction: form.hours_rounding_direction,
         invoice_prefix: form.invoice_prefix,
         reset_sequence_yearly: form.reset_sequence_yearly,
       };
@@ -271,7 +283,42 @@ export default function InvoiceSettingsPage() {
                     className={FIELD}
                   />
                 </div>
+                <div>
+                  <label className={LABEL}>Round hours to</label>
+                  <select
+                    value={form.hours_rounding_increment}
+                    onChange={(e) => set({ hours_rounding_increment: e.target.value })}
+                    className={FIELD}
+                  >
+                    <option value="0">Off</option>
+                    <option value="0.25">Quarter hour</option>
+                    <option value="0.5">Half hour</option>
+                    <option value="1">Whole hour</option>
+                  </select>
+                </div>
+                <div>
+                  <label className={LABEL}>Rounding direction</label>
+                  <select
+                    value={form.hours_rounding_direction}
+                    onChange={(e) =>
+                      set({ hours_rounding_direction: e.target.value as HoursRoundingDirection })
+                    }
+                    className={FIELD}
+                  >
+                    <option value="nearest">Nearest</option>
+                    <option value="up">Always up</option>
+                    <option value="down">Always down</option>
+                  </select>
+                </div>
               </div>
+              {/* Say plainly that nothing happens on its own. Read as an
+                  automatic setting, "always up" would look like the app
+                  quietly inflating billed hours — it never does. */}
+              <p className="text-xs text-slate-500 mt-3">
+                A default only — hours are never rounded automatically. You apply it from an
+                invoice with the <span className="text-slate-400">Round hours</span> action, and
+                choose which lines it touches.
+              </p>
             </section>
 
             {/* ── Numbering ── */}

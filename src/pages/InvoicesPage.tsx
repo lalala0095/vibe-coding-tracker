@@ -404,6 +404,10 @@ export default function InvoicesPage() {
                   taxLabel={meta.tax_label}
                   taxPercent={meta.tax_percent}
                   onChange={(next) => { setLines(next); setDirty(true); }}
+                  // Settings load is best-effort and may be null, in which case
+                  // the table falls back to its own defaults.
+                  roundingIncrement={settings?.hours_rounding_increment}
+                  roundingDirection={settings?.hours_rounding_direction}
                 />
 
                 <div className="border-t border-slate-800 pt-4">

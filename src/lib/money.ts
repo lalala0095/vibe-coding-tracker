@@ -191,6 +191,71 @@ export function computeMoney<T extends { hours: number; rate: number; amount: nu
   };
 }
 
+export type HoursRoundingDirection = 'nearest' | 'up' | 'down';
+
+/**
+ * Snap `hours` onto a multiple of `increment` — e.g. billing in quarter hours.
+ *
+ * This has **no Python counterpart on purpose**. The server never rounds hours
+ * to an increment; it only ever quantises them to 2 dp (`round_hours`). So the
+ * absence of a mirror in `invoice_service.py` is deliberate and is *not* the
+ * two implementations drifting apart, despite CLAUDE.md's sync requirement.
+ * Increment rounding is a client-side input aid: it decides what number gets
+ * typed into the invoice, and the server then treats that number as given.
+ *
+ * Direction:
+ * - `'nearest'` — the nearest multiple. An exact half-step is resolved **away
+ *   from zero**, the same tie rule `quantize` uses for ROUND_HALF_UP. On a
+ *   0.25 increment that means 1.125 → 1.25 (never 1.00), and symmetrically
+ *   -1.125 → -1.25.
+ * - `'up'` — the smallest multiple that is >= hours (toward +∞, so -1.1 → -1.0)
+ * - `'down'` — the largest multiple that is <= hours (toward -∞, so -1.1 → -1.25)
+ *
+ * Degenerate inputs are total, never thrown:
+ * - increment null / 0 / negative / non-finite / unparseable → rounding is off,
+ *   and this degrades to `roundHours`'s plain 2 dp behaviour.
+ * - hours null / undefined / unparseable → 0.
+ *
+ * The whole computation runs on the exact scaled-integer path. Doing it in
+ * floats silently overcharges a value that is *already* on the increment:
+ * `Math.ceil(0.07 / 0.01) * 0.01` is 0.08, because 0.07 / 0.01 evaluates to
+ * 7.000000000000001. Here an exact multiple is a fixed point in every
+ * direction, at every increment.
+ */
+export function roundHoursToIncrement(
+  hours: number | string | null | undefined,
+  increment: number | string | null | undefined,
+  direction: HoursRoundingDirection = 'nearest'
+): number {
+  const inc = toDec(increment);
+  if (inc.m <= 0n) return roundHours(hours);
+
+  // Align first: 9.500 and 0.25 arrive at different scales, exactly as
+  // addDec/subDec have to reconcile.
+  const [h, i, s] = align(toDec(hours), inc);
+
+  // BigInt division truncates toward zero and the remainder carries the
+  // dividend's sign, so every branch below works from the magnitude.
+  const negative = h < 0n;
+  const abs = negative ? -h : h;
+  const q = abs / i;
+  const remainder = abs % i;
+
+  let steps: bigint;
+  if (remainder === 0n) {
+    steps = q; // already on the increment — must not move, in any direction
+  } else if (direction === 'nearest') {
+    steps = remainder * 2n >= i ? q + 1n : q;
+  } else if (direction === 'up') {
+    steps = negative ? q : q + 1n; // toward +∞
+  } else {
+    steps = negative ? q + 1n : q; // toward -∞
+  }
+
+  const m = negative ? -(steps * i) : steps * i;
+  return decToNumber(quantize({ m, s }));
+}
+
 /** Display a money value, per §5. Falls back to a plain 2 dp figure. */
 export function formatMoney(value: number, currency: string): string {
   try {

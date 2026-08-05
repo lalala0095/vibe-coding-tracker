@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import type { InvoiceLine } from '../types';
+import type { InvoiceLine, HoursRoundingDirection } from '../types';
 import { computeMoney, formatMoney, type DiscountType } from '../lib/money';
+import RoundHoursModal from './RoundHoursModal';
 
 interface Props {
   lines: InvoiceLine[];
@@ -18,7 +19,16 @@ interface Props {
   // A per-line caveat from the parent — e.g. "this tracker's time entries are
   // already listed above". Rendered as a note; it never blocks anything.
   reasonForLine?: (lineId: string) => string | null;
+  // ── Hours rounding defaults (from Invoice Settings) ─────────────────────────
+  // Optional: the button is offered either way, so a surface that has not
+  // loaded settings yet still gets the feature, just with a plain default.
+  roundingIncrement?: number;
+  roundingDirection?: HoursRoundingDirection;
 }
+
+// Used when the caller has no setting to hand. A quarter hour is the increment
+// the Hours cell already steps by, so it is the least surprising fallback.
+const FALLBACK_INCREMENT = 0.25;
 
 const CELL_INPUT =
   'w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-2 py-1.5 text-sm ' +
@@ -62,10 +72,15 @@ function newLine(): InvoiceLine {
 export default function InvoiceLineTable({
   lines, currency, discountType, discountValue, taxLabel, taxPercent, onChange,
   excludedIds, onToggleExclude, reasonForLine,
+  roundingIncrement, roundingDirection,
 }: Props) {
   // Raw text for numeric cells while they are being typed, so a half-typed
   // "1." or a momentarily empty field is not snapped back to 0.
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+
+  // Line CRUD lives here, so the rounding modal does too — both call sites get
+  // the button without either having to wire it up.
+  const [rounding, setRounding] = useState(false);
 
   const selectable = onToggleExclude !== undefined;
   const isExcluded = (lineId: string) => excludedIds?.has(lineId) ?? false;
@@ -280,7 +295,7 @@ export default function InvoiceLineTable({
         </table>
       </div>
 
-      <div>
+      <div className="flex items-center gap-4">
         <button
           onClick={() => onChange([...lines, newLine()])}
           className="flex items-center gap-1 text-xs text-violet-400 hover:text-violet-300 transition-colors"
@@ -290,7 +305,39 @@ export default function InvoiceLineTable({
           </svg>
           Add line
         </button>
+        {/* Rounding only ever happens on this press — never on load, never on
+            edit, never on save (§1: defaults, not constraints). */}
+        <button
+          onClick={() => setRounding(true)}
+          className="flex items-center gap-1 text-xs text-slate-400 hover:text-violet-300 transition-colors"
+          title="Snap hours to a billing increment"
+        >
+          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round"
+              d="M12 6v6h4.5M12 21a9 9 0 100-18 9 9 0 000 18z" />
+          </svg>
+          Round hours
+        </button>
       </div>
+
+      {rounding && (
+        <RoundHoursModal
+          lines={lines}
+          currency={currency}
+          // A caller that has not loaded settings passes nothing; falling back
+          // keeps the feature reachable rather than opening a dead modal.
+          defaultIncrement={
+            roundingIncrement !== undefined && roundingIncrement > 0
+              ? roundingIncrement
+              : FALLBACK_INCREMENT
+          }
+          defaultDirection={roundingDirection ?? 'nearest'}
+          // Same channel add and delete use — the parent stays the owner of the
+          // array and saves on its own schedule.
+          onApply={onChange}
+          onClose={() => setRounding(false)}
+        />
+      )}
 
       {/* ── Totals ── */}
       <div className="flex justify-end">

@@ -341,6 +341,10 @@ export interface CreateInvoicePayload {
 
 export interface UpdateInvoicePayload extends Partial<CreateInvoicePayload> {}
 
+// How billable hours are rounded onto an increment. "nearest" is the usual
+// convention; "up" is the aggressive one and never lowers a figure.
+export type HoursRoundingDirection = 'nearest' | 'up' | 'down';
+
 export interface InvoiceSettings {
   business_name: string;
   contact_name: string;
@@ -353,6 +357,12 @@ export interface InvoiceSettings {
   default_tax_label: string;
   default_tax_percent: number;
   default_rate: number;
+  // The billing increment hours snap to, in hours — 0.25 is a quarter hour.
+  // 0 turns rounding off. Never applied on its own: it is the default the
+  // "Round hours" action offers, and the user still chooses which lines it
+  // touches, so no figure is ever rewritten without being asked for.
+  hours_rounding_increment: number;
+  hours_rounding_direction: HoursRoundingDirection;
   invoice_prefix: string;
   reset_sequence_yearly: boolean;
   datetime_inserted: string;
