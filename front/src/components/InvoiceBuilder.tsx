@@ -593,6 +593,10 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
                   // A manually added line has no preview entry, so it has no
                   // caveat — and is never auto-excluded.
                   reasonForLine={(id) => previewMeta.get(id)?.duplicate_reason ?? null}
+                  // Same defaults as the editor, so rounding is available while
+                  // building an invoice, not only after it exists.
+                  roundingIncrement={settings?.hours_rounding_increment}
+                  roundingDirection={settings?.hours_rounding_direction}
                 />
               </div>
 
