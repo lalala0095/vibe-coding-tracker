@@ -469,6 +469,10 @@ export default function InvoicesPage() {
           // The working lines, not the stored ones, so unsaved hand-edits take
           // part in the merge instead of being silently reverted by it.
           currentLines={lines}
+          // Same best-effort settings as the table: null means no increment is
+          // configured and the modal simply does not offer rounding.
+          roundingIncrement={settings?.hours_rounding_increment}
+          roundingDirection={settings?.hours_rounding_direction}
           onApply={(merged, periodStart, periodEnd) => {
             setLines(merged);
             setPendingPeriod({ start: periodStart, end: periodEnd });

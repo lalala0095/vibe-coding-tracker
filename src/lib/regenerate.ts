@@ -16,14 +16,18 @@
 // preview re-sorts, and line_id is meaningless because the preview mints a new
 // one on every run.
 //
-// No money arithmetic happens here — deliberately. `amount` is recomputed by
-// the server on every write (CLAUDE.md § Money rules), so carrying the stored
-// value through untouched is correct and importing `money.ts` would only invite
-// a second, divergent implementation of the same sums.
+// No money arithmetic is *implemented* here — deliberately. `amount` is
+// recomputed by the server on every write (CLAUDE.md § Money rules), so
+// carrying the stored value through untouched is correct, and writing a second
+// copy of those sums here would only invite the two to diverge. Calling into
+// `money.ts` is the opposite of that: `roundHoursToIncrement` is imported so
+// the increment rounding a regenerate applies is bit-for-bit the one the manual
+// Round hours action applies, rather than an approximation of it.
 //
 // Pure functions; no React, no network, no mutation of the inputs.
 
-import type { InvoiceLine, InvoicePreviewLine } from '../types';
+import type { HoursRoundingDirection, InvoiceLine, InvoicePreviewLine } from '../types';
+import { roundHoursToIncrement } from './money';
 
 export type LineChangeKind = 'added' | 'updated' | 'unchanged' | 'removed' | 'manual';
 
@@ -35,6 +39,12 @@ export interface LineChange {
   hoursAfter: number | null;  // null for 'removed'
   datesChanged: boolean;
   isTracker: boolean;
+}
+
+/** The billing increment a regenerate should snap refreshed hours onto. */
+export interface RegenerateRounding {
+  increment: number;
+  direction: HoursRoundingDirection;
 }
 
 export interface MergeResult {
@@ -66,6 +76,21 @@ function isBlank(value: string | null | undefined): boolean {
 }
 
 /**
+ * Put a refreshed hours figure through the configured billing increment.
+ *
+ * Off by default: with no rounding, or an increment that is absent, zero,
+ * negative or not a number, the value passes through byte-identical to the
+ * preview's. That guard also keeps `roundHoursToIncrement` off its own
+ * increment-disabled path, which would quietly re-quantise to 2 dp instead of
+ * leaving the number alone.
+ */
+function applyRounding(hours: number, rounding?: RegenerateRounding | null): number {
+  if (!rounding) return hours;
+  if (!Number.isFinite(rounding.increment) || rounding.increment <= 0) return hours;
+  return roundHoursToIncrement(hours, rounding.increment, rounding.direction);
+}
+
+/**
  * The identity of the work a line bills, or null when the line is manual.
  *
  * The task key carries project_id because the server groups time entries by
@@ -90,7 +115,7 @@ function lineTitle(line: InvoiceLine): string {
 // before an added line joins the invoice. They are build-time facts about the
 // preview, not part of a stored invoice, and shipping them back to the server
 // would persist state that is meaningless the moment it is written.
-function toStoredLine(line: InvoicePreviewLine): InvoiceLine {
+function toStoredLine(line: InvoicePreviewLine, rounding?: RegenerateRounding | null): InvoiceLine {
   return {
     line_id: line.line_id,
     task_id: line.task_id,
@@ -100,7 +125,7 @@ function toStoredLine(line: InvoicePreviewLine): InvoiceLine {
     description: line.description,
     date_from: line.date_from,
     date_to: line.date_to,
-    hours: line.hours,
+    hours: applyRounding(line.hours, rounding),
     rate: line.rate,
     amount: line.amount,
     session_ids: asArray(line.session_ids),
@@ -121,11 +146,19 @@ function totalHours(lines: InvoiceLine[]): number {
  * an invoice the user has arranged. `changes` follows the same order, with
  * removals collected at the end since they have no place in the result.
  *
+ * `rounding` snaps every refreshed figure — on updated and added lines alike —
+ * onto the billing increment, and the change classification is made against
+ * that rounded value. Without it a line the user had already rounded to 9.50
+ * would be reported as changed and reverted to the raw 9.47 the preview
+ * carries, undoing their work; with it, a second regenerate is a true no-op.
+ * Manual lines are never refreshed, so they are never rounded either.
+ *
  * Total: empty inputs yield an empty, coherent result with `hasChanges` false.
  */
 export function mergeRegeneratedLines(
   current: InvoiceLine[],
   fresh: InvoicePreviewLine[],
+  rounding?: RegenerateRounding | null,
 ): MergeResult {
   // Fresh lines bucketed by key, in arrival order. A bucket rather than a bare
   // value because a malformed preview could repeat a key; each stored line then
@@ -188,14 +221,18 @@ export function mergeRegeneratedLines(
     const datesChanged =
       (stored.date_from ?? null) !== (match.date_from ?? null) ||
       (stored.date_to ?? null) !== (match.date_to ?? null);
-    const hoursChanged = !hoursEqual(stored.hours, match.hours);
+    // Compared against the *rounded* figure, because that is what applying
+    // would write. A stored 9.50 against a fresh 9.47 that rounds back to 9.50
+    // is genuinely unchanged, not an edit worth reporting.
+    const freshHours = applyRounding(match.hours, rounding);
+    const hoursChanged = !hoursEqual(stored.hours, freshHours);
 
     // Only the four refreshed fields move; everything else, including `amount`,
     // is the stored line's. A new object either way — the stored one is input
     // and must not be touched.
     const merged: InvoiceLine = {
       ...stored,
-      hours: match.hours,
+      hours: freshHours,
       session_ids: asArray(match.session_ids),
       date_from: match.date_from,
       date_to: match.date_to,
@@ -216,7 +253,7 @@ export function mergeRegeneratedLines(
 
   fresh.forEach((line, index) => {
     if (consumed.has(index)) return;
-    const added = toStoredLine(line);
+    const added = toStoredLine(line, rounding);
     lines.push(added);
     changes.push({
       kind: 'added',

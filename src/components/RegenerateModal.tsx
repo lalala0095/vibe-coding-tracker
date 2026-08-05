@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import type { Invoice, InvoiceLine, Project } from '../types';
+import { useMemo, useState } from 'react';
+import type { HoursRoundingDirection, Invoice, InvoiceLine, InvoicePreviewLine, Project } from '../types';
 import { previewInvoice } from '../api';
 import { mergeRegeneratedLines, type LineChange, type LineChangeKind, type MergeResult } from '../lib/regenerate';
 
@@ -48,6 +48,14 @@ function hoursText(value: number | null): string {
   return value === null ? '—' : `${value.toFixed(2)}h`;
 }
 
+// Spell the configured rule out on the checkbox itself, so the user knows what
+// ticking it does without leaving to read Settings.
+function roundingLabel(increment: number, direction: HoursRoundingDirection): string {
+  const verb =
+    direction === 'up' ? 'Round up to' : direction === 'down' ? 'Round down to' : 'Round to the nearest';
+  return `${verb} ${increment} h`;
+}
+
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
 interface Props {
@@ -56,20 +64,45 @@ interface Props {
   // The editor's working lines, which may hold unsaved edits — those take part
   // in the merge, so a hand-typed rate is preserved even before it is saved.
   currentLines: InvoiceLine[];
+  // The saved billing increment. Absent (or not positive) means no rounding is
+  // configured, and the option is not offered at all.
+  roundingIncrement?: number;
+  roundingDirection?: HoursRoundingDirection;
   onApply: (lines: InvoiceLine[], periodStart: string, periodEnd: string) => void;
   onClose: () => void;
 }
 
-export default function RegenerateModal({ invoice, projects, currentLines, onApply, onClose }: Props) {
+export default function RegenerateModal({
+  invoice, projects, currentLines, roundingIncrement, roundingDirection, onApply, onClose,
+}: Props) {
   const [periodStart, setPeriodStart] = useState(invoice.period_start ?? '');
   const [periodEnd, setPeriodEnd] = useState(invoice.period_end ?? '');
   const [projectIds, setProjectIds] = useState<string[]>(invoice.project_ids ?? []);
   const [includeTrackers, setIncludeTrackers] = useState(true);
   const [includeInvoiced, setIncludeInvoiced] = useState(false);
 
-  const [result, setResult] = useState<MergeResult | null>(null);
+  const canRound =
+    typeof roundingIncrement === 'number' && Number.isFinite(roundingIncrement) && roundingIncrement > 0;
+  // On by default when an increment is configured: the owner set it precisely so
+  // that billed hours land on it, and a regenerate that ignored it would hand
+  // back raw figures they would then have to round again by hand.
+  const [roundHours, setRoundHours] = useState(canRound);
+  const direction: HoursRoundingDirection = roundingDirection ?? 'nearest';
+
+  // The preview is kept raw rather than pre-merged, so flipping the rounding
+  // checkbox re-merges in place instead of sending the user back to Load.
+  const [preview, setPreview] = useState<InvoicePreviewLine[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  const result: MergeResult | null = useMemo(() => {
+    if (preview === null) return null;
+    const rounding =
+      roundHours && typeof roundingIncrement === 'number' && roundingIncrement > 0
+        ? { increment: roundingIncrement, direction }
+        : null;
+    return mergeRegeneratedLines(currentLines, preview, rounding);
+  }, [preview, currentLines, roundHours, roundingIncrement, direction]);
 
   // The client is a snapshot on the invoice and the server will not accept a
   // different one, so it is shown rather than offered.
@@ -80,7 +113,7 @@ export default function RegenerateModal({ invoice, projects, currentLines, onApp
 
   const toggleProject = (id: string) => {
     setProjectIds((prev) => (prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id]));
-    setResult(null);   // the summary was built from the old source; drop it
+    setPreview(null);   // the summary was built from the old source; drop it
   };
 
   const handleLoad = async () => {
@@ -88,7 +121,7 @@ export default function RegenerateModal({ invoice, projects, currentLines, onApp
     setLoading(true);
     setError('');
     try {
-      const preview = await previewInvoice({
+      const fresh = await previewInvoice({
         client_id: invoice.client_id,
         project_ids: projectIds.length > 0 ? projectIds : undefined,
         period_start: periodStart,
@@ -99,7 +132,7 @@ export default function RegenerateModal({ invoice, projects, currentLines, onApp
         // the preview would come back all but empty.
         for_invoice_id: invoice.id,
       });
-      setResult(mergeRegeneratedLines(currentLines, preview.lines ?? []));
+      setPreview(fresh.lines ?? []);
     } catch {
       setError('Failed to load time entries for that period.');
     } finally {
@@ -108,6 +141,25 @@ export default function RegenerateModal({ invoice, projects, currentLines, onApp
   };
 
   const issued = invoice.status !== 'draft';
+
+  // Rendered in both steps: the summary re-merges the moment it is flipped, so
+  // the user can see the rounded and unrounded outcome without reloading.
+  // Hidden entirely when no increment is configured — nothing to round to.
+  const roundingToggle =
+    canRound && roundingIncrement !== undefined ? (
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={roundHours}
+          onChange={(e) => setRoundHours(e.target.checked)}
+          className={CHECKBOX}
+        />
+        <span className="text-xs text-slate-400">
+          Round hours to the billing increment
+          <span className="text-slate-500"> · {roundingLabel(roundingIncrement, direction)}</span>
+        </span>
+      </label>
+    ) : null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
@@ -207,6 +259,7 @@ export default function RegenerateModal({ invoice, projects, currentLines, onApp
                     Include entries already billed on another invoice
                   </span>
                 </label>
+                {roundingToggle}
               </div>
 
               <p className="text-xs text-slate-500 leading-relaxed">
@@ -216,7 +269,14 @@ export default function RegenerateModal({ invoice, projects, currentLines, onApp
             </div>
           ) : (
             /* ── Step 2: what applying would do ── */
-            <ChangeSummary result={result} />
+            <div className="flex flex-col gap-4">
+              {roundingToggle && (
+                <div className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2">
+                  {roundingToggle}
+                </div>
+              )}
+              <ChangeSummary result={result} />
+            </div>
           )}
 
           {result !== null && periodChanged && (
@@ -242,7 +302,7 @@ export default function RegenerateModal({ invoice, projects, currentLines, onApp
           <div className="flex gap-2">
             {result !== null && (
               <button
-                onClick={() => setResult(null)}
+                onClick={() => setPreview(null)}
                 className="px-4 py-2 text-sm rounded-lg text-slate-300 hover:bg-slate-800 transition-colors"
               >
                 Back
