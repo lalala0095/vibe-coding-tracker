@@ -3,6 +3,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { getTasks, getTask, getClients, getProjects, getModels, createTask, updateTask } from '../api';
 import type { Task, Client, Project, Model, Goal, TaskStatus, TaskPriority, CreateTaskPayload } from '../types';
 import AppNav from '../components/AppNav';
+import Modal from '../components/Modal';
 import TaskPanel from '../components/TaskPanel';
 import GoalPanel from '../components/GoalPanel';
 import TaskForm from '../components/TaskForm';
@@ -816,48 +817,36 @@ export default function TasksPage() {
       </div>
 
       {/* ── Create Modal ── */}
+      {/* No `footer`: TaskForm renders its own Cancel/Create buttons. The body
+          padding is overridden because the default adds a flex column and gap
+          that would change the form's internal spacing. */}
       {modal.kind === 'create' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
-          <div className="relative w-full max-w-2xl max-h-[90vh] bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800 shrink-0">
-              <h2 className="text-base font-semibold text-slate-100">New Task</h2>
-              <button
+        <Modal title="New Task" onClose={() => setModal({ kind: 'none' })} size="md" bodyClassName="p-6">
+          {projects.length === 0 ? (
+            <div className="text-center py-8">
+              <p className="text-slate-300 font-medium mb-2">No projects found</p>
+              <p className="text-slate-500 text-sm mb-4">
+                You need at least one client and project before creating tasks.
+              </p>
+              <Link
+                to="/manage"
                 onClick={() => setModal({ kind: 'none' })}
-                className="p-1.5 text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded-lg transition-colors"
+                className="inline-flex px-4 py-2 text-sm font-medium text-white bg-violet-600 rounded-xl
+                           hover:bg-violet-500 transition-colors"
               >
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
+                Manage Clients &amp; Projects
+              </Link>
             </div>
-            <div className="flex-1 overflow-y-auto p-6">
-              {projects.length === 0 ? (
-                <div className="text-center py-8">
-                  <p className="text-slate-300 font-medium mb-2">No projects found</p>
-                  <p className="text-slate-500 text-sm mb-4">
-                    You need at least one client and project before creating tasks.
-                  </p>
-                  <Link
-                    to="/manage"
-                    onClick={() => setModal({ kind: 'none' })}
-                    className="inline-flex px-4 py-2 text-sm font-medium text-white bg-violet-600 rounded-xl
-                               hover:bg-violet-500 transition-colors"
-                  >
-                    Manage Clients &amp; Projects
-                  </Link>
-                </div>
-              ) : (
-                <TaskForm
-                  projects={projects}
-                  defaultProjectId={selectedProjectId ?? undefined}
-                  onSubmit={handleCreate}
-                  onCancel={() => setModal({ kind: 'none' })}
-                  submitLabel="Create Task"
-                />
-              )}
-            </div>
-          </div>
-        </div>
+          ) : (
+            <TaskForm
+              projects={projects}
+              defaultProjectId={selectedProjectId ?? undefined}
+              onSubmit={handleCreate}
+              onCancel={() => setModal({ kind: 'none' })}
+              submitLabel="Create Task"
+            />
+          )}
+        </Modal>
       )}
 
     </div>

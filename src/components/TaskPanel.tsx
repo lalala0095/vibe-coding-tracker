@@ -4,6 +4,7 @@ import { getTasks, updateTask, deleteTask, createTask, getGoals, createGoal, upd
 import TaskForm from './TaskForm';
 import GoalForm from './GoalForm';
 import TimeEntryList from './TimeEntryList';
+import ConfirmDialog from './ConfirmDialog';
 
 interface Props {
   task: Task;
@@ -82,13 +83,15 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
   const [subtasks, setSubtasks] = useState<Task[]>([]);
   const [loadingSubtasks, setLoadingSubtasks] = useState(false);
   const [showSubtaskForm, setShowSubtaskForm] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  const [deleting, setDeleting] = useState(false);
+  const [confirmDeleteTask, setConfirmDeleteTask] = useState(false);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Goal[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(false);
   const [showSessionForm, setShowSessionForm] = useState(false);
   const [editingSession, setEditingSession] = useState<Goal | null>(null);
+  // One nullable target for the whole list, not a flag per row — a dialog per
+  // row would mount one for every session.
+  const [confirmDeleteSession, setConfirmDeleteSession] = useState<Goal | null>(null);
   const [allTasks, setAllTasks] = useState<Task[]>([]);
   const [loadingAllTasks, setLoadingAllTasks] = useState(false);
 
@@ -116,7 +119,6 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
     setShowSubtaskForm(false);
     setShowSessionForm(false);
     setEditingSession(null);
-    setConfirmDelete(false);
   }, [task.id]);
 
   const handleUpdate = async (data: CreateTaskPayload & { files: File[] }) => {
@@ -126,12 +128,11 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
     setMode('view');
   };
 
+  // No try/catch: a failure has to reach ConfirmDialog, which keeps itself open
+  // and shows the message.
   const handleDelete = async () => {
-    setDeleting(true);
-    try {
-      await deleteTask(task.id);
-      onDeleted(task.id);
-    } catch { setDeleting(false); setConfirmDelete(false); }
+    await deleteTask(task.id);
+    onDeleted(task.id);
   };
 
   const handleSubtaskCreate = async (data: CreateTaskPayload & { files: File[] }) => {
@@ -186,6 +187,8 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
     setEditingSession(null);
   };
 
+  // Called from ConfirmDialog. It used to run straight off the row's click with
+  // no confirmation and no error path at all; the throw now reaches the dialog.
   const handleSessionDelete = async (session: Goal) => {
     await deleteGoal(session.id);
     setSessions((prev) => prev.filter((s) => s.id !== session.id));
@@ -228,36 +231,23 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
           >
             Edit
           </button>
-          {!confirmDelete ? (
-            <button
-              onClick={() => setConfirmDelete(true)}
-              className="px-2.5 py-1 text-xs font-medium text-red-400 bg-red-400/10 border border-red-400/20
-                         rounded-lg hover:bg-red-400/20 transition-colors"
-            >
-              Delete
-            </button>
-          ) : (
-            <div className="flex items-center gap-1.5">
-              <span className="text-xs text-slate-400">Delete?</span>
-              <button
-                onClick={handleDelete}
-                disabled={deleting}
-                className="px-2.5 py-1 text-xs font-medium text-white bg-red-600 rounded-lg
-                           hover:bg-red-500 disabled:opacity-50 flex items-center gap-1"
-              >
-                {deleting && <span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
-                Yes
-              </button>
-              <button
-                onClick={() => setConfirmDelete(false)}
-                className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200 transition-colors"
-              >
-                No
-              </button>
-            </div>
-          )}
+          <button
+            onClick={() => setConfirmDeleteTask(true)}
+            className="px-2.5 py-1 text-xs font-medium text-red-400 bg-red-400/10 border border-red-400/20
+                       rounded-lg hover:bg-red-400/20 transition-colors"
+          >
+            Delete
+          </button>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmDeleteTask}
+        title="Delete task"
+        message={<>Delete <span className="text-slate-100 font-medium">{task.title}</span>?</>}
+        onConfirm={handleDelete}
+        onClose={() => setConfirmDeleteTask(false)}
+      />
 
       {/* Content */}
       <div className="flex flex-col gap-5 p-5">
@@ -549,7 +539,7 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
                             Edit
                           </button>
                           <button
-                            onClick={(e) => { e.stopPropagation(); handleSessionDelete(s); }}
+                            onClick={(e) => { e.stopPropagation(); setConfirmDeleteSession(s); }}
                             className="px-1.5 py-0.5 text-xs text-red-400 hover:text-red-300 hover:bg-red-400/10 rounded transition-colors"
                             title="Delete session"
                           >
@@ -574,6 +564,23 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
           )}
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmDeleteSession !== null}
+        title="Delete session"
+        message={
+          <>
+            Delete the{' '}
+            <span className="text-slate-100 font-medium">{confirmDeleteSession?.model_name}</span>{' '}
+            session?
+          </>
+        }
+        detail={<span className="line-clamp-3">{confirmDeleteSession?.goal}</span>}
+        onConfirm={async () => {
+          if (confirmDeleteSession) await handleSessionDelete(confirmDeleteSession);
+        }}
+        onClose={() => setConfirmDeleteSession(null)}
+      />
     </div>
   );
 }

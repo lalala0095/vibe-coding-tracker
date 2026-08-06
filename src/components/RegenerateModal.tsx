@@ -2,17 +2,12 @@ import { useMemo, useState } from 'react';
 import type { HoursRoundingDirection, Invoice, InvoiceLine, InvoicePreviewLine, Project } from '../types';
 import { previewInvoice } from '../api';
 import { mergeRegeneratedLines, type LineChange, type LineChangeKind, type MergeResult } from '../lib/regenerate';
+import Modal, { MODAL_CANCEL_BUTTON, MODAL_PRIMARY_BUTTON, ButtonSpinner } from './Modal';
+// The form classes live with the other shared invoice-UI pieces rather than
+// being restated here, which is what let the three dialogs drift.
+import { FIELD, LABEL, CHECKBOX } from './InvoiceBuilder';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-const FIELD =
-  'w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-3 py-2 text-sm ' +
-  'placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent';
-
-const LABEL = 'text-xs text-slate-400 mb-1 block';
-
-const CHECKBOX =
-  'w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0';
 
 // Grouped in the order the user reads them: what is new, what moved, what
 // disappeared, then the untouched remainder.
@@ -162,138 +157,12 @@ export default function RegenerateModal({
     ) : null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-full max-w-3xl flex flex-col overflow-hidden"
-           style={{ maxHeight: '90vh' }}>
-        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-700 shrink-0">
-          <h2 className="text-base font-semibold text-white">
-            Regenerate lines · {invoice.invoice_number}
-          </h2>
-          <button onClick={onClose} className="text-slate-500 hover:text-slate-300 transition-colors">
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-5">
-          {/* Warn on an issued invoice — nothing below is disabled (§1) */}
-          {issued && (
-            <p className="text-xs text-amber-300 bg-amber-400/10 border border-amber-400/20 rounded-lg px-3 py-2 leading-relaxed">
-              This invoice is already marked {invoice.status}. Regenerating changes what it bills,
-              and the client may already have the old figures. You can still do it.
-            </p>
-          )}
-
-          {result === null ? (
-            /* ── Step 1: what to pull from ── */
-            <div className="flex flex-col gap-3">
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div>
-                  <label className={LABEL}>Client</label>
-                  <p className="px-3 py-2 text-sm text-slate-300 bg-slate-800/50 border border-slate-800 rounded-lg truncate">
-                    {invoice.client_name}
-                  </p>
-                </div>
-                <div>
-                  <label className={LABEL}>Period start</label>
-                  <input
-                    type="date"
-                    value={periodStart}
-                    onChange={(e) => setPeriodStart(e.target.value)}
-                    className={FIELD}
-                  />
-                </div>
-                <div>
-                  <label className={LABEL}>Period end</label>
-                  <input
-                    type="date"
-                    value={periodEnd}
-                    onChange={(e) => setPeriodEnd(e.target.value)}
-                    className={FIELD}
-                  />
-                </div>
-              </div>
-
-              {clientProjects.length > 0 && (
-                <div>
-                  <label className={LABEL}>
-                    Projects <span className="text-slate-600">(all projects if none selected)</span>
-                  </label>
-                  <div className="flex flex-wrap gap-1.5">
-                    {clientProjects.map((p) => (
-                      <button
-                        key={p.id}
-                        onClick={() => toggleProject(p.id)}
-                        className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
-                          projectIds.includes(p.id)
-                            ? 'bg-violet-500/15 border-violet-500/40 text-violet-300'
-                            : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
-                        }`}
-                      >
-                        {p.name}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              <div className="flex items-center gap-4 flex-wrap">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={includeTrackers}
-                    onChange={(e) => setIncludeTrackers(e.target.checked)}
-                    className={CHECKBOX}
-                  />
-                  <span className="text-xs text-slate-400">Include trackers</span>
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={includeInvoiced}
-                    onChange={(e) => setIncludeInvoiced(e.target.checked)}
-                    className={CHECKBOX}
-                  />
-                  <span className="text-xs text-slate-400">
-                    Include entries already billed on another invoice
-                  </span>
-                </label>
-                {roundingToggle}
-              </div>
-
-              <p className="text-xs text-slate-500 leading-relaxed">
-                Your rates, descriptions and task lists are kept. Only hours, dates and which lines
-                exist are refreshed. Nothing is saved until you press Save changes on the invoice.
-              </p>
-            </div>
-          ) : (
-            /* ── Step 2: what applying would do ── */
-            <div className="flex flex-col gap-4">
-              {roundingToggle && (
-                <div className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2">
-                  {roundingToggle}
-                </div>
-              )}
-              <ChangeSummary result={result} />
-            </div>
-          )}
-
-          {result !== null && periodChanged && (
-            <p className="text-xs text-slate-400 bg-slate-800/60 border border-slate-700 rounded-lg px-3 py-2 leading-relaxed">
-              The period differs from the one stored on this invoice. Applying also updates it to{' '}
-              {periodStart} – {periodEnd}, because that is what prints on the document.
-            </p>
-          )}
-
-          {error && (
-            <p className="text-sm text-red-400 bg-red-400/10 border border-red-400/20 rounded-lg px-3 py-2">
-              {error}
-            </p>
-          )}
-        </div>
-
-        <div className="flex items-center justify-between px-5 py-3 border-t border-slate-700 shrink-0 bg-slate-900">
+    <Modal
+      title={`Regenerate lines · ${invoice.invoice_number}`}
+      onClose={onClose}
+      size="lg"
+      footer={
+        <>
           <span className="text-xs text-slate-500">
             {result === null
               ? 'Nothing is written to the server here.'
@@ -301,17 +170,11 @@ export default function RegenerateModal({
           </span>
           <div className="flex gap-2">
             {result !== null && (
-              <button
-                onClick={() => setPreview(null)}
-                className="px-4 py-2 text-sm rounded-lg text-slate-300 hover:bg-slate-800 transition-colors"
-              >
+              <button onClick={() => setPreview(null)} className={MODAL_CANCEL_BUTTON}>
                 Back
               </button>
             )}
-            <button
-              onClick={onClose}
-              className="px-4 py-2 text-sm rounded-lg text-slate-300 hover:bg-slate-800 transition-colors"
-            >
+            <button onClick={onClose} className={MODAL_CANCEL_BUTTON}>
               {result !== null && !result.hasChanges ? 'Close' : 'Cancel'}
             </button>
             {result === null ? (
@@ -320,9 +183,7 @@ export default function RegenerateModal({
                 disabled={loading}
                 className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
               >
-                {loading && (
-                  <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                )}
+                {loading && <ButtonSpinner />}
                 Load changes
               </button>
             ) : (
@@ -330,16 +191,131 @@ export default function RegenerateModal({
               result.hasChanges && (
                 <button
                   onClick={() => { onApply(result.lines, periodStart, periodEnd); onClose(); }}
-                  className="px-4 py-2 text-sm rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-medium transition-colors"
+                  className={MODAL_PRIMARY_BUTTON}
                 >
                   Apply to invoice
                 </button>
               )
             )}
           </div>
+        </>
+      }
+    >
+      {/* Warn on an issued invoice — nothing below is disabled (§1) */}
+      {issued && (
+        <p className="text-xs text-amber-300 bg-amber-400/10 border border-amber-400/20 rounded-lg px-3 py-2 leading-relaxed">
+          This invoice is already marked {invoice.status}. Regenerating changes what it bills,
+          and the client may already have the old figures. You can still do it.
+        </p>
+      )}
+
+      {result === null ? (
+        /* ── Step 1: what to pull from ── */
+        <div className="flex flex-col gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div>
+              <label className={LABEL}>Client</label>
+              <p className="px-3 py-2 text-sm text-slate-300 bg-slate-800/50 border border-slate-800 rounded-lg truncate">
+                {invoice.client_name}
+              </p>
+            </div>
+            <div>
+              <label className={LABEL}>Period start</label>
+              <input
+                type="date"
+                value={periodStart}
+                onChange={(e) => setPeriodStart(e.target.value)}
+                className={FIELD}
+              />
+            </div>
+            <div>
+              <label className={LABEL}>Period end</label>
+              <input
+                type="date"
+                value={periodEnd}
+                onChange={(e) => setPeriodEnd(e.target.value)}
+                className={FIELD}
+              />
+            </div>
+          </div>
+
+          {clientProjects.length > 0 && (
+            <div>
+              <label className={LABEL}>
+                Projects <span className="text-slate-600">(all projects if none selected)</span>
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {clientProjects.map((p) => (
+                  <button
+                    key={p.id}
+                    onClick={() => toggleProject(p.id)}
+                    className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
+                      projectIds.includes(p.id)
+                        ? 'bg-violet-500/15 border-violet-500/40 text-violet-300'
+                        : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {p.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="flex items-center gap-4 flex-wrap">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeTrackers}
+                onChange={(e) => setIncludeTrackers(e.target.checked)}
+                className={CHECKBOX}
+              />
+              <span className="text-xs text-slate-400">Include trackers</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeInvoiced}
+                onChange={(e) => setIncludeInvoiced(e.target.checked)}
+                className={CHECKBOX}
+              />
+              <span className="text-xs text-slate-400">
+                Include entries already billed on another invoice
+              </span>
+            </label>
+            {roundingToggle}
+          </div>
+
+          <p className="text-xs text-slate-500 leading-relaxed">
+            Your rates, descriptions and task lists are kept. Only hours, dates and which lines
+            exist are refreshed. Nothing is saved until you press Save changes on the invoice.
+          </p>
         </div>
-      </div>
-    </div>
+      ) : (
+        /* ── Step 2: what applying would do ── */
+        <div className="flex flex-col gap-4">
+          {roundingToggle && (
+            <div className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2">
+              {roundingToggle}
+            </div>
+          )}
+          <ChangeSummary result={result} />
+        </div>
+      )}
+
+      {result !== null && periodChanged && (
+        <p className="text-xs text-slate-400 bg-slate-800/60 border border-slate-700 rounded-lg px-3 py-2 leading-relaxed">
+          The period differs from the one stored on this invoice. Applying also updates it to{' '}
+          {periodStart} – {periodEnd}, because that is what prints on the document.
+        </p>
+      )}
+
+      {error && (
+        <p className="text-sm text-red-400 bg-red-400/10 border border-red-400/20 rounded-lg px-3 py-2">
+          {error}
+        </p>
+      )}
+    </Modal>
   );
 }
 

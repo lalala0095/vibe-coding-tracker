@@ -6,6 +6,7 @@ import type {
 import { previewInvoice, createInvoice } from '../api';
 import { computeMoney, formatMoney, type DiscountType } from '../lib/money';
 import InvoiceLineTable from './InvoiceLineTable';
+import Modal, { MODAL_CANCEL_BUTTON, MODAL_PRIMARY_BUTTON, ButtonSpinner } from './Modal';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -24,11 +25,20 @@ function startOfMonthSGT(): string {
   return `${todaySGT().slice(0, 7)}-01`;
 }
 
-const FIELD =
+// ── Shared form classes ───────────────────────────────────────────────────────
+// Exported because the two sibling invoice dialogs (RegenerateModal,
+// RoundHoursModal) declared these verbatim. They live here rather than in a new
+// module because this file is already the invoice UI's shared-pieces home —
+// InvoicesPage imports from it too.
+
+export const FIELD =
   'w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-3 py-2 text-sm ' +
   'placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent';
 
-const LABEL = 'text-xs text-slate-400 mb-1 block';
+export const LABEL = 'text-xs text-slate-400 mb-1 block';
+
+export const CHECKBOX =
+  'w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0';
 
 // ── The "null" clearing sentinel ──────────────────────────────────────────────
 // Optional STRING fields are cleared by sending the literal string "null"
@@ -216,7 +226,7 @@ export function InvoiceMetaFields({
               type="checkbox"
               checked={meta.show_due_date}
               onChange={(e) => set({ show_due_date: e.target.checked })}
-              className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0"
+              className={CHECKBOX}
             />
             <span className="text-sm text-slate-300">Due date</span>
           </label>
@@ -225,7 +235,7 @@ export function InvoiceMetaFields({
               type="checkbox"
               checked={meta.show_payment_terms}
               onChange={(e) => set({ show_payment_terms: e.target.checked })}
-              className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0"
+              className={CHECKBOX}
             />
             <span className="text-sm text-slate-300">Payment terms</span>
           </label>
@@ -414,206 +424,12 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-full max-w-4xl flex flex-col overflow-hidden"
-           style={{ maxHeight: '90vh' }}>
-        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-700 shrink-0">
-          <h2 className="text-base font-semibold text-white">New Invoice</h2>
-          <button onClick={onClose} className="text-slate-500 hover:text-slate-300 transition-colors">
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-5">
-          {/* ── Source: client, projects, period ── */}
-          <div className="flex flex-col gap-3">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div>
-                <label className={LABEL}>Client</label>
-                <select
-                  value={clientId}
-                  onChange={(e) => {
-                    setClientId(e.target.value);
-                    setProjectIds([]);
-                    invalidatePreview();
-                  }}
-                  className={FIELD}
-                >
-                  <option value="">Select a client…</option>
-                  {clients.map((c) => (
-                    <option key={c.id} value={c.id}>{c.name}</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className={LABEL}>Period start</label>
-                <input
-                  type="date"
-                  value={periodStart}
-                  onChange={(e) => { setPeriodStart(e.target.value); invalidatePreview(); }}
-                  className={FIELD}
-                />
-              </div>
-              <div>
-                <label className={LABEL}>Period end</label>
-                <input
-                  type="date"
-                  value={periodEnd}
-                  onChange={(e) => { setPeriodEnd(e.target.value); invalidatePreview(); }}
-                  className={FIELD}
-                />
-              </div>
-            </div>
-
-            {clientId && clientProjects.length > 0 && (
-              <div>
-                <label className={LABEL}>
-                  Projects <span className="text-slate-600">(all projects if none selected)</span>
-                </label>
-                <div className="flex flex-wrap gap-1.5">
-                  {clientProjects.map((p) => (
-                    <button
-                      key={p.id}
-                      onClick={() => toggleProject(p.id)}
-                      className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
-                        projectIds.includes(p.id)
-                          ? 'bg-violet-500/15 border-violet-500/40 text-violet-300'
-                          : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      {p.name}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="flex items-center justify-between gap-3 flex-wrap">
-              <div className="flex items-center gap-4 flex-wrap">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={includeInvoiced}
-                    onChange={(e) => { setIncludeInvoiced(e.target.checked); invalidatePreview(); }}
-                    className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0"
-                  />
-                  <span className="text-xs text-slate-400">Include already-invoiced entries</span>
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={includeTrackers}
-                    onChange={(e) => { setIncludeTrackers(e.target.checked); invalidatePreview(); }}
-                    className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-violet-600 focus:ring-2 focus:ring-violet-500 focus:ring-offset-0"
-                  />
-                  <span className="text-xs text-slate-400">Include trackers</span>
-                </label>
-              </div>
-              <button
-                onClick={handlePreview}
-                disabled={loadingPreview}
-                className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
-              >
-                {loadingPreview && (
-                  <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                )}
-                {previewed ? 'Reload time entries' : 'Load time entries'}
-              </button>
-            </div>
-          </div>
-
-          {staleSource && (
-            <p className="text-xs text-amber-300 bg-amber-400/10 border border-amber-400/20 rounded-lg px-3 py-2">
-              The client, projects or period changed, so the previous lines no longer apply.
-              Load the time entries again to rebuild them.
-            </p>
-          )}
-
-          {/* Running entries were excluded from the preview (§10) */}
-          {runningCount > 0 && (
-            <div className="flex items-start gap-2.5 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2.5">
-              <svg className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-              </svg>
-              <p className="text-xs text-amber-300 leading-relaxed">
-                {runningCount} time {runningCount === 1 ? 'entry is' : 'entries are'} still running
-                and {runningCount === 1 ? 'was' : 'were'} excluded. Set an end time or manual hours
-                on {runningCount === 1 ? 'it' : 'them'} to bill {runningCount === 1 ? 'it' : 'them'}.
-              </p>
-            </div>
-          )}
-
-          {/* Already billed elsewhere (§12). This is the only build-time signal
-              the user gets — the entry badge names one claimant, not all. */}
-          {claimedCount > 0 && (
-            <div className="flex items-start gap-2.5 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2.5">
-              <svg className="w-4 h-4 text-red-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
-              </svg>
-              <p className="text-xs text-red-300 leading-relaxed">
-                {claimedCount} time {claimedCount === 1 ? 'entry is' : 'entries are'} already billed
-                on {claimedInvoices.length > 0 ? claimedInvoices.join(', ') : 'another invoice'}.
-                Invoicing {claimedCount === 1 ? 'it' : 'them'} again will charge the same hours twice.
-              </p>
-            </div>
-          )}
-
-          {/* Tracker lines whose hours are already on the invoice as task
-              lines. They arrive unticked, but stay tickable — warn, never
-              block (§ no locking). */}
-          {duplicateTrackerCount > 0 && (
-            <div className="flex items-start gap-2.5 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2.5">
-              <svg className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-              </svg>
-              <p className="text-xs text-amber-300 leading-relaxed">
-                {duplicateTrackerCount} tracker {duplicateTrackerCount === 1 ? 'line' : 'lines'} arrived
-                unticked because {duplicateTrackerCount === 1 ? 'its' : 'their'} time entries are
-                already listed as {duplicateTrackerCount === 1 ? 'a line of its own' : 'lines of their own'}.
-                Ticking {duplicateTrackerCount === 1 ? 'it' : 'one'} would bill the same hours twice.
-              </p>
-            </div>
-          )}
-
-          {previewed && (
-            <>
-              <div className="border-t border-slate-800 pt-4">
-                <InvoiceLineTable
-                  lines={lines}
-                  currency={currency}
-                  discountType={meta.discount_type}
-                  discountValue={meta.discount_value}
-                  taxLabel={meta.tax_label}
-                  taxPercent={meta.tax_percent}
-                  onChange={setLines}
-                  excludedIds={excluded}
-                  onToggleExclude={toggleExclude}
-                  // A manually added line has no preview entry, so it has no
-                  // caveat — and is never auto-excluded.
-                  reasonForLine={(id) => previewMeta.get(id)?.duplicate_reason ?? null}
-                  // Same defaults as the editor, so rounding is available while
-                  // building an invoice, not only after it exists.
-                  roundingIncrement={settings?.hours_rounding_increment}
-                  roundingDirection={settings?.hours_rounding_direction}
-                />
-              </div>
-
-              <div className="border-t border-slate-800 pt-4">
-                <InvoiceMetaFields meta={meta} onChange={setMeta} />
-              </div>
-            </>
-          )}
-
-          {error && (
-            <p className="text-sm text-red-400 bg-red-400/10 border border-red-400/20 rounded-lg px-3 py-2">
-              {error}
-            </p>
-          )}
-        </div>
-
-        <div className="flex items-center justify-between px-5 py-3 border-t border-slate-700 shrink-0 bg-slate-900">
+    <Modal
+      title="New Invoice"
+      onClose={onClose}
+      size="xl"
+      footer={
+        <>
           {/* Counts what will be billed, not what is on screen — an unticked
               line is still listed and still editable. */}
           <span className="text-xs text-slate-500">
@@ -626,25 +442,203 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
               : 'Server assigns the invoice number on save.'}
           </span>
           <div className="flex gap-2">
-            <button
-              onClick={onClose}
-              className="px-4 py-2 text-sm rounded-lg text-slate-300 hover:bg-slate-800 transition-colors"
-            >
+            <button onClick={onClose} className={MODAL_CANCEL_BUTTON}>
               Cancel
             </button>
             <button
               onClick={handleSave}
               disabled={saving || !clientId || !previewed}
-              className="px-4 py-2 text-sm rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+              className={MODAL_PRIMARY_BUTTON}
             >
-              {saving && (
-                <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-              )}
+              {saving && <ButtonSpinner />}
               Create Invoice
             </button>
           </div>
+        </>
+      }
+    >
+      {/* ── Source: client, projects, period ── */}
+      <div className="flex flex-col gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div>
+            <label className={LABEL}>Client</label>
+            <select
+              value={clientId}
+              onChange={(e) => {
+                setClientId(e.target.value);
+                setProjectIds([]);
+                invalidatePreview();
+              }}
+              className={FIELD}
+            >
+              <option value="">Select a client…</option>
+              {clients.map((c) => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className={LABEL}>Period start</label>
+            <input
+              type="date"
+              value={periodStart}
+              onChange={(e) => { setPeriodStart(e.target.value); invalidatePreview(); }}
+              className={FIELD}
+            />
+          </div>
+          <div>
+            <label className={LABEL}>Period end</label>
+            <input
+              type="date"
+              value={periodEnd}
+              onChange={(e) => { setPeriodEnd(e.target.value); invalidatePreview(); }}
+              className={FIELD}
+            />
+          </div>
+        </div>
+
+        {clientId && clientProjects.length > 0 && (
+          <div>
+            <label className={LABEL}>
+              Projects <span className="text-slate-600">(all projects if none selected)</span>
+            </label>
+            <div className="flex flex-wrap gap-1.5">
+              {clientProjects.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => toggleProject(p.id)}
+                  className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
+                    projectIds.includes(p.id)
+                      ? 'bg-violet-500/15 border-violet-500/40 text-violet-300'
+                      : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {p.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-4 flex-wrap">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeInvoiced}
+                onChange={(e) => { setIncludeInvoiced(e.target.checked); invalidatePreview(); }}
+                className={CHECKBOX}
+              />
+              <span className="text-xs text-slate-400">Include already-invoiced entries</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeTrackers}
+                onChange={(e) => { setIncludeTrackers(e.target.checked); invalidatePreview(); }}
+                className={CHECKBOX}
+              />
+              <span className="text-xs text-slate-400">Include trackers</span>
+            </label>
+          </div>
+          <button
+            onClick={handlePreview}
+            disabled={loadingPreview}
+            className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+          >
+            {loadingPreview && <ButtonSpinner />}
+            {previewed ? 'Reload time entries' : 'Load time entries'}
+          </button>
         </div>
       </div>
-    </div>
+
+      {staleSource && (
+        <p className="text-xs text-amber-300 bg-amber-400/10 border border-amber-400/20 rounded-lg px-3 py-2">
+          The client, projects or period changed, so the previous lines no longer apply.
+          Load the time entries again to rebuild them.
+        </p>
+      )}
+
+      {/* Running entries were excluded from the preview (§10) */}
+      {runningCount > 0 && (
+        <div className="flex items-start gap-2.5 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2.5">
+          <svg className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+          </svg>
+          <p className="text-xs text-amber-300 leading-relaxed">
+            {runningCount} time {runningCount === 1 ? 'entry is' : 'entries are'} still running
+            and {runningCount === 1 ? 'was' : 'were'} excluded. Set an end time or manual hours
+            on {runningCount === 1 ? 'it' : 'them'} to bill {runningCount === 1 ? 'it' : 'them'}.
+          </p>
+        </div>
+      )}
+
+      {/* Already billed elsewhere (§12). This is the only build-time signal
+          the user gets — the entry badge names one claimant, not all. */}
+      {claimedCount > 0 && (
+        <div className="flex items-start gap-2.5 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2.5">
+          <svg className="w-4 h-4 text-red-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+          </svg>
+          <p className="text-xs text-red-300 leading-relaxed">
+            {claimedCount} time {claimedCount === 1 ? 'entry is' : 'entries are'} already billed
+            on {claimedInvoices.length > 0 ? claimedInvoices.join(', ') : 'another invoice'}.
+            Invoicing {claimedCount === 1 ? 'it' : 'them'} again will charge the same hours twice.
+          </p>
+        </div>
+      )}
+
+      {/* Tracker lines whose hours are already on the invoice as task
+          lines. They arrive unticked, but stay tickable — warn, never
+          block (§ no locking). */}
+      {duplicateTrackerCount > 0 && (
+        <div className="flex items-start gap-2.5 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2.5">
+          <svg className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+          </svg>
+          <p className="text-xs text-amber-300 leading-relaxed">
+            {duplicateTrackerCount} tracker {duplicateTrackerCount === 1 ? 'line' : 'lines'} arrived
+            unticked because {duplicateTrackerCount === 1 ? 'its' : 'their'} time entries are
+            already listed as {duplicateTrackerCount === 1 ? 'a line of its own' : 'lines of their own'}.
+            Ticking {duplicateTrackerCount === 1 ? 'it' : 'one'} would bill the same hours twice.
+          </p>
+        </div>
+      )}
+
+      {previewed && (
+        <>
+          <div className="border-t border-slate-800 pt-4">
+            <InvoiceLineTable
+              lines={lines}
+              currency={currency}
+              discountType={meta.discount_type}
+              discountValue={meta.discount_value}
+              taxLabel={meta.tax_label}
+              taxPercent={meta.tax_percent}
+              onChange={setLines}
+              excludedIds={excluded}
+              onToggleExclude={toggleExclude}
+              // A manually added line has no preview entry, so it has no
+              // caveat — and is never auto-excluded.
+              reasonForLine={(id) => previewMeta.get(id)?.duplicate_reason ?? null}
+              // Same defaults as the editor, so rounding is available while
+              // building an invoice, not only after it exists.
+              roundingIncrement={settings?.hours_rounding_increment}
+              roundingDirection={settings?.hours_rounding_direction}
+            />
+          </div>
+
+          <div className="border-t border-slate-800 pt-4">
+            <InvoiceMetaFields meta={meta} onChange={setMeta} />
+          </div>
+        </>
+      )}
+
+      {error && (
+        <p className="text-sm text-red-400 bg-red-400/10 border border-red-400/20 rounded-lg px-3 py-2">
+          {error}
+        </p>
+      )}
+    </Modal>
   );
 }

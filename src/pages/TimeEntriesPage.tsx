@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import AppNav from '../components/AppNav';
 import TimeEntryForm, { type TimeEntryFormValues } from '../components/TimeEntryForm';
+import ConfirmDialog from '../components/ConfirmDialog';
 import {
   getSessions, createSession, updateSession, deleteSession,
   getClients, getProjects, getTasks,
@@ -35,6 +36,15 @@ function formatTime(iso: string | null): string {
   return hhmm || '—';
 }
 
+/**
+ * Invoices claiming an entry. The list is the truth; the scalar is only a
+ * fallback for documents written before the list existed (types.ts:178).
+ */
+function claimingInvoices(entry: TimeEntry): string[] {
+  if (entry.invoice_numbers?.length) return entry.invoice_numbers;
+  return entry.invoice_number ? [entry.invoice_number] : [];
+}
+
 const FIELD =
   'bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-3 py-2 text-sm ' +
   'focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent';
@@ -57,6 +67,9 @@ export default function TimeEntriesPage() {
   const [adding, setAdding] = useState(false);
   const [newTaskId, setNewTaskId] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
+  // One dialog for the whole list — the entry it is asking about, not a flag
+  // per row.
+  const [deleteTarget, setDeleteTarget] = useState<TimeEntry | null>(null);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -143,14 +156,16 @@ export default function TimeEntriesPage() {
     setEditingId(null);
   };
 
+  // Throws on failure so the dialog reports it in place and stays open; the
+  // page banner is left for the other actions.
   const handleDelete = async (entry: TimeEntry) => {
     setActionError('');
     try {
       await deleteSession(entry.id);
-      setEntries((prev) => prev.filter((e) => e.id !== entry.id));
     } catch {
-      setActionError('Failed to delete the time entry.');
+      throw new Error('Failed to delete the time entry. It is still here — try again.');
     }
+    setEntries((prev) => prev.filter((e) => e.id !== entry.id));
   };
 
   return (
@@ -323,7 +338,7 @@ export default function TimeEntriesPage() {
                                 Edit
                               </button>
                               <button
-                                onClick={() => handleDelete(e)}
+                                onClick={() => setDeleteTarget(e)}
                                 className="px-2.5 py-1 text-xs rounded-lg bg-slate-800 border border-slate-700 text-red-400 hover:text-red-300 transition-colors"
                               >
                                 Delete
@@ -340,6 +355,32 @@ export default function TimeEntriesPage() {
           </div>
         )}
       </main>
+
+      {deleteTarget && (
+        <ConfirmDialog
+          open
+          title="Delete time entry"
+          message={
+            <>
+              Delete{' '}
+              <span className="text-slate-100 font-medium">{deleteTarget.task_title}</span>
+              {' — '}
+              {formatDay(entryDate(deleteTarget.start_time))},{' '}
+              {(deleteTarget.effective_hours ?? 0).toFixed(2)} h?
+            </>
+          }
+          // Billed hours are the case worth a warning. The invoice keeps its
+          // snapshotted line either way (the server's delete does not touch
+          // invoices) — we warn, we do not block.
+          detail={
+            claimingInvoices(deleteTarget).length > 0
+              ? `These hours are billed on ${claimingInvoices(deleteTarget).join(', ')}. That invoice keeps the totals it was saved with, but regenerating it will no longer find this entry.`
+              : undefined
+          }
+          onConfirm={() => handleDelete(deleteTarget)}
+          onClose={() => setDeleteTarget(null)}
+        />
+      )}
     </div>
   );
 }
