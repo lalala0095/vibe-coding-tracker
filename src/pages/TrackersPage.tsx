@@ -145,9 +145,21 @@ function TrackerForm({ initial, projects = [], onSave, onClose }: TrackerFormPro
     if (!taskTitleEdited) setTaskTitle(value);
   }
 
+  // With the task section open there are two title fields, and filling either
+  // one is enough — typing only the task title and leaving the tracker's blank
+  // used to be rejected, which reads as a bug when you have plainly named the
+  // thing. Whichever was typed becomes the tracker's title; the task keeps its
+  // own when they differ.
+  const effectiveTitle =
+    title.trim() || (isCreate && createTask ? taskTitle.trim() : '');
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!title.trim() || !startTime) { setErr('Title and start time are required.'); return; }
+    // Reported one at a time. The old combined message named the start time
+    // even when only the title was missing, so a filled-in start time made the
+    // error look wrong rather than pointing at the empty field.
+    if (!effectiveTitle) { setErr('A title is required.'); return; }
+    if (!startTime) { setErr('A start time is required.'); return; }
     // Warn rather than block — the submit button stays live (§ no locking).
     if (isCreate && createTask && !taskProjectId) {
       setErr('Choose a project for the task, or switch the task off.');
@@ -156,7 +168,7 @@ function TrackerForm({ initial, projects = [], onSave, onClose }: TrackerFormPro
     setSaving(true);
     try {
       const payload: CreateTrackerPayload = {
-        title: title.trim(),
+        title: effectiveTitle,
         start_time: toISOWithOffset(startTime),
         ...(endTime ? { end_time: toISOWithOffset(endTime) } : {}),
         ...(notes.trim() ? { notes: notes.trim() } : {}),
