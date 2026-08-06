@@ -120,12 +120,24 @@ export interface Tracker {
   datetime_updated: string;
 }
 
+// Start a tracker and a task for it in one go. The task is created first and
+// attached to the tracker, so a work block you have not planned as a task yet
+// still ends up with one — which is what makes its hours reachable from an
+// invoice.
+export interface NewTrackerTask {
+  project_id: string;              // required — a task cannot exist without one
+  title?: string;                  // defaults to the tracker's title
+  status?: TaskStatus;             // defaults to "in_progress"
+  priority?: TaskPriority;         // defaults to "medium"
+}
+
 export interface CreateTrackerPayload {
   title: string;
   start_time: string;
   end_time?: string;
   notes?: string;
   task_ids?: string[];
+  new_task?: NewTrackerTask;
 }
 
 export interface UpdateTrackerPayload {

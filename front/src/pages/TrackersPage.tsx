@@ -12,7 +12,7 @@ import { parseTaskList } from '../lib/taskPaste';
 import type {
   Tracker, Task, Client, Project,
   CreateTrackerPayload, UpdateTrackerPayload,
-  TrackerTaskRef,
+  TrackerTaskRef, TaskStatus, TaskPriority,
 } from '../types';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -76,13 +76,29 @@ function elapsedHours(tracker: Tracker): number | null {
 
 // ── Tracker Form Modal ────────────────────────────────────────────────────────
 
+// Raw enum values read badly in a select, so each one carries a label.
+const TASK_STATUSES: ReadonlyArray<readonly [TaskStatus, string]> = [
+  ['todo', 'Todo'],
+  ['in_progress', 'In progress'],
+  ['done', 'Done'],
+];
+
+const TASK_PRIORITIES: ReadonlyArray<readonly [TaskPriority, string]> = [
+  ['low', 'Low'],
+  ['medium', 'Medium'],
+  ['high', 'High'],
+  ['urgent', 'Urgent'],
+];
+
 interface TrackerFormProps {
   initial?: Tracker;
+  // Only used on the create path, to pick the project the new task belongs to.
+  projects?: Project[];
   onSave: (payload: CreateTrackerPayload) => Promise<void>;
   onClose: () => void;
 }
 
-function TrackerForm({ initial, onSave, onClose }: TrackerFormProps) {
+function TrackerForm({ initial, projects = [], onSave, onClose }: TrackerFormProps) {
   const [title, setTitle] = useState(initial?.title ?? '');
   const [startTime, setStartTime] = useState(
     initial ? toLocalInputValue(initial.start_time) : nowLocalInputValue()
@@ -92,9 +108,44 @@ function TrackerForm({ initial, onSave, onClose }: TrackerFormProps) {
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState('');
 
+  // ── Optional task created alongside the tracker ──
+  // Only offered when starting a tracker: an existing tracker is not being
+  // "started", so editing one leaves all of this out entirely.
+  const isCreate = !initial;
+  const [createTask, setCreateTask] = useState(false);
+  const [taskProjectId, setTaskProjectId] = useState('');
+  const [taskTitle, setTaskTitle] = useState(initial?.title ?? '');
+  // The task title trails the tracker title only until the user makes it their
+  // own — after that, typing in the tracker title must not overwrite it.
+  const [taskTitleEdited, setTaskTitleEdited] = useState(false);
+  const [taskStatus, setTaskStatus] = useState<TaskStatus>('in_progress');
+  const [taskPriority, setTaskPriority] = useState<TaskPriority>('medium');
+
+  // Projects grouped by their client, because project names repeat across
+  // clients and the name alone is not enough to pick the right one.
+  const projectGroups = projects.reduce<Array<{ clientId: string; clientName: string; projects: Project[] }>>(
+    (groups, p) => {
+      const group = groups.find(g => g.clientId === p.client_id);
+      if (group) group.projects.push(p);
+      else groups.push({ clientId: p.client_id, clientName: p.client_name, projects: [p] });
+      return groups;
+    },
+    []
+  );
+
+  function handleTitleChange(value: string) {
+    setTitle(value);
+    if (!taskTitleEdited) setTaskTitle(value);
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!title.trim() || !startTime) { setErr('Title and start time are required.'); return; }
+    // Warn rather than block — the submit button stays live (§ no locking).
+    if (isCreate && createTask && !taskProjectId) {
+      setErr('Choose a project for the task, or switch the task off.');
+      return;
+    }
     setSaving(true);
     try {
       const payload: CreateTrackerPayload = {
@@ -102,6 +153,18 @@ function TrackerForm({ initial, onSave, onClose }: TrackerFormProps) {
         start_time: toISOWithOffset(startTime),
         ...(endTime ? { end_time: toISOWithOffset(endTime) } : {}),
         ...(notes.trim() ? { notes: notes.trim() } : {}),
+        // A blank task title is left out so the server applies its own default,
+        // which is the tracker title — the same thing the field was showing.
+        ...(isCreate && createTask
+          ? {
+              new_task: {
+                project_id: taskProjectId,
+                ...(taskTitle.trim() ? { title: taskTitle.trim() } : {}),
+                status: taskStatus,
+                priority: taskPriority,
+              },
+            }
+          : {}),
       };
       await onSave(payload);
       onClose();
@@ -114,7 +177,9 @@ function TrackerForm({ initial, onSave, onClose }: TrackerFormProps) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div className="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md shadow-2xl">
+      {/* The optional task section can push this past the viewport, so the card
+          scrolls rather than hiding its own buttons. */}
+      <div className="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md shadow-2xl max-h-[90vh] overflow-y-auto">
         <h2 className="text-lg font-semibold text-white mb-4">
           {initial ? 'Edit Tracker' : 'New Tracker'}
         </h2>
@@ -124,7 +189,7 @@ function TrackerForm({ initial, onSave, onClose }: TrackerFormProps) {
             <input
               className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
               value={title}
-              onChange={e => setTitle(e.target.value)}
+              onChange={e => handleTitleChange(e.target.value)}
               placeholder="Tracker title"
               autoFocus
             />
@@ -146,9 +211,88 @@ function TrackerForm({ initial, onSave, onClose }: TrackerFormProps) {
               rows={3}
               value={notes}
               onChange={e => setNotes(e.target.value)}
-              placeholder="Any notes for this session…"
+              placeholder="Any notes for this tracker…"
             />
           </div>
+
+          {/* A tracker on its own has no project and no billable time. Giving it
+              a task is what lets its hours reach an invoice later. */}
+          {isCreate && (
+            <div className="rounded-lg border border-slate-700 bg-slate-800/40 p-3 flex flex-col gap-3">
+              <label className="flex items-center gap-2 text-sm text-slate-200 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={createTask}
+                  onChange={e => setCreateTask(e.target.checked)}
+                  className="accent-blue-500"
+                />
+                Also create a task for this tracker
+              </label>
+              <p className="text-xs text-slate-500 -mt-2">
+                The task is attached to the tracker, and the notes above become its description.
+              </p>
+
+              {createTask && (
+                <>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Project</label>
+                    <select
+                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+                      value={taskProjectId}
+                      onChange={e => setTaskProjectId(e.target.value)}
+                    >
+                      <option value="">Select a project…</option>
+                      {projectGroups.map(g => (
+                        <optgroup key={g.clientId} label={g.clientName}>
+                          {g.projects.map(p => (
+                            <option key={p.id} value={p.id}>{g.clientName} / {p.name}</option>
+                          ))}
+                        </optgroup>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Task title</label>
+                    <input
+                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+                      value={taskTitle}
+                      onChange={e => { setTaskTitle(e.target.value); setTaskTitleEdited(true); }}
+                      placeholder={title.trim() || 'Same as the tracker title'}
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">Status</label>
+                      <select
+                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+                        value={taskStatus}
+                        onChange={e => setTaskStatus(e.target.value as TaskStatus)}
+                      >
+                        {TASK_STATUSES.map(([value, label]) => (
+                          <option key={value} value={value}>{label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">Priority</label>
+                      <select
+                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+                        value={taskPriority}
+                        onChange={e => setTaskPriority(e.target.value as TaskPriority)}
+                      >
+                        {TASK_PRIORITIES.map(([value, label]) => (
+                          <option key={value} value={value}>{label}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
           {err && <p className="text-xs text-red-400">{err}</p>}
           <div className="flex justify-end gap-2 pt-1">
             <button
@@ -1007,6 +1151,16 @@ export default function TrackersPage() {
   async function handleCreateTracker(payload: CreateTrackerPayload) {
     const created = await createTracker(payload);
     setTrackers(prev => [created, ...prev]);
+    // The server made a task we have never seen; refetch so the "Pick existing"
+    // tree and the rest of the page know about it.
+    if (payload.new_task) {
+      try {
+        setTasks(await getTasks());
+      } catch {
+        // The tracker is created either way — a stale task list is not worth
+        // failing the save for.
+      }
+    }
   }
 
   async function handleUpdateTracker(payload: UpdateTrackerPayload) {
@@ -1163,6 +1317,7 @@ export default function TrackersPage() {
       {/* ── Modals ── */}
       {modal.kind === 'create_tracker' && (
         <TrackerForm
+          projects={projects}
           onSave={handleCreateTracker}
           onClose={() => setModal({ kind: 'none' })}
         />
