@@ -3,6 +3,7 @@ import type { TimeEntry, CreateTimeEntryPayload, UpdateTimeEntryPayload } from '
 import { getSessions, createSession, updateSession, deleteSession } from '../api';
 import TimeEntryForm from './TimeEntryForm';
 import type { TimeEntryFormValues } from './TimeEntryForm';
+import ConfirmDialog from './ConfirmDialog';
 
 interface Props {
   taskId: string;
@@ -41,9 +42,14 @@ export default function TimeEntryList({ taskId }: Props) {
   const [entries, setEntries] = useState<TimeEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');        // load failure — replaces the list
-  const [actionError, setActionError] = useState(''); // delete failure — sits above it
+  // Row-level failures that must not blow away the list. The delete path no
+  // longer uses it — that error surfaces inside the confirm dialog instead.
+  const [actionError, setActionError] = useState('');
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  // One target for the whole list rather than a flag per row, so a single
+  // dialog is mounted no matter how many entries there are.
+  const [confirmTarget, setConfirmTarget] = useState<TimeEntry | null>(null);
 
   const fetchEntries = useCallback(async () => {
     setLoading(true);
@@ -98,15 +104,11 @@ export default function TimeEntryList({ taskId }: Props) {
     setEditingId(null);
   };
 
+  // No try/catch: ConfirmDialog reports the failure in place, keeping the
+  // question and the error together instead of splitting them across the page.
   const handleDelete = async (entry: TimeEntry) => {
-    setActionError('');
-    try {
-      await deleteSession(entry.id);
-      setEntries((prev) => prev.filter((e) => e.id !== entry.id));
-    } catch {
-      // Shown above the list rather than through `error`, which replaces it.
-      setActionError('Failed to delete the time entry.');
-    }
+    await deleteSession(entry.id);
+    setEntries((prev) => prev.filter((e) => e.id !== entry.id));
   };
 
   const totalHours = round2(entries.reduce((sum, e) => sum + (e.effective_hours ?? 0), 0));
@@ -221,7 +223,7 @@ export default function TimeEntryList({ taskId }: Props) {
                         Edit
                       </button>
                       <button
-                        onClick={() => handleDelete(e)}
+                        onClick={() => setConfirmTarget(e)}
                         className="px-1.5 py-0.5 text-xs text-red-400 hover:text-red-300 hover:bg-red-400/10 rounded transition-colors"
                         title="Delete time entry"
                       >
@@ -263,6 +265,36 @@ export default function TimeEntryList({ taskId }: Props) {
           ))}
         </ul>
       )}
+
+      <ConfirmDialog
+        open={confirmTarget !== null}
+        title="Delete time entry"
+        message={
+          confirmTarget && (
+            <>
+              Delete the{' '}
+              <span className="text-slate-100 font-medium">{confirmTarget.effective_hours}h</span>{' '}
+              entry on{' '}
+              <span className="text-slate-100 font-medium">
+                {formatEntryDate(confirmTarget.start_time)}
+              </span>{' '}
+              for {confirmTarget.task_title}?
+            </>
+          )
+        }
+        // Worth saying out loud: the hours vanish from an invoice that has
+        // already been issued. It is a warning, not a block — see the no-locking
+        // rule in CLAUDE.md.
+        detail={
+          confirmTarget?.invoice_number
+            ? `These hours are on invoice ${confirmTarget.invoice_number}.`
+            : undefined
+        }
+        onConfirm={async () => {
+          if (confirmTarget) await handleDelete(confirmTarget);
+        }}
+        onClose={() => setConfirmTarget(null)}
+      />
     </div>
   );
 }

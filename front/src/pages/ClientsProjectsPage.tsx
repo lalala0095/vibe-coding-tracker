@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
+import axios from 'axios';
 import {
   getClients, createClient, updateClient, deleteClient,
   getProjects, createProject, updateProject, deleteProject,
@@ -7,6 +8,21 @@ import {
 import type { ClientOptions } from '../api';
 import type { Client, Project } from '../types';
 import AppNav from '../components/AppNav';
+import ConfirmDialog from '../components/ConfirmDialog';
+
+// The API answers a rejected write with a `detail` string worth showing verbatim
+// ("Client 'x' has 3 projects."). Anything else falls back to the caller's
+// message. Mirrors TrackersPage.
+function errorDetail(e: unknown, fallback: string): string {
+  if (axios.isAxiosError(e)) {
+    const data: unknown = e.response?.data;
+    if (data && typeof data === 'object' && 'detail' in data) {
+      const detail = (data as { detail: unknown }).detail;
+      if (typeof detail === 'string' && detail.trim()) return detail;
+    }
+  }
+  return fallback;
+}
 
 // ── Rate helpers ─────────────────────────────────────────────────────────────
 
@@ -88,8 +104,8 @@ export default function ClientsProjectsPage() {
   const [newClientAddress, setNewClientAddress] = useState('');
   const [addingClient, setAddingClient] = useState(false);
   const [addClientError, setAddClientError] = useState('');
-  const [confirmDeleteClientId, setConfirmDeleteClientId] = useState<string | null>(null);
-  const [deletingClientId, setDeletingClientId] = useState<string | null>(null);
+  // The whole client, not just its id, so the dialog can name what it deletes.
+  const [confirmClient, setConfirmClient] = useState<Client | null>(null);
   const [editClientId, setEditClientId] = useState<string | null>(null);
   const [clientDraft, setClientDraft] = useState<ClientDraft | null>(null);
   const [savingClientId, setSavingClientId] = useState<string | null>(null);
@@ -104,8 +120,7 @@ export default function ClientsProjectsPage() {
   const [newProjectRate, setNewProjectRate] = useState('');
   const [addingProject, setAddingProject] = useState(false);
   const [addProjectError, setAddProjectError] = useState('');
-  const [confirmDeleteProjectId, setConfirmDeleteProjectId] = useState<string | null>(null);
-  const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
+  const [confirmProject, setConfirmProject] = useState<Project | null>(null);
   const [editProjectId, setEditProjectId] = useState<string | null>(null);
   const [projectDraft, setProjectDraft] = useState<ProjectDraft | null>(null);
   const [savingProjectId, setSavingProjectId] = useState<string | null>(null);
@@ -199,7 +214,6 @@ export default function ClientsProjectsPage() {
   };
 
   const startEditClient = (client: Client) => {
-    setConfirmDeleteClientId(null);
     setEditClientError('');
     setEditClientId(client.id);
     setClientDraft({
@@ -255,19 +269,18 @@ export default function ClientsProjectsPage() {
     }
   };
 
+  // Throws on failure so ConfirmDialog can keep itself open and show why. The
+  // old version swallowed the error, so a refused delete — a client that still
+  // has projects — looked exactly like a successful one.
   const handleDeleteClient = async (id: string) => {
-    setDeletingClientId(id);
     try {
       await deleteClient(id);
-      setClients((prev) => prev.filter((c) => c.id !== id));
-      setConfirmDeleteClientId(null);
-      // Also remove projects that belonged to this client
-      setProjects((prev) => prev.filter((p) => p.client_id !== id));
-    } catch {
-      // silently reset
-    } finally {
-      setDeletingClientId(null);
+    } catch (e) {
+      throw new Error(errorDetail(e, 'Failed to delete client. Please try again.'));
     }
+    setClients((prev) => prev.filter((c) => c.id !== id));
+    // Also remove projects that belonged to this client
+    setProjects((prev) => prev.filter((p) => p.client_id !== id));
   };
 
   // ── Project handlers ───────────────────────────────────────────────────────
@@ -306,7 +319,6 @@ export default function ClientsProjectsPage() {
   };
 
   const startEditProject = (project: Project) => {
-    setConfirmDeleteProjectId(null);
     setEditProjectError('');
     setEditProjectId(project.id);
     setProjectDraft({ name: project.name, rate: rateToInput(project.rate) });
@@ -345,17 +357,15 @@ export default function ClientsProjectsPage() {
     }
   };
 
+  // Throws on failure for the same reason as handleDeleteClient — a project
+  // that still has tasks may well be refused.
   const handleDeleteProject = async (id: string) => {
-    setDeletingProjectId(id);
     try {
       await deleteProject(id);
-      setProjects((prev) => prev.filter((p) => p.id !== id));
-      setConfirmDeleteProjectId(null);
-    } catch {
-      // silently reset
-    } finally {
-      setDeletingProjectId(null);
+    } catch (e) {
+      throw new Error(errorDetail(e, 'Failed to delete project. Please try again.'));
     }
+    setProjects((prev) => prev.filter((p) => p.id !== id));
   };
 
   return (
@@ -651,51 +661,26 @@ export default function ClientsProjectsPage() {
                       </div>
 
                       <div className="flex items-center gap-2">
-                        {confirmDeleteClientId === client.id ? (
-                          <>
-                            <span className="text-xs text-slate-400">Delete?</span>
-                            <button
-                              onClick={() => handleDeleteClient(client.id)}
-                              disabled={deletingClientId === client.id}
-                              className="px-2.5 py-1 text-xs font-medium text-white bg-red-600 rounded-lg
-                                         hover:bg-red-500 transition-colors disabled:opacity-50 flex items-center gap-1"
-                            >
-                              {deletingClientId === client.id && (
-                                <span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                              )}
-                              Yes
-                            </button>
-                            <button
-                              onClick={() => setConfirmDeleteClientId(null)}
-                              className="px-2.5 py-1 text-xs text-slate-400 hover:text-slate-200 transition-colors"
-                            >
-                              No
-                            </button>
-                          </>
-                        ) : (
-                          <>
-                            <button
-                              onClick={() => startEditClient(client)}
-                              className="p-1.5 text-slate-500 hover:text-violet-400 hover:bg-violet-400/10 rounded-lg transition-colors"
-                              title="Edit client"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                                <path strokeLinecap="round" strokeLinejoin="round"
-                                  d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                              </svg>
-                            </button>
-                            <button
-                              onClick={() => setConfirmDeleteClientId(client.id)}
-                              className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors"
-                              title="Delete client"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                                <path strokeLinecap="round" strokeLinejoin="round"
-                                  d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                              </svg>
-                            </button>
-                          </>
-                        )}
+                        <button
+                          onClick={() => startEditClient(client)}
+                          className="p-1.5 text-slate-500 hover:text-violet-400 hover:bg-violet-400/10 rounded-lg transition-colors"
+                          title="Edit client"
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round"
+                              d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                          </svg>
+                        </button>
+                        <button
+                          onClick={() => setConfirmClient(client)}
+                          className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors"
+                          title="Delete client"
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round"
+                              d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          </svg>
+                        </button>
                       </div>
                     </li>
                     )
@@ -939,51 +924,26 @@ export default function ClientsProjectsPage() {
                       </div>
 
                       <div className="flex items-center gap-2">
-                        {confirmDeleteProjectId === project.id ? (
-                          <>
-                            <span className="text-xs text-slate-400">Delete?</span>
-                            <button
-                              onClick={() => handleDeleteProject(project.id)}
-                              disabled={deletingProjectId === project.id}
-                              className="px-2.5 py-1 text-xs font-medium text-white bg-red-600 rounded-lg
-                                         hover:bg-red-500 transition-colors disabled:opacity-50 flex items-center gap-1"
-                            >
-                              {deletingProjectId === project.id && (
-                                <span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                              )}
-                              Yes
-                            </button>
-                            <button
-                              onClick={() => setConfirmDeleteProjectId(null)}
-                              className="px-2.5 py-1 text-xs text-slate-400 hover:text-slate-200 transition-colors"
-                            >
-                              No
-                            </button>
-                          </>
-                        ) : (
-                          <>
-                            <button
-                              onClick={() => startEditProject(project)}
-                              className="p-1.5 text-slate-500 hover:text-violet-400 hover:bg-violet-400/10 rounded-lg transition-colors"
-                              title="Edit project"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                                <path strokeLinecap="round" strokeLinejoin="round"
-                                  d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                              </svg>
-                            </button>
-                            <button
-                              onClick={() => setConfirmDeleteProjectId(project.id)}
-                              className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors"
-                              title="Delete project"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                                <path strokeLinecap="round" strokeLinejoin="round"
-                                  d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                              </svg>
-                            </button>
-                          </>
-                        )}
+                        <button
+                          onClick={() => startEditProject(project)}
+                          className="p-1.5 text-slate-500 hover:text-violet-400 hover:bg-violet-400/10 rounded-lg transition-colors"
+                          title="Edit project"
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round"
+                              d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                          </svg>
+                        </button>
+                        <button
+                          onClick={() => setConfirmProject(project)}
+                          className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors"
+                          title="Delete project"
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round"
+                              d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          </svg>
+                        </button>
                       </div>
                     </li>
                     );
@@ -994,6 +954,40 @@ export default function ClientsProjectsPage() {
           </div>
         </div>
       </main>
+
+      {/* One dialog per list — the target is held in state, not rendered per row.
+          clients.py does not cascade, so the projects survive the delete even
+          though this page drops them from the list; the detail says so rather
+          than implying they go too. */}
+      <ConfirmDialog
+        open={confirmClient !== null}
+        title="Delete client"
+        message={
+          <>
+            Delete <span className="text-slate-100 font-medium">{confirmClient?.name}</span>?
+          </>
+        }
+        detail={
+          confirmClient && projects.some((p) => p.client_id === confirmClient.id)
+            ? `Its ${projects.filter((p) => p.client_id === confirmClient.id).length} project(s) are not deleted, but they lose the inherited default rate.`
+            : undefined
+        }
+        onConfirm={() => handleDeleteClient(confirmClient!.id)}
+        onClose={() => setConfirmClient(null)}
+      />
+
+      <ConfirmDialog
+        open={confirmProject !== null}
+        title="Delete project"
+        message={
+          <>
+            Delete <span className="text-slate-100 font-medium">{confirmProject?.name}</span>?
+          </>
+        }
+        detail="Tasks under this project are not deleted with it."
+        onConfirm={() => handleDeleteProject(confirmProject!.id)}
+        onClose={() => setConfirmProject(null)}
+      />
     </div>
   );
 }

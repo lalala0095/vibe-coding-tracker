@@ -3,6 +3,8 @@ import { Link, useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import AppNav from '../components/AppNav';
 import DateTimeInput from '../components/DateTimeInput';
+import Modal, { MODAL_CANCEL_BUTTON, MODAL_PRIMARY_BUTTON } from '../components/Modal';
+import ConfirmDialog from '../components/ConfirmDialog';
 import {
   getTrackers, createTracker, updateTracker, deleteTracker,
   addTasksToTracker, removeTaskFromTracker, billTracker,
@@ -90,6 +92,11 @@ const TASK_PRIORITIES: ReadonlyArray<readonly [TaskPriority, string]> = [
   ['urgent', 'Urgent'],
 ];
 
+// The submit button lives in the modal footer, outside the <form>, so the two
+// are linked by id. Only one TrackerForm is ever mounted (the modal state is a
+// union), so a constant id cannot collide.
+const FORM_ID = 'tracker-form';
+
 interface TrackerFormProps {
   initial?: Tracker;
   // Only used on the create path, to pick the project the new task belongs to.
@@ -176,143 +183,138 @@ function TrackerForm({ initial, projects = [], onSave, onClose }: TrackerFormPro
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      {/* The optional task section can push this past the viewport, so the card
-          scrolls rather than hiding its own buttons. */}
-      <div className="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md shadow-2xl max-h-[90vh] overflow-y-auto">
-        <h2 className="text-lg font-semibold text-white mb-4">
-          {initial ? 'Edit Tracker' : 'New Tracker'}
-        </h2>
-        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+    <Modal
+      title={initial ? 'Edit Tracker' : 'New Tracker'}
+      onClose={onClose}
+      size="sm"
+      footer={
+        <>
+          <button type="button" onClick={onClose} className={MODAL_CANCEL_BUTTON}>
+            Cancel
+          </button>
+          {/* The footer is a sibling of the body inside Modal, so the button is
+              tied back to the form by id. That association is also what keeps
+              Enter-to-submit working: the form's default button is the first
+              submit button owned by it, wherever it sits in the DOM. */}
+          <button type="submit" form={FORM_ID} disabled={saving} className={MODAL_PRIMARY_BUTTON}>
+            {saving ? 'Saving…' : initial ? 'Save' : 'Create'}
+          </button>
+        </>
+      }
+    >
+      <form id={FORM_ID} onSubmit={handleSubmit} className="flex flex-col gap-4">
+        <div>
+          <label className="block text-xs text-slate-400 mb-1">Title</label>
+          <input
+            className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+            value={title}
+            onChange={e => handleTitleChange(e.target.value)}
+            placeholder="Tracker title"
+            autoFocus
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="block text-xs text-slate-400 mb-1">Title</label>
-            <input
-              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
-              value={title}
-              onChange={e => handleTitleChange(e.target.value)}
-              placeholder="Tracker title"
-              autoFocus
-            />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">Start time</label>
-              <DateTimeInput value={startTime} onChange={setStartTime} />
-            </div>
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">End time (optional)</label>
-              <DateTimeInput value={endTime} onChange={setEndTime} />
-            </div>
+            <label className="block text-xs text-slate-400 mb-1">Start time</label>
+            <DateTimeInput value={startTime} onChange={setStartTime} />
           </div>
           <div>
-            <label className="block text-xs text-slate-400 mb-1">Notes (optional)</label>
-            <textarea
-              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500 resize-none"
-              rows={3}
-              value={notes}
-              onChange={e => setNotes(e.target.value)}
-              placeholder="Any notes for this tracker…"
-            />
+            <label className="block text-xs text-slate-400 mb-1">End time (optional)</label>
+            <DateTimeInput value={endTime} onChange={setEndTime} />
           </div>
+        </div>
+        <div>
+          <label className="block text-xs text-slate-400 mb-1">Notes (optional)</label>
+          <textarea
+            className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500 resize-none"
+            rows={3}
+            value={notes}
+            onChange={e => setNotes(e.target.value)}
+            placeholder="Any notes for this tracker…"
+          />
+        </div>
 
-          {/* A tracker on its own has no project and no billable time. Giving it
-              a task is what lets its hours reach an invoice later. */}
-          {isCreate && (
-            <div className="rounded-lg border border-slate-700 bg-slate-800/40 p-3 flex flex-col gap-3">
-              <label className="flex items-center gap-2 text-sm text-slate-200 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={createTask}
-                  onChange={e => setCreateTask(e.target.checked)}
-                  className="accent-blue-500"
-                />
-                Also create a task for this tracker
-              </label>
-              <p className="text-xs text-slate-500 -mt-2">
-                The task is attached to the tracker, and the notes above become its description.
-              </p>
+        {/* A tracker on its own has no project and no billable time. Giving it
+            a task is what lets its hours reach an invoice later. */}
+        {isCreate && (
+          <div className="rounded-lg border border-slate-700 bg-slate-800/40 p-3 flex flex-col gap-3">
+            <label className="flex items-center gap-2 text-sm text-slate-200 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={createTask}
+                onChange={e => setCreateTask(e.target.checked)}
+                className="accent-blue-500"
+              />
+              Also create a task for this tracker
+            </label>
+            <p className="text-xs text-slate-500 -mt-2">
+              The task is attached to the tracker, and the notes above become its description.
+            </p>
 
-              {createTask && (
-                <>
+            {createTask && (
+              <>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Project</label>
+                  <select
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+                    value={taskProjectId}
+                    onChange={e => setTaskProjectId(e.target.value)}
+                  >
+                    <option value="">Select a project…</option>
+                    {projectGroups.map(g => (
+                      <optgroup key={g.clientId} label={g.clientName}>
+                        {g.projects.map(p => (
+                          <option key={p.id} value={p.id}>{g.clientName} / {p.name}</option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Task title</label>
+                  <input
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+                    value={taskTitle}
+                    onChange={e => { setTaskTitle(e.target.value); setTaskTitleEdited(true); }}
+                    placeholder={title.trim() || 'Same as the tracker title'}
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-xs text-slate-400 mb-1">Project</label>
+                    <label className="block text-xs text-slate-400 mb-1">Status</label>
                     <select
                       className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
-                      value={taskProjectId}
-                      onChange={e => setTaskProjectId(e.target.value)}
+                      value={taskStatus}
+                      onChange={e => setTaskStatus(e.target.value as TaskStatus)}
                     >
-                      <option value="">Select a project…</option>
-                      {projectGroups.map(g => (
-                        <optgroup key={g.clientId} label={g.clientName}>
-                          {g.projects.map(p => (
-                            <option key={p.id} value={p.id}>{g.clientName} / {p.name}</option>
-                          ))}
-                        </optgroup>
+                      {TASK_STATUSES.map(([value, label]) => (
+                        <option key={value} value={value}>{label}</option>
                       ))}
                     </select>
                   </div>
-
                   <div>
-                    <label className="block text-xs text-slate-400 mb-1">Task title</label>
-                    <input
+                    <label className="block text-xs text-slate-400 mb-1">Priority</label>
+                    <select
                       className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
-                      value={taskTitle}
-                      onChange={e => { setTaskTitle(e.target.value); setTaskTitleEdited(true); }}
-                      placeholder={title.trim() || 'Same as the tracker title'}
-                    />
+                      value={taskPriority}
+                      onChange={e => setTaskPriority(e.target.value as TaskPriority)}
+                    >
+                      {TASK_PRIORITIES.map(([value, label]) => (
+                        <option key={value} value={value}>{label}</option>
+                      ))}
+                    </select>
                   </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1">Status</label>
-                      <select
-                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
-                        value={taskStatus}
-                        onChange={e => setTaskStatus(e.target.value as TaskStatus)}
-                      >
-                        {TASK_STATUSES.map(([value, label]) => (
-                          <option key={value} value={value}>{label}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1">Priority</label>
-                      <select
-                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
-                        value={taskPriority}
-                        onChange={e => setTaskPriority(e.target.value as TaskPriority)}
-                      >
-                        {TASK_PRIORITIES.map(([value, label]) => (
-                          <option key={value} value={value}>{label}</option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                </>
-              )}
-            </div>
-          )}
-
-          {err && <p className="text-xs text-red-400">{err}</p>}
-          <div className="flex justify-end gap-2 pt-1">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 text-sm rounded-lg text-slate-300 hover:bg-slate-800 transition-colors"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={saving}
-              className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors disabled:opacity-50"
-            >
-              {saving ? 'Saving…' : initial ? 'Save' : 'Create'}
-            </button>
+                </div>
+              </>
+            )}
           </div>
-        </form>
-      </div>
-    </div>
+        )}
+
+        {err && <p className="text-xs text-red-400">{err}</p>}
+      </form>
+    </Modal>
   );
 }
 
@@ -554,194 +556,19 @@ function AddTasksModal({ tracker, allTasks, clients, projects, onAdd, onCreateTa
     }
   }
 
+  // The body is a column of tabs plus a pane region that owns its own scrolling,
+  // so it drops the modal's default padding and gap and never scrolls itself.
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
-      <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-full max-w-2xl flex flex-col overflow-hidden" style={{ maxHeight: '80vh' }}>
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-700 shrink-0">
-          <h2 className="text-base font-semibold text-white">Add tasks to tracker</h2>
-          <button onClick={onClose} className="text-slate-500 hover:text-slate-300 transition-colors">
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-
-        {/* Mode tabs */}
-        <div className="flex gap-1 px-5 pt-3 pb-2 border-b border-slate-800 shrink-0">
-          {([['pick', 'Pick existing'], ['paste', 'Paste new tasks']] as const).map(([value, label]) => (
-            <button
-              key={value}
-              onClick={() => { setMode(value); setErr(''); }}
-              className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${
-                mode === value
-                  ? 'bg-slate-800 text-white'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-              }`}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
-        {mode === 'pick' ? (
-        /* Body: sidebar + task tree */
-        <div className="flex flex-1 overflow-hidden">
-          {/* Left: client/project tree */}
-          <aside className="w-48 shrink-0 border-r border-slate-800 overflow-y-auto bg-slate-950/50">
-            <nav className="flex flex-col py-2">
-              <button
-                onClick={() => setSelectedProjectId(null)}
-                className={`flex items-center gap-2 px-3 py-2 text-sm text-left transition-colors ${
-                  selectedProjectId === null
-                    ? 'text-violet-400 bg-violet-400/10 font-medium'
-                    : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800'
-                }`}
-              >
-                <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm-.375 5.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
-                </svg>
-                All Tasks
-              </button>
-
-              {clientProjectGroups.map(({ client, projects: cProjects }) => (
-                <div key={client.id}>
-                  <button
-                    onClick={() => toggleClient(client.id)}
-                    className="w-full flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-500 hover:text-slate-300 hover:bg-slate-800 transition-colors text-left uppercase tracking-wider"
-                  >
-                    <svg
-                      className={`w-3 h-3 shrink-0 transition-transform ${expandedClients.has(client.id) ? 'rotate-90' : ''}`}
-                      fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}
-                    >
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
-                    </svg>
-                    <span className="truncate">{client.name}</span>
-                  </button>
-
-                  {expandedClients.has(client.id) && cProjects.map(p => (
-                    <button
-                      key={p.id}
-                      onClick={() => setSelectedProjectId(p.id)}
-                      className={`w-full flex items-center gap-2 pl-6 pr-3 py-1.5 text-sm text-left transition-colors ${
-                        selectedProjectId === p.id
-                          ? 'text-violet-400 bg-violet-400/10 font-medium'
-                          : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800'
-                      }`}
-                    >
-                      <span className="w-1 h-1 rounded-full bg-current shrink-0 opacity-60" />
-                      <span className="truncate">{p.name}</span>
-                    </button>
-                  ))}
-
-                  {expandedClients.has(client.id) && cProjects.length === 0 && (
-                    <p className="pl-6 pr-3 py-1.5 text-xs text-slate-600 italic">No projects</p>
-                  )}
-                </div>
-              ))}
-            </nav>
-          </aside>
-
-          {/* Right: task tree */}
-          <div className="flex-1 overflow-y-auto">
-            {topLevelTasks.length === 0 ? (
-              <div className="flex items-center justify-center h-full text-sm text-slate-500">
-                No tasks available.
-              </div>
-            ) : (
-              topLevelTasks.map(t => (
-                <TaskTreeRow
-                  key={t.id}
-                  task={t}
-                  depth={0}
-                  subtasksOf={subtasksOf}
-                  selected={selected}
-                  existingIds={existingIds}
-                  expandedTasks={expandedTasks}
-                  onToggleExpand={toggleTaskExpand}
-                  onToggleSelect={toggleTaskSelect}
-                />
-              ))
-            )}
-          </div>
-        </div>
-        ) : (
-        /* Body: paste a block of text, review it, create the tasks */
-        <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
-          <div>
-            <label className="block text-xs text-slate-400 mb-1">Project</label>
-            <select
-              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
-              value={pasteProjectId}
-              onChange={e => setPasteProjectId(e.target.value)}
-            >
-              <option value="">Select a project…</option>
-              {clientProjectGroups.map(({ client, projects: cProjects }) => (
-                cProjects.length > 0 && (
-                  <optgroup key={client.id} label={client.name}>
-                    {cProjects.map(p => (
-                      <option key={p.id} value={p.id}>{client.name} / {p.name}</option>
-                    ))}
-                  </optgroup>
-                )
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label className="block text-xs text-slate-400 mb-1">Paste your tasks</label>
-            <textarea
-              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500 resize-none"
-              rows={5}
-              value={pasteText}
-              onChange={e => handlePasteChange(e.target.value)}
-              placeholder="One per line, or a paragraph — each sentence becomes a task."
-            />
-          </div>
-
-          {titles.length === 0 ? (
-            <p className="text-xs text-slate-500">
-              Nothing parsed yet. Everything below stays editable before you create it.
-            </p>
-          ) : (
-            <div className="flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                  Preview
-                </span>
-                <span className="text-xs text-slate-500">
-                  {filledTitles.length} task{filledTitles.length !== 1 ? 's' : ''}
-                </span>
-              </div>
-              {titles.map((title, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <span className="w-5 shrink-0 text-xs text-slate-600 text-right">{i + 1}</span>
-                  <input
-                    className="flex-1 min-w-0 bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
-                    value={title}
-                    onChange={e => updateTitle(i, e.target.value)}
-                  />
-                  <button
-                    onClick={() => removeTitle(i)}
-                    className="shrink-0 text-slate-600 hover:text-red-400 transition-colors"
-                    title="Remove this task"
-                  >
-                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                  </button>
-                </div>
-              ))}
-              <p className="text-xs text-slate-500">
-                Blank titles are dropped. The tasks are created in the project above and linked to this tracker.
-              </p>
-            </div>
-          )}
-        </div>
-        )}
-
-        {/* Footer */}
-        <div className="flex items-center justify-between gap-3 px-5 py-3 border-t border-slate-700 shrink-0 bg-slate-900">
+    <Modal
+      title="Add tasks to tracker"
+      onClose={onClose}
+      size="md"
+      maxHeight="80vh"
+      bodyClassName="flex flex-col overflow-hidden p-0"
+      footer={
+        <>
+          {/* The error takes the status line's slot rather than adding a row,
+              so the footer keeps its height either way. */}
           {err ? (
             <span className="text-xs text-red-400">{err}</span>
           ) : mode === 'pick' ? (
@@ -756,10 +583,7 @@ function AddTasksModal({ tracker, allTasks, clients, projects, onAdd, onCreateTa
             </span>
           )}
           <div className="flex gap-2 shrink-0">
-            <button
-              onClick={onClose}
-              className="px-4 py-2 text-sm rounded-lg text-slate-300 hover:bg-slate-800 transition-colors"
-            >
+            <button onClick={onClose} className={MODAL_CANCEL_BUTTON}>
               Cancel
             </button>
             {mode === 'pick' ? (
@@ -780,9 +604,182 @@ function AddTasksModal({ tracker, allTasks, clients, projects, onAdd, onCreateTa
               </button>
             )}
           </div>
+        </>
+      }
+    >
+      {/* Mode tabs */}
+      <div className="flex gap-1 px-5 pt-3 pb-2 border-b border-slate-800 shrink-0">
+        {([['pick', 'Pick existing'], ['paste', 'Paste new tasks']] as const).map(([value, label]) => (
+          <button
+            key={value}
+            onClick={() => { setMode(value); setErr(''); }}
+            className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${
+              mode === value
+                ? 'bg-slate-800 text-white'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {mode === 'pick' ? (
+      /* Body: sidebar + task tree */
+      <div className="flex flex-1 overflow-hidden">
+        {/* Left: client/project tree */}
+        <aside className="w-48 shrink-0 border-r border-slate-800 overflow-y-auto bg-slate-950/50">
+          <nav className="flex flex-col py-2">
+            <button
+              onClick={() => setSelectedProjectId(null)}
+              className={`flex items-center gap-2 px-3 py-2 text-sm text-left transition-colors ${
+                selectedProjectId === null
+                  ? 'text-violet-400 bg-violet-400/10 font-medium'
+                  : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800'
+              }`}
+            >
+              <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm-.375 5.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
+              </svg>
+              All Tasks
+            </button>
+
+            {clientProjectGroups.map(({ client, projects: cProjects }) => (
+              <div key={client.id}>
+                <button
+                  onClick={() => toggleClient(client.id)}
+                  className="w-full flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-500 hover:text-slate-300 hover:bg-slate-800 transition-colors text-left uppercase tracking-wider"
+                >
+                  <svg
+                    className={`w-3 h-3 shrink-0 transition-transform ${expandedClients.has(client.id) ? 'rotate-90' : ''}`}
+                    fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+                  </svg>
+                  <span className="truncate">{client.name}</span>
+                </button>
+
+                {expandedClients.has(client.id) && cProjects.map(p => (
+                  <button
+                    key={p.id}
+                    onClick={() => setSelectedProjectId(p.id)}
+                    className={`w-full flex items-center gap-2 pl-6 pr-3 py-1.5 text-sm text-left transition-colors ${
+                      selectedProjectId === p.id
+                        ? 'text-violet-400 bg-violet-400/10 font-medium'
+                        : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800'
+                    }`}
+                  >
+                    <span className="w-1 h-1 rounded-full bg-current shrink-0 opacity-60" />
+                    <span className="truncate">{p.name}</span>
+                  </button>
+                ))}
+
+                {expandedClients.has(client.id) && cProjects.length === 0 && (
+                  <p className="pl-6 pr-3 py-1.5 text-xs text-slate-600 italic">No projects</p>
+                )}
+              </div>
+            ))}
+          </nav>
+        </aside>
+
+        {/* Right: task tree */}
+        <div className="flex-1 overflow-y-auto">
+          {topLevelTasks.length === 0 ? (
+            <div className="flex items-center justify-center h-full text-sm text-slate-500">
+              No tasks available.
+            </div>
+          ) : (
+            topLevelTasks.map(t => (
+              <TaskTreeRow
+                key={t.id}
+                task={t}
+                depth={0}
+                subtasksOf={subtasksOf}
+                selected={selected}
+                existingIds={existingIds}
+                expandedTasks={expandedTasks}
+                onToggleExpand={toggleTaskExpand}
+                onToggleSelect={toggleTaskSelect}
+              />
+            ))
+          )}
         </div>
       </div>
-    </div>
+      ) : (
+      /* Body: paste a block of text, review it, create the tasks */
+      <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
+        <div>
+          <label className="block text-xs text-slate-400 mb-1">Project</label>
+          <select
+            className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+            value={pasteProjectId}
+            onChange={e => setPasteProjectId(e.target.value)}
+          >
+            <option value="">Select a project…</option>
+            {clientProjectGroups.map(({ client, projects: cProjects }) => (
+              cProjects.length > 0 && (
+                <optgroup key={client.id} label={client.name}>
+                  {cProjects.map(p => (
+                    <option key={p.id} value={p.id}>{client.name} / {p.name}</option>
+                  ))}
+                </optgroup>
+              )
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <label className="block text-xs text-slate-400 mb-1">Paste your tasks</label>
+          <textarea
+            className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500 resize-none"
+            rows={5}
+            value={pasteText}
+            onChange={e => handlePasteChange(e.target.value)}
+            placeholder="One per line, or a paragraph — each sentence becomes a task."
+          />
+        </div>
+
+        {titles.length === 0 ? (
+          <p className="text-xs text-slate-500">
+            Nothing parsed yet. Everything below stays editable before you create it.
+          </p>
+        ) : (
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                Preview
+              </span>
+              <span className="text-xs text-slate-500">
+                {filledTitles.length} task{filledTitles.length !== 1 ? 's' : ''}
+              </span>
+            </div>
+            {titles.map((title, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <span className="w-5 shrink-0 text-xs text-slate-600 text-right">{i + 1}</span>
+                <input
+                  className="flex-1 min-w-0 bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                  value={title}
+                  onChange={e => updateTitle(i, e.target.value)}
+                />
+                <button
+                  onClick={() => removeTitle(i)}
+                  className="shrink-0 text-slate-600 hover:text-red-400 transition-colors"
+                  title="Remove this task"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            ))}
+            <p className="text-xs text-slate-500">
+              Blank titles are dropped. The tasks are created in the project above and linked to this tracker.
+            </p>
+          </div>
+        )}
+      </div>
+      )}
+    </Modal>
   );
 }
 
@@ -794,12 +791,18 @@ interface TrackerPanelProps {
   onDelete: () => void;
   onStop: () => void;
   onAddTasks: () => void;
-  onRemoveTask: (taskId: string) => void;
+  // Awaited by the confirmation, so a failed removal keeps the dialog open and
+  // shows why instead of leaving the row in place with no explanation.
+  onRemoveTask: (taskId: string) => Promise<void>;
 }
 
 function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveTask }: TrackerPanelProps) {
   const isActive = !tracker.end_time;
   const navigate = useNavigate();
+
+  // One dialog for the whole list — the row being removed is the state, so the
+  // tracker's tasks do not each carry a dialog of their own.
+  const [removeTarget, setRemoveTarget] = useState<TrackerTaskRef | null>(null);
 
   // Billing the tracker: turning its span into time entries on the `sessions`
   // collection, which is what an invoice reads.
@@ -1073,7 +1076,7 @@ function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveT
                     </svg>
                   </button>
                   <button
-                    onClick={() => onRemoveTask(t.task_id)}
+                    onClick={() => setRemoveTarget(t)}
                     className="shrink-0 text-slate-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
                     title="Remove task from tracker"
                   >
@@ -1087,6 +1090,19 @@ function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveT
           )}
         </div>
       </div>
+
+      {removeTarget && (
+        <ConfirmDialog
+          open
+          title="Remove task"
+          message={<>Remove “{removeTarget.task_title}” from this tracker?</>}
+          detail="The task itself is not deleted — only its link to this tracker."
+          confirmLabel="Remove"
+          onConfirm={() => onRemoveTask(removeTarget.task_id)}
+          onClose={() => setRemoveTarget(null)}
+          errorFallback="Failed to remove the task. Please try again."
+        />
+      )}
     </div>
   );
 }
@@ -1112,6 +1128,10 @@ export default function TrackersPage() {
   const [selectedTracker, setSelectedTracker] = useState<Tracker | null>(null);
 
   const [modal, setModal] = useState<ModalState>({ kind: 'none' });
+
+  // Kept apart from `modal` so the confirmation can sit above whatever else is
+  // open, and so the tracker being deleted survives the panel's own state.
+  const [deleteTarget, setDeleteTarget] = useState<Tracker | null>(null);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -1177,8 +1197,9 @@ export default function TrackersPage() {
     if (selectedTracker?.id === updated.id) setSelectedTracker(updated);
   }
 
+  // No try/catch: a failure has to reach the confirmation, which keeps itself
+  // open and says what went wrong rather than dropping the row from the list.
   async function handleDeleteTracker(tracker: Tracker) {
-    if (!confirm(`Delete tracker "${tracker.title}"?`)) return;
     await deleteTracker(tracker.id);
     setTrackers(prev => prev.filter(t => t.id !== tracker.id));
     if (selectedTracker?.id === tracker.id) setSelectedTracker(null);
@@ -1302,7 +1323,7 @@ export default function TrackersPage() {
             key={selectedTracker.id}
             tracker={selectedTracker}
             onEdit={() => setModal({ kind: 'edit_tracker', tracker: selectedTracker })}
-            onDelete={() => handleDeleteTracker(selectedTracker)}
+            onDelete={() => setDeleteTarget(selectedTracker)}
             onStop={() => handleStopTracker(selectedTracker)}
             onAddTasks={() => setModal({ kind: 'add_tasks', tracker: selectedTracker })}
             onRemoveTask={handleRemoveTask}
@@ -1338,6 +1359,16 @@ export default function TrackersPage() {
           onAdd={handleAddTasks}
           onCreateTasks={handleCreateTasks}
           onClose={() => setModal({ kind: 'none' })}
+        />
+      )}
+      {deleteTarget && (
+        <ConfirmDialog
+          open
+          title="Delete tracker"
+          message={<>Delete tracker “{deleteTarget.title}”?</>}
+          onConfirm={() => handleDeleteTracker(deleteTarget)}
+          onClose={() => setDeleteTarget(null)}
+          errorFallback="Failed to delete the tracker. Please try again."
         />
       )}
       </div>

@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import type { Goal, Model } from '../types';
 import { deleteGoal, updateGoal } from '../api';
 import GoalForm from './GoalForm';
+import ConfirmDialog from './ConfirmDialog';
 
 interface Props {
   goal: Goal;
@@ -28,7 +29,6 @@ function formatDatetime(iso: string): string {
 export default function GoalPanel({ goal, models, onClose, onUpdated, onDeleted }: Props) {
   const [mode, setMode] = useState<'view' | 'edit'>('view');
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [deleting, setDeleting] = useState(false);
 
   // Reset to view mode when goal changes
   useEffect(() => {
@@ -48,15 +48,11 @@ export default function GoalPanel({ goal, models, onClose, onUpdated, onDeleted 
     setMode('view');
   };
 
+  // No try/catch: a failure has to reach ConfirmDialog, which keeps itself open
+  // and shows the message.
   const handleDelete = async () => {
-    setDeleting(true);
-    try {
-      await deleteGoal(goal.id);
-      onDeleted(goal.id);
-    } catch {
-      setDeleting(false);
-      setConfirmDelete(false);
-    }
+    await deleteGoal(goal.id);
+    onDeleted(goal.id);
   };
 
   if (mode === 'edit') {
@@ -119,35 +115,27 @@ export default function GoalPanel({ goal, models, onClose, onUpdated, onDeleted 
           >
             Edit
           </button>
-          {!confirmDelete ? (
-            <button
-              onClick={() => setConfirmDelete(true)}
-              className="px-2.5 py-1 text-xs font-medium text-red-400 bg-red-400/10 border border-red-400/20
-                         rounded-lg hover:bg-red-400/20 transition-colors"
-            >
-              Delete
-            </button>
-          ) : (
-            <div className="flex items-center gap-1.5">
-              <span className="text-xs text-slate-400">Delete?</span>
-              <button
-                onClick={handleDelete}
-                disabled={deleting}
-                className="px-2.5 py-1 text-xs font-medium text-white bg-red-600 rounded-lg
-                           hover:bg-red-500 disabled:opacity-50 flex items-center gap-1"
-              >
-                {deleting && <span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
-                Yes
-              </button>
-              <button
-                onClick={() => setConfirmDelete(false)}
-                className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200 transition-colors"
-              >
-                No
-              </button>
-            </div>
-          )}
+          <button
+            onClick={() => setConfirmDelete(true)}
+            className="px-2.5 py-1 text-xs font-medium text-red-400 bg-red-400/10 border border-red-400/20
+                       rounded-lg hover:bg-red-400/20 transition-colors"
+          >
+            Delete
+          </button>
         </div>
+
+        <ConfirmDialog
+          open={confirmDelete}
+          title="Delete session"
+          message={
+            <>
+              Delete the <span className="text-slate-100 font-medium">{goal.model_name}</span> session?
+            </>
+          }
+          detail={<span className="line-clamp-3">{goal.goal}</span>}
+          onConfirm={handleDelete}
+          onClose={() => setConfirmDelete(false)}
+        />
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto flex flex-col gap-5 p-5">

@@ -1,8 +1,23 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
+import axios from 'axios';
 import { getModels, createModel, deleteModel } from '../api';
 import type { Model } from '../types';
 import AppNav from '../components/AppNav';
+import ConfirmDialog from '../components/ConfirmDialog';
+
+// The API answers a rejected write with a `detail` string worth showing verbatim.
+// Anything else falls back to the caller's message. Mirrors TrackersPage.
+function errorDetail(e: unknown, fallback: string): string {
+  if (axios.isAxiosError(e)) {
+    const data: unknown = e.response?.data;
+    if (data && typeof data === 'object' && 'detail' in data) {
+      const detail = (data as { detail: unknown }).detail;
+      if (typeof detail === 'string' && detail.trim()) return detail;
+    }
+  }
+  return fallback;
+}
 
 export default function ModelsPage() {
   const [models, setModels] = useState<Model[]>([]);
@@ -11,8 +26,8 @@ export default function ModelsPage() {
   const [newName, setNewName] = useState('');
   const [adding, setAdding] = useState(false);
   const [addError, setAddError] = useState('');
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  // The whole model, not just its id, so the dialog can name what it deletes.
+  const [confirmModel, setConfirmModel] = useState<Model | null>(null);
 
   const fetchModels = useCallback(async () => {
     setLoading(true);
@@ -51,17 +66,15 @@ export default function ModelsPage() {
     }
   };
 
+  // Throws on failure so ConfirmDialog can keep itself open and show why; the
+  // old version swallowed the error and looked exactly like a success.
   const handleDelete = async (id: string) => {
-    setDeletingId(id);
     try {
       await deleteModel(id);
-      setModels((prev) => prev.filter((m) => m.id !== id));
-      setConfirmDeleteId(null);
-    } catch {
-      // Silently reset on error
-    } finally {
-      setDeletingId(null);
+    } catch (e) {
+      throw new Error(errorDetail(e, 'Failed to delete model. Please try again.'));
     }
+    setModels((prev) => prev.filter((m) => m.id !== id));
   };
 
   return (
@@ -174,50 +187,26 @@ export default function ModelsPage() {
                       <span className="text-sm text-slate-100 font-medium">{model.name}</span>
 
                       <div className="flex items-center gap-2">
-                        {confirmDeleteId === model.id ? (
-                          <>
-                            <span className="text-xs text-slate-400">Delete?</span>
-                            <button
-                              onClick={() => handleDelete(model.id)}
-                              disabled={deletingId === model.id}
-                              className="px-2.5 py-1 text-xs font-medium text-white bg-red-600 rounded-lg
-                                         hover:bg-red-500 transition-colors disabled:opacity-50
-                                         flex items-center gap-1"
-                            >
-                              {deletingId === model.id && (
-                                <span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                              )}
-                              Yes
-                            </button>
-                            <button
-                              onClick={() => setConfirmDeleteId(null)}
-                              className="px-2.5 py-1 text-xs text-slate-400 hover:text-slate-200 transition-colors"
-                            >
-                              No
-                            </button>
-                          </>
-                        ) : (
-                          <button
-                            onClick={() => setConfirmDeleteId(model.id)}
-                            className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-400/10
-                                       rounded-lg transition-colors"
-                            title="Delete model"
+                        <button
+                          onClick={() => setConfirmModel(model)}
+                          className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-400/10
+                                     rounded-lg transition-colors"
+                          title="Delete model"
+                        >
+                          <svg
+                            className="w-4 h-4"
+                            fill="none"
+                            viewBox="0 0 24 24"
+                            stroke="currentColor"
+                            strokeWidth={2}
                           >
-                            <svg
-                              className="w-4 h-4"
-                              fill="none"
-                              viewBox="0 0 24 24"
-                              stroke="currentColor"
-                              strokeWidth={2}
-                            >
-                              <path
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
-                              />
-                            </svg>
-                          </button>
-                        )}
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                            />
+                          </svg>
+                        </button>
                       </div>
                     </li>
                   ))}
@@ -227,6 +216,20 @@ export default function ModelsPage() {
           </div>
         </div>
       </main>
+
+      {/* One dialog for the whole list — the target is held in state, not per row. */}
+      <ConfirmDialog
+        open={confirmModel !== null}
+        title="Delete model"
+        message={
+          <>
+            Delete <span className="text-slate-100 font-medium">{confirmModel?.name}</span>?
+          </>
+        }
+        detail="Sessions already recorded against this model keep their stored model name."
+        onConfirm={() => handleDelete(confirmModel!.id)}
+        onClose={() => setConfirmModel(null)}
+      />
     </div>
   );
 }

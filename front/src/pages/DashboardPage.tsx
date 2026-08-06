@@ -3,6 +3,7 @@ import { useAuth } from '../auth';
 import { getGoals, getModels, getTasks, createGoal } from '../api';
 import type { Goal, Model, Task } from '../types';
 import AppNav from '../components/AppNav';
+import Modal from '../components/Modal';
 import GoalCard from '../components/GoalCard';
 import GoalPanel from '../components/GoalPanel';
 import GoalForm from '../components/GoalForm';
@@ -273,34 +274,25 @@ export default function DashboardPage() {
       </div>
 
       {/* ── Create Modal ── */}
+      {/* No `footer`: GoalForm renders its own Cancel/Create buttons. The body
+          classes are overridden to keep this page's thin scrollbar and to drop
+          the default flex column and gap, which would change the form's
+          internal spacing. */}
       {modal.kind === 'create' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
-          <div
-            className="relative w-full max-w-2xl max-h-[90vh] bg-slate-900 border border-slate-800
-                       rounded-2xl shadow-2xl flex flex-col overflow-hidden"
-          >
-            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800 shrink-0">
-              <h2 className="text-base font-semibold text-slate-100">New Session</h2>
-              <button
-                onClick={() => setModal({ kind: 'none' })}
-                className="p-1.5 text-slate-400 hover:text-slate-100 hover:bg-slate-800 rounded-lg transition-colors"
-              >
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto scrollbar-thin p-6">
-              <GoalForm
-                models={models}
-                tasks={tasks}
-                onSubmit={handleCreate}
-                onCancel={() => setModal({ kind: 'none' })}
-                submitLabel="Create Session"
-              />
-            </div>
-          </div>
-        </div>
+        <Modal
+          title="New Session"
+          onClose={() => setModal({ kind: 'none' })}
+          size="md"
+          bodyClassName="p-6 scrollbar-thin"
+        >
+          <GoalForm
+            models={models}
+            tasks={tasks}
+            onSubmit={handleCreate}
+            onCancel={() => setModal({ kind: 'none' })}
+            submitLabel="Create Session"
+          />
+        </Modal>
       )}
     </div>
   );

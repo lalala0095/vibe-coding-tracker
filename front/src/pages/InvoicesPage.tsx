@@ -14,6 +14,7 @@ import InvoiceBuilder, {
   InvoiceMetaFields, metaFromInvoice, clearable, CLEAR, type InvoiceMeta,
 } from '../components/InvoiceBuilder';
 import RegenerateModal from '../components/RegenerateModal';
+import ConfirmDialog from '../components/ConfirmDialog';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -70,7 +71,10 @@ export default function InvoicesPage() {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [busyStatus, setBusyStatus] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  // The invoice the delete dialog is asking about. Held as the invoice rather
+  // than a flag so the dialog keeps naming it while `selected` is cleared out
+  // from under it on success.
+  const [deleteTarget, setDeleteTarget] = useState<Invoice | null>(null);
   const [showRegenerate, setShowRegenerate] = useState(false);
   // A period a regenerate settled on, held until the next save. The lines and
   // the printed period have to move together, so this rides along with `lines`
@@ -120,7 +124,6 @@ export default function InvoicesPage() {
       setLines([]); setMeta(null); setDirty(false); setPendingPeriod(null); return;
     }
     loadEditor(selected);
-    setConfirmDelete(false);
     setShowRegenerate(false);
     setDetailError('');
   }, [selectedId]);
@@ -190,17 +193,18 @@ export default function InvoicesPage() {
     }
   };
 
-  const handleDelete = async () => {
-    if (!selected) return;
+  // Failure is reported by throwing: the dialog stays open and shows the
+  // message, so this path no longer writes to the detail banner — which the
+  // successful path would have unmounted anyway.
+  const handleDelete = async (invoice: Invoice) => {
     setDetailError('');
     try {
-      await deleteInvoice(selected.id);
-      setInvoices((prev) => prev.filter((i) => i.id !== selected.id));
-      setSelected(null);
+      await deleteInvoice(invoice.id);
     } catch {
-      setDetailError('Failed to delete the invoice.');
-      setConfirmDelete(false);
+      throw new Error('Failed to delete the invoice. It is still here — try again.');
     }
+    setInvoices((prev) => prev.filter((i) => i.id !== invoice.id));
+    setSelected(null);
   };
 
   const filtered = invoices.filter((i) => filter === 'all' || i.status === filter);
@@ -343,30 +347,12 @@ export default function InvoicesPage() {
                     >
                       Print
                     </Link>
-                    {!confirmDelete ? (
-                      <button
-                        onClick={() => setConfirmDelete(true)}
-                        className="px-2.5 py-1 text-xs rounded-lg bg-slate-800 border border-slate-700 text-red-400 hover:text-red-300 transition-colors"
-                      >
-                        Delete
-                      </button>
-                    ) : (
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-xs text-slate-400">Delete?</span>
-                        <button
-                          onClick={handleDelete}
-                          className="px-2.5 py-1 text-xs rounded-lg bg-red-600 hover:bg-red-500 text-white font-medium transition-colors"
-                        >
-                          Yes
-                        </button>
-                        <button
-                          onClick={() => setConfirmDelete(false)}
-                          className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200 transition-colors"
-                        >
-                          No
-                        </button>
-                      </div>
-                    )}
+                    <button
+                      onClick={() => setDeleteTarget(selected)}
+                      className="px-2.5 py-1 text-xs rounded-lg bg-slate-800 border border-slate-700 text-red-400 hover:text-red-300 transition-colors"
+                    >
+                      Delete
+                    </button>
                   </div>
                 </div>
 
@@ -479,6 +465,26 @@ export default function InvoicesPage() {
             setDirty(true);   // nothing is written until the user saves
           }}
           onClose={() => setShowRegenerate(false)}
+        />
+      )}
+
+      {/* Rendered at page level, not inside the detail pane, so a successful
+          delete clearing `selected` does not unmount the dialog mid-close. */}
+      {deleteTarget && (
+        <ConfirmDialog
+          open
+          title="Delete invoice"
+          message={
+            <>
+              Delete invoice{' '}
+              <span className="text-slate-100 font-medium">{deleteTarget.invoice_number}</span>?
+            </>
+          }
+          // The server unlinks what this invoice claimed (_sync_session_links /
+          // _sync_tracker_links), which the UI has never said out loud.
+          detail="The time entries and trackers it billed are released and become billable again. The invoice itself cannot be recovered."
+          onConfirm={() => handleDelete(deleteTarget)}
+          onClose={() => setDeleteTarget(null)}
         />
       )}
     </div>
