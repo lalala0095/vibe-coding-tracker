@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from auth import get_current_user
 from routers.sessions import SessionResponse, _doc_to_session
+from routers.tasks import _fetch_project
 from services.firestore_service import get_firestore_client
 
 router = APIRouter(prefix="/trackers", tags=["trackers"])
@@ -14,6 +15,11 @@ router = APIRouter(prefix="/trackers", tags=["trackers"])
 SGT = pytz.timezone("Asia/Singapore")
 
 VALID_SPLITS = ("even", "full")
+
+# The values the tasks router accepts, mirrored here so a task created
+# alongside a tracker is indistinguishable from one created any other way.
+VALID_TASK_STATUSES = ("todo", "in_progress", "done")
+VALID_TASK_PRIORITIES = ("low", "medium", "high", "urgent")
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas
@@ -27,12 +33,27 @@ class TaskRef(BaseModel):
     client_name: str
 
 
+class NewTrackerTask(BaseModel):
+    """
+    A task to create alongside the tracker, in the same request.
+
+    A tracker on its own carries no billable time and no project; giving it a
+    task is what makes its hours reachable from an invoice.
+    """
+
+    project_id: str  # required — a task cannot exist without one
+    title: Optional[str] = None  # defaults to the tracker's title
+    status: str = "in_progress"
+    priority: str = "medium"
+
+
 class TrackerCreate(BaseModel):
     title: str
     start_time: str  # ISO-8601 datetime string
     end_time: Optional[str] = None
     notes: Optional[str] = None
     task_ids: list[str] = []
+    new_task: Optional[NewTrackerTask] = None
 
 
 class TrackerUpdate(BaseModel):
@@ -168,6 +189,32 @@ def _validate_split(value: str) -> str:
     return value
 
 
+def _validate_task_status(value: str) -> str:
+    """
+    Check a task status against the set the tasks router documents.
+
+    Case-sensitive on purpose: ``"In_Progress"`` is stored verbatim by the
+    tasks router and would then never match the tasks list's status filter, so
+    it is refused here rather than written and lost.
+    """
+    if value not in VALID_TASK_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Status must be one of: {', '.join(VALID_TASK_STATUSES)}.",
+        )
+    return value
+
+
+def _validate_task_priority(value: str) -> str:
+    """Check a task priority against the set the tasks router documents."""
+    if value not in VALID_TASK_PRIORITIES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Priority must be one of: {', '.join(VALID_TASK_PRIORITIES)}.",
+        )
+    return value
+
+
 def _existing_tracker_task_ids(db, tracker_id: str) -> set:
     """
     Return the task ids that already have a time entry for this tracker.
@@ -277,10 +324,27 @@ async def create_tracker(
     """
     Create a new tracker.
 
-    Optionally supply ``task_ids`` to link tasks immediately; their titles and
-    project/client names are denormalised automatically.
+    - ``task_ids``  – (optional) link existing tasks immediately; their titles
+      and project/client names are denormalised automatically.
+    - ``new_task``  – (optional) create a task for this tracker in the same
+      request and link it ahead of ``task_ids``.  Requires ``project_id``;
+      ``title`` defaults to the tracker's title and the tracker's ``notes``
+      become the task's description.  ``status`` (``todo`` | ``in_progress`` |
+      ``done``, default ``in_progress``) and ``priority`` (``low`` | ``medium``
+      | ``high`` | ``urgent``, default ``medium``) are case-sensitive.
+
+    A tracker on its own carries no billable time; giving it a task is what
+    makes its hours reachable from an invoice.
     """
     db = get_firestore_client()
+
+    # Validate everything before writing anything, so a bad request cannot
+    # leave a half-created task/tracker pair behind.
+    new_task_project: Optional[dict] = None
+    if payload.new_task is not None:
+        new_task_project = _fetch_project(db, payload.new_task.project_id)
+        _validate_task_status(payload.new_task.status)
+        _validate_task_priority(payload.new_task.priority)
 
     task_refs: list[dict] = []
     seen_ids: set[str] = set()
@@ -291,20 +355,61 @@ async def create_tracker(
         seen_ids.add(task_id)
 
     now = _now_sgt()
-    _, doc_ref = db.collection("trackers").add(
-        {
-            "title": payload.title,
-            "start_time": payload.start_time,
-            "end_time": payload.end_time,
-            "notes": payload.notes,
-            "tasks": task_refs,
-            "invoice_ids": [],
-            "invoice_numbers": [],
-            "datetime_inserted": now,
-            "datetime_updated": now,
-        }
-    )
-    doc = doc_ref.get()
+
+    new_task_ref = None
+    if payload.new_task is not None and new_task_project is not None:
+        new_task_ref = db.collection("tasks").document()
+        new_task_title = (payload.new_task.title or "").strip() or payload.title
+        new_task_ref.set(
+            {
+                "title": new_task_title,
+                "description": payload.notes or "",
+                "project_id": payload.new_task.project_id,
+                "project_name": new_task_project["project_name"],
+                "client_id": new_task_project["client_id"],
+                "client_name": new_task_project["client_name"],
+                "parent_task_id": None,
+                "status": payload.new_task.status,
+                "priority": payload.new_task.priority,
+                "due_date": None,
+                "attachments": [],
+                "datetime_inserted": now,
+                "datetime_updated": now,
+            }
+        )
+        # Prepend, and drop any ref ``task_ids`` already produced for the same
+        # id, so passing both cannot yield two refs to one task.
+        task_refs = [
+            {
+                "task_id": new_task_ref.id,
+                "task_title": new_task_title,
+                "project_name": new_task_project["project_name"],
+                "client_name": new_task_project["client_name"],
+            }
+        ] + [t for t in task_refs if t["task_id"] != new_task_ref.id]
+
+    try:
+        _, doc_ref = db.collection("trackers").add(
+            {
+                "title": payload.title,
+                "start_time": payload.start_time,
+                "end_time": payload.end_time,
+                "notes": payload.notes,
+                "tasks": task_refs,
+                "invoice_ids": [],
+                "invoice_numbers": [],
+                "datetime_inserted": now,
+                "datetime_updated": now,
+            }
+        )
+        doc = doc_ref.get()
+    except Exception:
+        # Compensation: the task is written first, so a tracker that fails to
+        # create would otherwise leave an orphan task the user never asked for.
+        if new_task_ref is not None:
+            new_task_ref.delete()
+        raise
+
     return _doc_to_tracker(doc)
 
 
