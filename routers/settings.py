@@ -1,4 +1,5 @@
 import math
+import re
 from datetime import datetime
 from typing import Annotated, Optional
 
@@ -48,6 +49,36 @@ VALID_ROUNDING_DIRECTIONS = ("nearest", "up", "down")
 # An increment longer than a day is a typo, not a billing policy.
 MAX_ROUNDING_INCREMENT = 24.0
 
+# The singleton document holding tracker defaults.
+TRACKER_SETTINGS_DOC_ID = "tracker"
+
+DEFAULT_TRACKER_SETTINGS: dict = {
+    "auto_name_enabled": True,
+    "auto_name_template": "{date} tasks",
+}
+
+# The token names a tracker-name template may use.
+#
+# Mirrored in `front/src/lib/trackerName.ts` (`TRACKER_NAME_TOKENS`), which owns
+# the rendering.  The two lists MUST stay in step: a token added here and not
+# there renders as its own literal braces in the tracker's title, and one added
+# there and not here is refused on save.
+VALID_NAME_TOKENS = (
+    "date",
+    "date_short",
+    "day",
+    "month",
+    "month_name",
+    "month_short",
+    "year",
+    "weekday",
+    "weekday_short",
+    "time",
+)
+
+# A title longer than this is a paste accident, not a naming scheme.
+MAX_NAME_TEMPLATE_LENGTH = 200
+
 # ---------------------------------------------------------------------------
 # Pydantic schemas
 # ---------------------------------------------------------------------------
@@ -87,6 +118,18 @@ class InvoiceSettingsResponse(BaseModel):
     reset_sequence_yearly: bool
     hours_rounding_increment: float
     hours_rounding_direction: str
+    datetime_inserted: str
+    datetime_updated: str
+
+
+class TrackerSettingsUpdate(BaseModel):
+    auto_name_enabled: Optional[bool] = None
+    auto_name_template: Optional[str] = None
+
+
+class TrackerSettingsResponse(BaseModel):
+    auto_name_enabled: bool
+    auto_name_template: str
     datetime_inserted: str
     datetime_updated: str
 
@@ -214,6 +257,113 @@ def get_invoice_settings(db) -> dict:
     return data
 
 
+def _data_to_tracker_settings(data: dict) -> TrackerSettingsResponse:
+    return TrackerSettingsResponse(
+        # Both keys fall back to the default rather than 500ing the read, so a
+        # settings document written before tracker naming existed still loads.
+        auto_name_enabled=data.get(
+            "auto_name_enabled", DEFAULT_TRACKER_SETTINGS["auto_name_enabled"]
+        ),
+        auto_name_template=data.get(
+            "auto_name_template", DEFAULT_TRACKER_SETTINGS["auto_name_template"]
+        ),
+        datetime_inserted=data.get("datetime_inserted", ""),
+        datetime_updated=data.get("datetime_updated", ""),
+    )
+
+
+def _validate_name_template(value: str) -> str:
+    """
+    Check a tracker-name template and return it unchanged.
+
+    Every ``{token}`` must name something the frontend can render.  A typo like
+    ``{dat}`` would otherwise be stored happily and then print itself literally
+    in the tracker's title, which reads as the app being broken rather than as a
+    typo — so it is refused at the point it is typed, naming both the offending
+    token and the valid set.
+
+    An empty or whitespace-only template is legal: it means the same thing as
+    auto-naming being switched off, and refusing it would stop someone clearing
+    the field.  The value is returned exactly as typed rather than stripped,
+    because the frontend trims when it renders.
+
+    Note there is no ``"null"`` sentinel here.  ``auto_name_template`` is a plain
+    string that is cleared by sending ``""``, so a user who genuinely wants the
+    word "null" in their tracker titles can have it.
+    """
+    if len(value) > MAX_NAME_TEMPLATE_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Tracker name template must be "
+                f"{MAX_NAME_TEMPLATE_LENGTH} characters or fewer."
+            ),
+        )
+
+    unknown = [
+        name
+        for name in re.findall(r"\{([a-z_]+)\}", value)
+        if name not in VALID_NAME_TOKENS
+    ]
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unknown tracker name token(s): {', '.join(unknown)}. "
+                f"Valid tokens are: {', '.join(VALID_NAME_TOKENS)}."
+            ),
+        )
+
+    # The pattern above is lowercase-only, matching the frontend's, so `{DATE}`
+    # matches nothing and would sail through to print as literal braces — the
+    # exact failure this validator exists to stop.  Caught here, but only when
+    # the braces hold a real token in the wrong case, so an unrelated `{FOO}`
+    # someone wants in their titles is still left alone.
+    miscased = [
+        name
+        for name in re.findall(r"\{([A-Za-z_]+)\}", value)
+        if name not in VALID_NAME_TOKENS and name.lower() in VALID_NAME_TOKENS
+    ]
+    if miscased:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Tracker name token(s) must be lowercase: {', '.join(miscased)} "
+                f"should be {', '.join('{' + n.lower() + '}' for n in miscased)}."
+            ),
+        )
+
+    return value
+
+
+def get_tracker_settings(db) -> dict:
+    """
+    Return the tracker settings document, creating it with defaults if absent.
+
+    Mirrors :func:`get_invoice_settings` so callers that need the naming
+    defaults can read them without going through the HTTP layer.
+
+    Args:
+        db: Firestore client.
+
+    Returns:
+        The raw settings dict.
+    """
+    doc_ref = db.collection("settings").document(TRACKER_SETTINGS_DOC_ID)
+    doc = doc_ref.get()
+    if doc.exists:
+        return doc.to_dict() or {}
+
+    now = _now_sgt()
+    data = {
+        **DEFAULT_TRACKER_SETTINGS,
+        "datetime_inserted": now,
+        "datetime_updated": now,
+    }
+    doc_ref.set(data)
+    return data
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -302,3 +452,56 @@ async def update_settings(
 
     updated_doc = doc_ref.get()
     return _data_to_settings(updated_doc.to_dict() or {})
+
+
+@router.get("/tracker", response_model=TrackerSettingsResponse)
+async def get_tracker_settings_endpoint(
+    _user: Annotated[dict, Depends(get_current_user)],
+) -> TrackerSettingsResponse:
+    """
+    Return the tracker settings singleton.
+
+    The document is created with defaults on first read, so this never 404s.
+    """
+    db = get_firestore_client()
+    return _data_to_tracker_settings(get_tracker_settings(db))
+
+
+@router.put("/tracker", response_model=TrackerSettingsResponse)
+async def update_tracker_settings(
+    payload: TrackerSettingsUpdate,
+    _user: Annotated[dict, Depends(get_current_user)],
+) -> TrackerSettingsResponse:
+    """
+    Update the tracker settings singleton.
+
+    - Creates the document with defaults first if it does not exist yet.
+    - Only fields present in the payload are updated.
+
+    This changes nothing but what a NEW tracker's title arrives pre-filled with.
+    It never renames a tracker that already exists, and the pre-filled title is
+    an ordinary editable field: the template is a starting point the owner types
+    over, never a name they are held to.
+    """
+    # Validated before the document is read or created, so a bad template 400s
+    # without writing anything.
+    if payload.auto_name_template is not None:
+        _validate_name_template(payload.auto_name_template)
+
+    db = get_firestore_client()
+    doc_ref = db.collection("settings").document(TRACKER_SETTINGS_DOC_ID)
+    get_tracker_settings(db)  # Ensure the document exists before updating.
+
+    updates: dict = {}
+
+    for field in ("auto_name_enabled", "auto_name_template"):
+        value = getattr(payload, field)
+        if value is not None:
+            updates[field] = value
+
+    if updates:
+        updates["datetime_updated"] = _now_sgt()
+        doc_ref.update(updates)
+
+    updated_doc = doc_ref.get()
+    return _data_to_tracker_settings(updated_doc.to_dict() or {})
