@@ -131,6 +131,25 @@ export interface NewTrackerTask {
   priority?: TaskPriority;         // defaults to "medium"
 }
 
+// Settings for how a new tracker names itself. A second singleton alongside the
+// invoice one, on its own document — tracker naming has nothing to do with
+// issuing an invoice, and putting it in the invoice document would make the
+// invoice settings form responsible for a field it never shows.
+export interface TrackerSettings {
+  // Whether the tracker form pre-fills its title at all. Off leaves the field
+  // blank, exactly as before this existed.
+  auto_name_enabled: boolean;
+  // Text with {token} placeholders — see front/src/lib/trackerName.ts for the
+  // list. "{date} tasks" renders as "2026-08-07 tasks".
+  auto_name_template: string;
+  datetime_inserted: string;
+  datetime_updated: string;
+}
+
+// Timestamps are server-owned — never sent back on update.
+export interface UpdateTrackerSettingsPayload
+  extends Partial<Omit<TrackerSettings, 'datetime_inserted' | 'datetime_updated'>> {}
+
 export interface CreateTrackerPayload {
   title: string;
   start_time: string;

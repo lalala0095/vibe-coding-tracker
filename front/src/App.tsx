@@ -7,6 +7,7 @@ import ModelsPage from './pages/ModelsPage';
 import TasksPage from './pages/TasksPage';
 import ClientsProjectsPage from './pages/ClientsProjectsPage';
 import TrackersPage from './pages/TrackersPage';
+import TrackerSettingsPage from './pages/TrackerSettingsPage';
 import TimeEntriesPage from './pages/TimeEntriesPage';
 import InvoicesPage from './pages/InvoicesPage';
 import InvoiceSettingsPage from './pages/InvoiceSettingsPage';
@@ -68,6 +69,14 @@ function AppRoutes() {
           element={
             <ProtectedRoute>
               <TrackersPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/trackers/settings"
+          element={
+            <ProtectedRoute>
+              <TrackerSettingsPage />
             </ProtectedRoute>
           }
         />
