@@ -9,10 +9,12 @@ import {
   getTrackers, createTracker, updateTracker, deleteTracker,
   addTasksToTracker, removeTaskFromTracker, billTracker,
   getTasks, getClients, getProjects, createTasksBulk, getSessions,
+  getTrackerSettings,
 } from '../api';
 import { parseTaskList } from '../lib/taskPaste';
+import { renderTrackerName } from '../lib/trackerName';
 import type {
-  Tracker, Task, Client, Project,
+  Tracker, Task, Client, Project, TrackerSettings,
   CreateTrackerPayload, UpdateTrackerPayload,
   TrackerTaskRef, TaskStatus, TaskPriority,
 } from '../types';
@@ -66,6 +68,24 @@ function errorDetail(e: unknown, fallback: string): string {
   return fallback;
 }
 
+// The moment a new tracker's name is rendered for: its own start time, so a
+// backdated tracker is named for its own day rather than for today. A
+// datetime-local value is read as local time, which is what the tokens want.
+// An empty or half-typed field parses to Invalid Date and falls back to now.
+function nameMoment(localStartTime: string): Date {
+  const at = new Date(localStartTime);
+  return Number.isNaN(at.getTime()) ? new Date() : at;
+}
+
+// What the stored template renders to, or '' when there is nothing to pre-fill
+// with — settings that never loaded, auto-naming switched off, or a blank
+// template. A pre-fill only; the field is the user's from that moment on.
+function autoTrackerName(settings: TrackerSettings | null, localStartTime: string): string {
+  if (!settings?.auto_name_enabled) return '';
+  if (!settings.auto_name_template.trim()) return '';
+  return renderTrackerName(settings.auto_name_template, nameMoment(localStartTime));
+}
+
 // A tracker's own span, in hours to 2dp. Null while it is still running — the
 // server then requires the hours to be supplied by hand.
 function elapsedHours(tracker: Tracker): number | null {
@@ -101,15 +121,25 @@ interface TrackerFormProps {
   initial?: Tracker;
   // Only used on the create path, to pick the project the new task belongs to.
   projects?: Project[];
+  // Best-effort: null when the settings never loaded, which costs the pre-filled
+  // name and nothing else. Ignored when editing — a saved title is never touched.
+  settings?: TrackerSettings | null;
   onSave: (payload: CreateTrackerPayload) => Promise<void>;
   onClose: () => void;
 }
 
-function TrackerForm({ initial, projects = [], onSave, onClose }: TrackerFormProps) {
-  const [title, setTitle] = useState(initial?.title ?? '');
-  const [startTime, setStartTime] = useState(
-    initial ? toLocalInputValue(initial.start_time) : nowLocalInputValue()
+function TrackerForm({ initial, projects = [], settings = null, onSave, onClose }: TrackerFormProps) {
+  const initialStartTime = initial ? toLocalInputValue(initial.start_time) : nowLocalInputValue();
+  // Rendered once, at mount. There is deliberately no effect tying the name to
+  // the start time: re-rendering it when the start time changes would rewrite a
+  // title the user had already typed (§ no locking).
+  const [title, setTitle] = useState(() =>
+    initial ? initial.title : autoTrackerName(settings, initialStartTime)
   );
+  // Whether the title is the user's now. Only ever set, never cleared, so no
+  // later code path can decide the field is fair game again.
+  const [titleEdited, setTitleEdited] = useState(false);
+  const [startTime, setStartTime] = useState(initialStartTime);
   const [endTime, setEndTime] = useState(toLocalInputValue(initial?.end_time ?? null));
   const [notes, setNotes] = useState(initial?.notes ?? '');
   const [saving, setSaving] = useState(false);
@@ -121,6 +151,12 @@ function TrackerForm({ initial, projects = [], onSave, onClose }: TrackerFormPro
   const isCreate = !initial;
   const [createTask, setCreateTask] = useState(false);
   const [taskProjectId, setTaskProjectId] = useState('');
+  // Deliberately left empty when the tracker title was auto-named. "2026-08-07
+  // tasks" is a reasonable name for a day's tracker and a poor name for a task,
+  // and an omitted task title already makes the server fall back to the tracker
+  // title — so a blank field here produces the better default, not a missing
+  // one. The placeholder below shows what it will become. The mirror is not
+  // seeded on purpose; it still fires normally the moment the title is typed.
   const [taskTitle, setTaskTitle] = useState(initial?.title ?? '');
   // The task title trails the tracker title only until the user makes it their
   // own — after that, typing in the tracker title must not overwrite it.
@@ -140,8 +176,22 @@ function TrackerForm({ initial, projects = [], onSave, onClose }: TrackerFormPro
     []
   );
 
+  // The settings request can land after the modal is already open, so the name
+  // is filled in then too — but only into a field that is still untouched and
+  // still empty. Anything typed, and anything already rendered, is left exactly
+  // as it is. The dependency list is deliberately just `settings`: the arrival
+  // is the only event that may fill the field, and neither the start time nor
+  // the title itself may re-trigger it.
+  useEffect(() => {
+    if (initial || titleEdited || title) return;
+    const auto = autoTrackerName(settings, startTime);
+    if (auto) setTitle(auto);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings]);
+
   function handleTitleChange(value: string) {
     setTitle(value);
+    setTitleEdited(true);
     if (!taskTitleEdited) setTaskTitle(value);
   }
 
@@ -1132,6 +1182,7 @@ export default function TrackersPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [trackerSettings, setTrackerSettings] = useState<TrackerSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -1159,6 +1210,13 @@ export default function TrackersPage() {
       setTasks(tasksData);
       setClients(clientsData);
       setProjects(projectsData);
+      // Kept out of the Promise.all: the naming template is a convenience, and
+      // losing it must not cost the page its trackers or block creating one.
+      try {
+        setTrackerSettings(await getTrackerSettings());
+      } catch {
+        setTrackerSettings(null);   // no pre-filled name, no error shown
+      }
     } catch {
       setError('Failed to load data.');
     } finally {
@@ -1253,12 +1311,20 @@ export default function TrackersPage() {
         {/* Top bar */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800">
           <span className="text-sm font-semibold text-white">Trackers</span>
-          <button
-            onClick={() => setModal({ kind: 'create_tracker' })}
-            className="px-3 py-1.5 text-xs rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors"
-          >
-            + New
-          </button>
+          <div className="flex items-center gap-2">
+            <Link
+              to="/trackers/settings"
+              className="px-2.5 py-1.5 text-xs rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800 transition-colors"
+            >
+              Settings
+            </Link>
+            <button
+              onClick={() => setModal({ kind: 'create_tracker' })}
+              className="px-3 py-1.5 text-xs rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors"
+            >
+              + New
+            </button>
+          </div>
         </div>
 
         {/* Filters */}
@@ -1351,6 +1417,7 @@ export default function TrackersPage() {
       {modal.kind === 'create_tracker' && (
         <TrackerForm
           projects={projects}
+          settings={trackerSettings}
           onSave={handleCreateTracker}
           onClose={() => setModal({ kind: 'none' })}
         />

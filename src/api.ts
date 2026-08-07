@@ -8,6 +8,7 @@ import type {
   Invoice, InvoiceStatus, InvoicePreviewRequest, InvoicePreviewResponse,
   CreateInvoicePayload, UpdateInvoicePayload,
   InvoiceSettings, UpdateInvoiceSettingsPayload,
+  TrackerSettings, UpdateTrackerSettingsPayload,
 } from './types';
 
 const apiClient = axios.create({
@@ -353,5 +354,19 @@ export async function updateInvoiceSettings(
   payload: UpdateInvoiceSettingsPayload
 ): Promise<InvoiceSettings> {
   const res = await apiClient.put<InvoiceSettings>('/settings/invoice', payload);
+  return res.data;
+}
+
+// ── Tracker settings ──────────────────────────────────────────────────────────
+
+export async function getTrackerSettings(): Promise<TrackerSettings> {
+  const res = await apiClient.get<TrackerSettings>('/settings/tracker');
+  return res.data;
+}
+
+export async function updateTrackerSettings(
+  payload: UpdateTrackerSettingsPayload
+): Promise<TrackerSettings> {
+  const res = await apiClient.put<TrackerSettings>('/settings/tracker', payload);
   return res.data;
 }
