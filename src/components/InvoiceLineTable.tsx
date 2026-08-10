@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { InvoiceLine, HoursRoundingDirection } from '../types';
 import { computeMoney, formatMoney, type DiscountType } from '../lib/money';
+import { moveLine, moveSubItem, moveSubItemToLine, moveItem } from '../lib/reorder';
 import RoundHoursModal from './RoundHoursModal';
 
 interface Props {
@@ -39,6 +40,37 @@ const CELL_INPUT =
 const SUB_INPUT =
   'flex-1 min-w-0 bg-slate-800 border border-slate-700 text-slate-300 rounded px-1.5 py-0.5 text-xs ' +
   'placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-transparent';
+
+// ── Drag and drop ─────────────────────────────────────────────────────────────
+// Two kinds of drag share one table, so every handler is guarded by `kind`
+// rather than by which element it fired on: a line dropped on a bullet means
+// "put the line here", not "put the line inside that bullet".
+//
+// The payload also rides in `dataTransfer` (below), but React state is what the
+// highlight reads — `dataTransfer.getData` is deliberately unreadable during
+// dragover, so there is no way to know from the event alone what is in flight.
+type DragSource =
+  | { kind: 'line'; lineId: string }
+  | { kind: 'sub'; lineId: string; index: number };
+
+// What the pointer is currently over. Never derived from the source: a drag
+// that is cancelled (Escape) fires `dragend` with no `drop`, so both pieces of
+// state are cleared in both places.
+type DropTarget =
+  | { kind: 'line'; lineId: string }
+  | { kind: 'sub'; lineId: string; index: number };
+
+const MIME = 'application/json';
+
+const HANDLE =
+  'cursor-grab active:cursor-grabbing text-slate-600 hover:text-violet-400 transition-colors ' +
+  'focus:outline-none focus:ring-1 focus:ring-violet-500 rounded select-none leading-none';
+
+function sameTarget(a: DropTarget | null, b: DropTarget | null): boolean {
+  if (a === null || b === null) return a === b;
+  if (a.kind !== b.kind || a.lineId !== b.lineId) return false;
+  return a.kind === 'sub' && b.kind === 'sub' ? a.index === b.index : true;
+}
 
 function todaySGT(): string {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Singapore' });
@@ -138,12 +170,149 @@ export default function InvoiceLineTable({
     });
   };
 
+  // ── Drag and drop ───────────────────────────────────────────────────────────
+  // Reordering only ever reorders. Every path below hands `lib/reorder` the
+  // whole array and passes the result straight out through `onChange`, so no
+  // handler here is in a position to touch `hours`, `rate` or `amount` (§5).
+
+  const [dragging, setDragging] = useState<DragSource | null>(null);
+  const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
+
+  const clearDrag = () => {
+    setDragging(null);
+    setDropTarget(null);
+  };
+
+  // `lib/reorder` returns the same array by identity when a drop changes
+  // nothing, so an identity check is enough to keep a no-op drop from marking
+  // the invoice dirty.
+  const commit = (next: InvoiceLine[]) => {
+    if (next !== lines) onChange(next);
+  };
+
+  // dragover fires continuously; without this the table re-renders on every
+  // mouse tick while a drag is in the air.
+  const aimAt = (target: DropTarget) => {
+    setDropTarget((prev) => (sameTarget(prev, target) ? prev : target));
+  };
+
+  const startDrag = (e: React.DragEvent, source: DragSource, label: string) => {
+    setDragging(source);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', label);
+    e.dataTransfer.setData(MIME, JSON.stringify(source));
+  };
+
+  // A drop is only accepted while one of our own drags is in flight — dragging
+  // a file or a text selection over the table should do nothing at all.
+  const acceptDrag = (e: React.DragEvent) => {
+    if (!dragging) return false;
+    e.preventDefault();          // without this the drop event never fires
+    e.dataTransfer.dropEffect = 'move';
+    return true;
+  };
+
+  // Dropping onto a row: a line lands where that row is, a bullet is appended
+  // to that row's task list.
+  const dropOnLine = (lineId: string) => {
+    if (!dragging) return;
+    if (dragging.kind === 'line') {
+      commit(moveLine(lines, dragging.lineId, lineId));
+    } else {
+      commit(moveSubItemToLine(lines, { lineId: dragging.lineId, index: dragging.index }, lineId));
+    }
+  };
+
+  // Dropping onto a bullet: a bullet takes its place; a line is treated as
+  // having been dropped on the row the bullet belongs to.
+  const dropOnSubItem = (lineId: string, index: number) => {
+    if (!dragging) return;
+    if (dragging.kind === 'line') {
+      commit(moveLine(lines, dragging.lineId, lineId));
+    } else {
+      commit(moveSubItem(lines, { lineId: dragging.lineId, index: dragging.index }, { lineId, index }));
+    }
+  };
+
+  // ── Keyboard equivalent ─────────────────────────────────────────────────────
+  // Native drag and drop is mouse-only, so Alt+ArrowUp/Down on a handle moves it
+  // one place. The handle must keep focus across the re-render, or a second
+  // press would act on whatever ends up under the cursor instead of on the thing
+  // just moved — the feature is only useful if it can be pressed repeatedly.
+  //
+  // Focus is therefore moved explicitly, by position, for BOTH kinds of handle.
+  // It is tempting to rely on React moving the DOM node instead, but that only
+  // holds for lines, which are keyed by `line_id`. Bullets are keyed by index
+  // (see the note at their `.map`), so React reuses the node at each slot and
+  // focus would stay on the SLOT while the bullet moved out from under it —
+  // three presses would nudge three different bullets one place each rather than
+  // walking one bullet three places.
+  //
+  // So the map is keyed by position — `line:<id>` and `sub:<lineId>:<index>` —
+  // and a move stashes the key of its DESTINATION, not its source. Refs attach
+  // during the commit's layout phase, before this passive effect runs, so the
+  // map is already up to date by the time the focus lands.
+  const handleRefs = useRef(new Map<string, HTMLButtonElement>());
+  const pendingFocus = useRef<string | null>(null);
+
+  useEffect(() => {
+    const key = pendingFocus.current;
+    if (key === null) return;
+    pendingFocus.current = null;
+    handleRefs.current.get(key)?.focus();
+  }, [lines]);
+
+  const handleRef = (key: string) => (el: HTMLButtonElement | null) => {
+    if (el) handleRefs.current.set(key, el);
+    else handleRefs.current.delete(key);
+  };
+
+  // Returns the arrow's direction, or 0 for any other key — callers use that to
+  // decide whether to swallow the event.
+  const arrowStep = (e: React.KeyboardEvent): number => {
+    if (!e.altKey) return 0;
+    if (e.key === 'ArrowUp') return -1;
+    if (e.key === 'ArrowDown') return 1;
+    return 0;
+  };
+
+  const onLineKeyDown = (e: React.KeyboardEvent, lineId: string) => {
+    const step = arrowStep(e);
+    if (step === 0) return;
+    e.preventDefault();
+    const from = lines.findIndex((l) => l.line_id === lineId);
+    const next = moveItem(lines, from, from + step);
+    if (next === lines) return;
+    pendingFocus.current = `line:${lineId}`;
+    onChange(next);
+  };
+
+  // Keyboard moves a bullet within its own line only. Crossing lines by
+  // keyboard needs a target-picking affordance this table has no room for; the
+  // bullet can still be retyped, and the mouse path handles the rest.
+  const onSubKeyDown = (e: React.KeyboardEvent, lineId: string, index: number) => {
+    const step = arrowStep(e);
+    if (step === 0) return;
+    e.preventDefault();
+    const to = index + step;
+    const next = moveSubItem(lines, { lineId, index }, { lineId, index: to });
+    if (next === lines) return;
+    pendingFocus.current = `sub:${lineId}:${to}`;
+    onChange(next);
+  };
+
+  // Where a dragged line would land relative to a row, so the target row can
+  // show the edge it will be inserted against.
+  const draggedLineIndex =
+    dragging?.kind === 'line' ? lines.findIndex((l) => l.line_id === dragging.lineId) : -1;
+
   return (
     <div className="flex flex-col gap-3">
       <div className="overflow-x-auto">
         <table className="w-full min-w-[720px] text-sm">
           <thead>
             <tr className="text-xs text-slate-500 uppercase tracking-wider">
+              <th className="w-7 pb-2" />
               {selectable && <th className="w-8 pb-2" />}
               <th className="text-left font-medium pb-2 pr-2">Description</th>
               <th className="text-left font-medium pb-2 px-2 w-36">From</th>
@@ -157,23 +326,81 @@ export default function InvoiceLineTable({
           <tbody>
             {lines.length === 0 ? (
               <tr>
-                <td colSpan={selectable ? 8 : 7} className="py-6 text-center text-sm text-slate-600">
+                {/* Grew by one with the drag handle column. */}
+                <td colSpan={selectable ? 9 : 8} className="py-6 text-center text-sm text-slate-600">
                   No lines yet. Load time entries or add a line manually.
                 </td>
               </tr>
             ) : (
-              rows.map((line) => {
+              rows.map((line, rowIndex) => {
                 const excluded = isExcluded(line.line_id);
                 const reason = reasonForLine?.(line.line_id) ?? null;
                 const subItems = line.sub_items ?? [];
+
+                // Keyed by line_id rather than by row index: `rows` is
+                // re-derived on every keystroke, so an index would follow the
+                // wrong row the moment the array changed under the pointer.
+                // A line dragged over itself is a no-op, so it must not draw an
+                // insertion edge promising a move that will not happen.
+                const isDraggedRow =
+                  dragging?.kind === 'line' && dragging.lineId === line.line_id;
+                const aimedAtRow =
+                  dropTarget?.kind === 'line' &&
+                  dropTarget.lineId === line.line_id &&
+                  !isDraggedRow;
+                // A line shows the edge it will be inserted against; a bullet
+                // being appended has no edge, so the whole row lights instead.
+                const insertAbove = draggedLineIndex > rowIndex;
+                const rowBorder =
+                  aimedAtRow && dragging?.kind === 'line'
+                    ? insertAbove
+                      ? 'border-t-2 border-t-violet-500'
+                      : 'border-t border-slate-800 border-b-2 border-b-violet-500'
+                    : 'border-t border-slate-800';
+                const rowTint =
+                  aimedAtRow && dragging?.kind === 'sub' ? 'bg-violet-500/10' : '';
 
                 return (
                 <tr
                   key={line.line_id}
                   // Dimmed, never disabled: an unticked line stays fully
                   // editable, and its inputs and amount keep rendering (§1).
-                  className={`border-t border-slate-800 align-top ${excluded ? 'opacity-50' : ''}`}
+                  className={`${rowBorder} ${rowTint} align-top ${excluded ? 'opacity-50' : ''}`}
+                  onDragOver={(e) => {
+                    if (acceptDrag(e)) aimAt({ kind: 'line', lineId: line.line_id });
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    dropOnLine(line.line_id);
+                    clearDrag();
+                  }}
                 >
+                  <td className="py-2 pt-4">
+                    {/* A real button, so the keyboard can reach it; `draggable`
+                        on the handle alone keeps the row's text, date and
+                        number inputs selectable (dragging a whole draggable row
+                        eats the caret). Never disabled — an excluded line is
+                        dimmed and still fully draggable (§1). */}
+                    <button
+                      type="button"
+                      ref={handleRef(`line:${line.line_id}`)}
+                      draggable
+                      aria-label={`Reorder line: ${line.description || line.task_title || 'untitled'}. Alt with up or down arrow moves it.`}
+                      title="Drag to reorder · Alt+↑/↓"
+                      onDragStart={(e) =>
+                        startDrag(
+                          e,
+                          { kind: 'line', lineId: line.line_id },
+                          line.description || line.task_title || 'Invoice line'
+                        )
+                      }
+                      onDragEnd={clearDrag}
+                      onKeyDown={(e) => onLineKeyDown(e, line.line_id)}
+                      className={`${HANDLE} px-1 py-0.5 text-base`}
+                    >
+                      ⠿
+                    </button>
+                  </td>
                   {selectable && (
                     <td className="py-2 pt-4">
                       <input
@@ -204,12 +431,76 @@ export default function InvoiceLineTable({
                       <p className="text-xs text-amber-300/90 mt-1 leading-snug">{reason}</p>
                     )}
 
-                    {/* Task bullets printed under the description. Keyed by
-                        index because the value IS the identity here — there is
-                        nothing else on a bare string to key by. */}
+                    {/* Task bullets printed under the description.
+                        Deliberately keyed by index, even though these are now
+                        reorderable and an index key is normally wrong for a
+                        reorderable list. A bullet is a bare string with no id,
+                        so the alternative is a parallel array of synthetic ids
+                        held in state beside `sub_items` — which can desync from
+                        the array it describes, a worse bug than the one it
+                        fixes. The value is not an identity either: two bullets
+                        may hold the same text, or none at all while being
+                        typed.
+
+                        What that costs: React reuses the DOM node at each slot
+                        rather than moving it, so after a reorder the focused
+                        node belongs to whatever bullet now sits in that slot.
+                        The controlled `value` still renders correctly, so mouse
+                        drags are unaffected — but keyboard moves would then walk
+                        a different bullet on each press. What compensates is
+                        `pendingFocus` below: a keyboard move re-points focus at
+                        the destination index explicitly, so the bullet keeps the
+                        focus rather than the slot does. */}
                     <div className="mt-1.5 flex flex-col gap-1">
-                      {subItems.map((item, i) => (
-                        <div key={i} className="flex items-center gap-1">
+                      {subItems.map((item, i) => {
+                        const aimedAtSub =
+                          dropTarget?.kind === 'sub' &&
+                          dropTarget.lineId === line.line_id &&
+                          dropTarget.index === i;
+                        return (
+                        <div
+                          key={i}
+                          className={`flex items-center gap-1 rounded ${
+                            aimedAtSub ? 'ring-1 ring-violet-500' : ''
+                          }`}
+                          // stopPropagation throughout, or the row underneath
+                          // would claim the same drop and append the bullet to
+                          // the end of the line instead of placing it here.
+                          onDragOver={(e) => {
+                            if (!acceptDrag(e)) return;
+                            e.stopPropagation();
+                            aimAt(
+                              dragging?.kind === 'line'
+                                ? { kind: 'line', lineId: line.line_id }
+                                : { kind: 'sub', lineId: line.line_id, index: i }
+                            );
+                          }}
+                          onDrop={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            dropOnSubItem(line.line_id, i);
+                            clearDrag();
+                          }}
+                        >
+                          <button
+                            type="button"
+                            ref={handleRef(`sub:${line.line_id}:${i}`)}
+                            draggable
+                            aria-label={`Reorder task: ${item || 'untitled'}. Alt with up or down arrow moves it.`}
+                            title="Drag to reorder · Alt+↑/↓"
+                            onDragStart={(e) => {
+                              e.stopPropagation();
+                              startDrag(e, { kind: 'sub', lineId: line.line_id, index: i }, item || 'Task');
+                            }}
+                            onDragEnd={(e) => {
+                              e.stopPropagation();
+                              clearDrag();
+                            }}
+                            onKeyDown={(e) => onSubKeyDown(e, line.line_id, i)}
+                            className={`${HANDLE} px-0.5 text-[11px]`}
+                          >
+                            ⠿
+                          </button>
                           <span className="text-slate-600 text-xs select-none">•</span>
                           <input
                             type="text"
@@ -226,7 +517,8 @@ export default function InvoiceLineTable({
                             ×
                           </button>
                         </div>
-                      ))}
+                        );
+                      })}
                       {/* Offered on every line, not just tracker lines — a
                           manual line may want a task list too. */}
                       <button
