@@ -257,6 +257,48 @@ export interface InvoiceLine {
   sub_items: string[];
 }
 
+// ── Payments ──────────────────────────────────────────────────────────────────
+// What the client was billed and what actually reached the bank are different
+// numbers in different currencies. A payment records both, so the gap — FX
+// spread, wire fees, an underpayment — is visible instead of inferred.
+
+export interface InvoicePayment {
+  payment_id: string;
+  paid_on: string;              // "YYYY-MM-DD"
+  // What the client paid, in the currency the invoice was raised in.
+  amount_paid: number;
+  // Snapshot of the invoice's currency at the time of payment, so re-denominating
+  // an invoice later cannot relabel money that has already arrived.
+  currency: string;
+  // What actually landed, in whatever currency it landed as.
+  amount_received: number;
+  received_currency: string;
+  // Server-derived: amount_received / amount_paid to 6dp. Null when nothing was
+  // paid — there is no rate against zero, and it is not 0.
+  rate: number | null;
+  notes: string | null;
+  datetime_inserted: string;
+  datetime_updated: string;
+}
+
+export interface CreatePaymentPayload {
+  paid_on: string;
+  amount_paid: number;
+  amount_received: number;
+  // Defaults to the payout currency in Invoice Settings.
+  received_currency?: string;
+  notes?: string;
+}
+
+export interface UpdatePaymentPayload extends Partial<CreatePaymentPayload> {}
+
+// Received money totalled per currency. Summing across currencies would produce
+// a number that means nothing, so each one is reported on its own.
+export interface ReceivedTotal {
+  currency: string;
+  amount: number;
+}
+
 export interface InvoiceIssuedBy {
   business_name: string;
   contact_name: string;   // the person issuing it; "" on invoices predating it
@@ -294,6 +336,17 @@ export interface Invoice {
   show_payment_terms: boolean;
   bill_to: string;             // snapshot at creation
   issued_by: InvoiceIssuedBy;  // snapshot at creation
+  // ── Payments and their derived figures ──
+  // All server-computed on write, like every other money field here.
+  payments: InvoicePayment[];
+  amount_paid: number;               // total paid, in the invoice's currency
+  received_totals: ReceivedTotal[];  // what arrived, per currency
+  // total − amount_paid. Deliberately unclamped: an overpayment reads negative
+  // rather than being rewritten to zero, so a discrepancy stays visible.
+  outstanding: number;
+  // Blended rate across all payments, 6dp. Null when nothing is paid or when
+  // money arrived in more than one currency — there is no single rate then.
+  effective_rate: number | null;
   datetime_inserted: string;
   datetime_updated: string;
 }
@@ -388,6 +441,12 @@ export interface InvoiceSettings {
   default_tax_label: string;
   default_tax_percent: number;
   default_rate: number;
+  // The currency the money actually arrives in, e.g. "PHP" while invoicing in
+  // USD. Pre-fills the payment form and stays editable there — a one-off
+  // payment that lands in a different currency is recorded as it happened.
+  // Empty means unset; the payment form then falls back to the invoice's own
+  // currency rather than guessing.
+  payout_currency: string;
   // The billing increment hours snap to, in hours — 0.25 is a quarter hour.
   // 0 turns rounding off. Never applied on its own: it is the default the
   // "Round hours" action offers, and the user still chooses which lines it

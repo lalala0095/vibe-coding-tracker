@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import type {
-  Invoice, InvoiceStatus, InvoiceLine, Client, Project, InvoiceSettings, UpdateInvoicePayload,
+  Invoice, InvoiceStatus, InvoiceLine, InvoicePayment, Client, Project, InvoiceSettings,
+  UpdateInvoicePayload,
 } from '../types';
 import {
   getInvoices, updateInvoice, updateInvoiceStatus, deleteInvoice,
@@ -15,6 +16,8 @@ import InvoiceBuilder, {
 } from '../components/InvoiceBuilder';
 import RegenerateModal from '../components/RegenerateModal';
 import ConfirmDialog from '../components/ConfirmDialog';
+import PaymentsPanel from '../components/PaymentsPanel';
+import PaymentForm from '../components/PaymentForm';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -80,6 +83,12 @@ export default function InvoicesPage() {
   // the printed period have to move together, so this rides along with `lines`
   // rather than being written when the modal closes.
   const [pendingPeriod, setPendingPeriod] = useState<{ start: string; end: string } | null>(null);
+  // The payment dialog. Null is closed; `{ payment: null }` records a new one,
+  // `{ payment }` amends that one. Held here rather than inside PaymentsPanel
+  // because marking an invoice paid opens it too — the panel is not the only
+  // thing that can ask for it.
+  const [paymentTarget, setPaymentTarget] =
+    useState<{ payment: InvoicePayment | null } | null>(null);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -125,6 +134,9 @@ export default function InvoicesPage() {
     }
     loadEditor(selected);
     setShowRegenerate(false);
+    // A dialog opened against the previous invoice must not stay up over the
+    // next one — its defaults were read from an invoice that is no longer here.
+    setPaymentTarget(null);
     setDetailError('');
   }, [selectedId]);
 
@@ -186,6 +198,12 @@ export default function InvoicesPage() {
     setDetailError('');
     try {
       replaceInvoice(await updateInvoiceStatus(selected.id, status));
+      // Marking an invoice paid OFFERS the payment form; it never requires it.
+      // The status change is already saved by the line above, so dismissing the
+      // dialog leaves the invoice paid with no payment recorded, and marking
+      // paid is never blocked by — or made to wait on — entering one
+      // (§ no locking). Status and payments are independent on purpose.
+      if (status === 'paid') setPaymentTarget({ payment: null });
     } catch {
       setDetailError('Failed to change the invoice status.');
     } finally {
@@ -403,6 +421,17 @@ export default function InvoicesPage() {
                   />
                 </div>
 
+                {/* Internal, and deliberately not part of the printed document
+                    — InvoicePrintView knows nothing about any of this. */}
+                <PaymentsPanel
+                  invoice={selected}
+                  // Every payment write returns the whole recomputed invoice,
+                  // so the list and the detail both take the server's figures.
+                  onUpdated={replaceInvoice}
+                  onNew={() => setPaymentTarget({ payment: null })}
+                  onEdit={(payment) => setPaymentTarget({ payment })}
+                />
+
                 {selected.bill_to && (
                   <div className="border-t border-slate-800 pt-4">
                     <p className="text-xs text-slate-500 uppercase tracking-wider mb-2">Bill to</p>
@@ -465,6 +494,23 @@ export default function InvoicesPage() {
             setDirty(true);   // nothing is written until the user saves
           }}
           onClose={() => setShowRegenerate(false)}
+        />
+      )}
+
+      {/* Keyed by target, so switching from "record" to an edit — or to a
+          different payment — remounts the form and re-reads its defaults
+          instead of keeping the previous one's values. */}
+      {paymentTarget && selected && (
+        <PaymentForm
+          key={paymentTarget.payment?.payment_id ?? 'new'}
+          invoice={selected}
+          payment={paymentTarget.payment}
+          // Best-effort, exactly like the table's rounding defaults: settings
+          // may have failed to load, and "" makes the form fall back to the
+          // invoice's own currency rather than refusing to open.
+          payoutCurrency={settings?.payout_currency ?? ''}
+          onSaved={replaceInvoice}
+          onClose={() => setPaymentTarget(null)}
         />
       )}
 

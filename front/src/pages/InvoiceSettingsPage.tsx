@@ -21,6 +21,7 @@ interface FormState {
   email: string;
   logo_url: string;
   default_currency: string;
+  payout_currency: string;
   default_payment_terms: string;
   default_due_days: string;
   default_tax_label: string;
@@ -42,6 +43,9 @@ function toForm(s: InvoiceSettings): FormState {
     email: s.email ?? '',
     logo_url: s.logo_url ?? '',
     default_currency: s.default_currency ?? 'USD',
+    // Empty is meaningful here — it means "not set", so there is no fallback
+    // currency to guess at.
+    payout_currency: s.payout_currency ?? '',
     default_payment_terms: s.default_payment_terms ?? '',
     default_due_days: String(s.default_due_days ?? 14),
     default_tax_label: s.default_tax_label ?? '',
@@ -98,6 +102,10 @@ export default function InvoiceSettingsPage() {
         // logo_url is a string field, so the repo's "null" sentinel clears it.
         logo_url: form.logo_url.trim() === '' ? 'null' : form.logo_url.trim(),
         default_currency: form.default_currency,
+        // Cleared with an empty string, NOT the "null" sentinel — a currency
+        // reading "null" would print on a client-facing document. The server
+        // trims and uppercases, and refuses that word outright.
+        payout_currency: form.payout_currency.trim(),
         default_payment_terms: form.default_payment_terms,
         default_due_days: num(form.default_due_days),
         default_tax_label: form.default_tax_label,
@@ -232,6 +240,23 @@ export default function InvoiceSettingsPage() {
                     placeholder="USD"
                     className={FIELD}
                   />
+                </div>
+                <div className="col-span-2">
+                  <label className={LABEL}>
+                    Currency I actually receive <span className="text-slate-600">(optional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={form.payout_currency}
+                    onChange={(e) => set({ payout_currency: e.target.value })}
+                    placeholder="PHP"
+                    className={FIELD}
+                  />
+                  <p className="text-xs text-slate-500 mt-1.5">
+                    Pre-fills the payment form when you invoice in one currency but are paid in
+                    another. A default only — you can change it on any individual payment. Leave
+                    blank to fall back to the invoice&rsquo;s own currency.
+                  </p>
                 </div>
                 <div>
                   <label className={LABEL}>Default rate</label>

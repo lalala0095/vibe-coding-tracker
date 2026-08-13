@@ -79,18 +79,51 @@ function div100(a: Dec): Dec {
   return { m: a.m, s: a.s + 2 };
 }
 
-// Quantise to 2 dp, ties away from zero — Python's ROUND_HALF_UP.
-function quantize(d: Dec): Dec {
-  if (d.s <= 2) return { m: d.m * pow10(2 - d.s), s: 2 };
+// Quantise to `dp` places, ties away from zero — Python's ROUND_HALF_UP.
+function quantizeTo(d: Dec, dp: number): Dec {
+  if (d.s <= dp) return { m: d.m * pow10(dp - d.s), s: dp };
 
-  const drop = pow10(d.s - 2);
+  const drop = pow10(d.s - dp);
   const negative = d.m < 0n;
   const abs = negative ? -d.m : d.m;
   const q = abs / drop;
   const remainder = abs % drop;
   const rounded = remainder * 2n >= drop ? q + 1n : q;
 
-  return { m: negative ? -rounded : rounded, s: 2 };
+  return { m: negative ? -rounded : rounded, s: dp };
+}
+
+// Quantise to 2 dp — the money case, and every existing caller.
+function quantize(d: Dec): Dec {
+  return quantizeTo(d, 2);
+}
+
+/**
+ * `a / b`, quantised to `dp` places, ties away from zero.
+ *
+ * Division is the one operation the scaled-integer representation cannot do
+ * exactly, so it is done once at the requested precision rather than left to
+ * float division: `Number(a) / Number(b)` would reintroduce exactly the binary
+ * error this whole module exists to avoid.
+ *
+ * Returns null when the divisor is zero — a caller has to decide what no rate
+ * at all should read as, and it is never 0.
+ */
+function divideTo(a: Dec, b: Dec, dp: number): Dec | null {
+  if (b.m === 0n) return null;
+  // a/b scaled by 10^dp = (a.m · 10^b.s · 10^dp) / (b.m · 10^a.s)
+  const numerator = a.m * pow10(b.s) * pow10(dp);
+  const denominator = b.m * pow10(a.s);
+
+  const negative = numerator < 0n !== denominator < 0n;
+  const absNum = numerator < 0n ? -numerator : numerator;
+  const absDen = denominator < 0n ? -denominator : denominator;
+
+  const q = absNum / absDen;
+  const remainder = absNum % absDen;
+  const rounded = remainder * 2n >= absDen ? q + 1n : q;
+
+  return { m: negative ? -rounded : rounded, s: dp };
 }
 
 function decToNumber(d: Dec): number {
@@ -254,6 +287,93 @@ export function roundHoursToIncrement(
 
   const m = negative ? -(steps * i) : steps * i;
   return decToNumber(quantize({ m, s }));
+}
+
+// ── Payments ──────────────────────────────────────────────────────────────────
+// Mirrors `compute_payments` in back/services/invoice_service.py. The server
+// recomputes all of this on write; this exists so the form can show the totals
+// and the effective rate while they are still being typed.
+
+/** The two amounts and the currency a payment landed in. */
+export interface PaymentAmounts {
+  amount_paid: number | null | undefined;
+  amount_received: number | null | undefined;
+  received_currency: string;
+}
+
+export interface ReceivedTotal {
+  currency: string;
+  amount: number;
+}
+
+export interface PaymentTotals<T> {
+  payments: (T & { rate: number | null })[];
+  amount_paid: number;
+  received_totals: ReceivedTotal[];
+  outstanding: number;
+  effective_rate: number | null;
+}
+
+/**
+ * Recompute an invoice's payment figures. Mirrors `compute_payments`.
+ *
+ * Received amounts total **per currency** — adding pesos to dollars would give a
+ * number that means nothing — and `effective_rate` is reported only when there
+ * is exactly one received currency to have a rate against.
+ *
+ * `outstanding` is not clamped: an overpayment reads negative, deliberately, so
+ * a discrepancy shows rather than being rounded away into zero (§5 rule 4).
+ */
+export function computePayments<T extends PaymentAmounts>(
+  payments: T[],
+  total: number | null | undefined
+): PaymentTotals<T> {
+  const computed: (T & { rate: number | null })[] = [];
+  let paidTotal: Dec = ZERO;
+  // A Map, so the currencies come back in the order they were first paid.
+  const receivedByCurrency = new Map<string, Dec>();
+
+  for (const payment of payments) {
+    const amountPaid = quantize(toDec(payment.amount_paid));
+    const amountReceived = quantize(toDec(payment.amount_received));
+    const currency = (payment.received_currency || '').trim();
+
+    const rate = divideTo(amountReceived, amountPaid, 6);
+    computed.push({
+      ...payment,
+      amount_paid: decToNumber(amountPaid),
+      amount_received: decToNumber(amountReceived),
+      rate: rate === null ? null : decToNumber(rate),
+    });
+
+    paidTotal = addDec(paidTotal, amountPaid);
+    receivedByCurrency.set(
+      currency,
+      addDec(receivedByCurrency.get(currency) ?? ZERO, amountReceived)
+    );
+  }
+
+  paidTotal = quantize(paidTotal);
+
+  const received_totals: ReceivedTotal[] = [];
+  for (const [currency, amount] of receivedByCurrency) {
+    received_totals.push({ currency, amount: decToNumber(quantize(amount)) });
+  }
+
+  let effective_rate: number | null = null;
+  if (receivedByCurrency.size === 1) {
+    const only = quantize([...receivedByCurrency.values()][0]);
+    const rate = divideTo(only, paidTotal, 6);
+    effective_rate = rate === null ? null : decToNumber(rate);
+  }
+
+  return {
+    payments: computed,
+    amount_paid: decToNumber(paidTotal),
+    received_totals,
+    outstanding: decToNumber(quantize(subDec(toDec(total), paidTotal))),
+    effective_rate,
+  };
 }
 
 /** Display a money value, per §5. Falls back to a plain 2 dp figure. */

@@ -7,6 +7,7 @@ import type {
   Session, CreateSessionPayload, UpdateSessionPayload,
   Invoice, InvoiceStatus, InvoicePreviewRequest, InvoicePreviewResponse,
   CreateInvoicePayload, UpdateInvoicePayload,
+  CreatePaymentPayload, UpdatePaymentPayload,
   InvoiceSettings, UpdateInvoiceSettingsPayload,
   TrackerSettings, UpdateTrackerSettingsPayload,
 } from './types';
@@ -341,6 +342,36 @@ export async function updateInvoiceStatus(id: string, status: InvoiceStatus): Pr
 
 export async function deleteInvoice(id: string): Promise<void> {
   await apiClient.delete(`/invoices/${id}`);
+}
+
+// ── Invoice payments ──────────────────────────────────────────────────────────
+// Each returns the whole invoice, not the payment: the server recomputes
+// amount_paid, outstanding and the effective rate on every write, so the caller
+// needs the invoice back to show them.
+
+export async function addInvoicePayment(
+  invoiceId: string, payload: CreatePaymentPayload
+): Promise<Invoice> {
+  const res = await apiClient.post<Invoice>(`/invoices/${invoiceId}/payments`, payload);
+  return res.data;
+}
+
+export async function updateInvoicePayment(
+  invoiceId: string, paymentId: string, payload: UpdatePaymentPayload
+): Promise<Invoice> {
+  const res = await apiClient.patch<Invoice>(
+    `/invoices/${invoiceId}/payments/${paymentId}`, payload
+  );
+  return res.data;
+}
+
+export async function deleteInvoicePayment(
+  invoiceId: string, paymentId: string
+): Promise<Invoice> {
+  const res = await apiClient.delete<Invoice>(
+    `/invoices/${invoiceId}/payments/${paymentId}`
+  );
+  return res.data;
 }
 
 // ── Invoice settings ──────────────────────────────────────────────────────────
