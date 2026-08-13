@@ -1,3 +1,5 @@
+import math
+import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Annotated, Optional
@@ -16,6 +18,7 @@ from services.invoice_service import (
     build_bill_to,
     build_issued_by,
     compute_money,
+    compute_payments,
 )
 from services.rate_service import resolve_currency, resolve_rate
 
@@ -29,6 +32,11 @@ _BATCH_LIMIT = 450
 VALID_STATUSES = ("draft", "sent", "paid", "void")
 
 VALID_DISCOUNT_TYPES = ("percent", "amount")
+
+# A date the money math and the printed document can both rely on.  strptime
+# alone is too lenient — it happily accepts "2026-8-1" — so the shape is checked
+# first and the calendar second.
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas
@@ -116,6 +124,45 @@ class InvoiceStatusUpdate(BaseModel):
     status: str
 
 
+class PaymentCreate(BaseModel):
+    paid_on: str
+    amount_paid: float
+    amount_received: float
+    # Omit to take the payout currency from settings, then the invoice's own.
+    received_currency: Optional[str] = None
+    notes: Optional[str] = None
+    # ``currency`` is deliberately absent — it is snapshotted from the invoice.
+    # ``rate`` too: the server always recomputes it.
+
+
+class PaymentUpdate(BaseModel):
+    paid_on: Optional[str] = None
+    amount_paid: Optional[float] = None
+    amount_received: Optional[float] = None
+    received_currency: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class PaymentResponse(BaseModel):
+    payment_id: str
+    paid_on: str
+    amount_paid: float
+    currency: str
+    amount_received: float
+    received_currency: str
+    rate: Optional[float]
+    notes: Optional[str]
+    datetime_inserted: str
+    datetime_updated: str
+
+
+class ReceivedTotal(BaseModel):
+    """What arrived, totalled per currency — never summed across them."""
+
+    currency: str
+    amount: float
+
+
 class InvoiceResponse(BaseModel):
     id: str
     invoice_number: str
@@ -138,6 +185,11 @@ class InvoiceResponse(BaseModel):
     tax_percent: float
     tax_amount: float
     total: float
+    payments: list[PaymentResponse]
+    amount_paid: float
+    received_totals: list[ReceivedTotal]
+    outstanding: float
+    effective_rate: Optional[float]
     notes: Optional[str]
     payment_terms: Optional[str]
     show_due_date: bool
@@ -660,6 +712,28 @@ def _doc_to_line(data: dict) -> InvoiceLineResponse:
     )
 
 
+def _doc_to_payment(data: dict) -> PaymentResponse:
+    """
+    Build a payment response from a stored payment dict.
+
+    ``data.get(key, default)`` per field, like ``_doc_to_line``, so a payment
+    written before a field existed reads back rather than 500ing the whole
+    invoice.
+    """
+    return PaymentResponse(
+        payment_id=data.get("payment_id", ""),
+        paid_on=data.get("paid_on", ""),
+        amount_paid=data.get("amount_paid", 0.0),
+        currency=data.get("currency", ""),
+        amount_received=data.get("amount_received", 0.0),
+        received_currency=data.get("received_currency", ""),
+        rate=data.get("rate"),
+        notes=data.get("notes"),
+        datetime_inserted=data.get("datetime_inserted", ""),
+        datetime_updated=data.get("datetime_updated", ""),
+    )
+
+
 def _doc_to_preview_line(data: dict) -> InvoicePreviewLine:
     """
     Build a preview line, carrying the already-claimed provenance.
@@ -704,6 +778,15 @@ def _doc_to_invoice(doc) -> InvoiceResponse:
         tax_percent=_value_or(data, "tax_percent", 0.0),
         tax_amount=_value_or(data, "tax_amount", 0.0),
         total=_value_or(data, "total", 0.0),
+        # An invoice stored before payments existed has none of these keys, so
+        # every one falls back rather than failing response validation.
+        payments=[
+            _doc_to_payment(payment) for payment in _value_or(data, "payments", [])
+        ],
+        amount_paid=_value_or(data, "amount_paid", 0.0),
+        received_totals=_value_or(data, "received_totals", []),
+        outstanding=_value_or(data, "outstanding", _value_or(data, "total", 0.0)),
+        effective_rate=data.get("effective_rate"),
         notes=data.get("notes"),
         payment_terms=data.get("payment_terms"),
         # An invoice created before these existed prints both blocks, which is
@@ -758,6 +841,168 @@ def _validate_discount_type(value: Optional[str]) -> Optional[str]:
             detail=f"Discount type must be one of: {', '.join(VALID_DISCOUNT_TYPES)}.",
         )
     return value
+
+
+def _validate_paid_on(value: str) -> str:
+    """
+    Check a payment date is a real calendar date written ``YYYY-MM-DD``.
+
+    Two checks, because neither alone is enough: the regex rejects the shapes
+    ``strptime`` would quietly accept (``2026-8-1``) and ``strptime`` rejects the
+    calendar nonsense the regex would wave through (``2026-13-45``).  A payment
+    date is sorted and compared as a string everywhere else in this app, so a
+    stray format would silently sort wrong rather than fail loudly.
+    """
+    if not _ISO_DATE_RE.match(value or ""):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="paid_on must be a date in YYYY-MM-DD format.",
+        )
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"paid_on '{value}' is not a real date.",
+        )
+    return value
+
+
+def _validate_amount(value: float, field: str) -> float:
+    """
+    Check an amount is a finite number.
+
+    NaN and infinity are rejected because they poison every sum they touch and
+    read back as ``null`` through JSON, which would 500 the invoice afterwards.
+
+    A **negative** amount passes deliberately.  A refund, a chargeback or a
+    correction is a legitimate thing to record, and per the no-locking principle
+    the server does not police the owner's own figures.  An overpayment passes
+    for the same reason — ``outstanding`` simply goes negative.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field} must be a number.",
+        )
+    if not math.isfinite(number):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field} must be a finite number.",
+        )
+    return number
+
+
+def _validate_received_currency(value: str) -> str:
+    """
+    Normalise a received currency and **reject** the ``"null"`` clearing sentinel.
+
+    Rejected, not ignored.  The sentinel clears optional strings elsewhere in
+    this app (``notes`` below still takes it), but a currency has no cleared
+    state: it is stamped on a client-facing document, and storing the literal
+    text ``"null"`` would print "null 68,400" on an invoice.  Silently ignoring
+    it would leave the caller believing a currency it named was applied, so the
+    request fails instead — case-insensitively, matching ``_clear_sentinel``.
+
+    **Uppercased, and it must stay that way to match ``_validate_payout_currency``
+    in settings.py.**  ``compute_payments`` groups received money by the exact
+    currency string, so ``"php"`` and ``"PHP"`` are two different currencies to
+    it: one invoice would report two ``received_totals`` rows for what is really
+    one currency, and ``effective_rate`` would silently go None, since a rate is
+    only quoted when there is exactly one received currency.  The settings
+    default already arrives uppercased, so a typed override that did not would
+    split against it.
+
+    Deliberately *not* applying settings.py's 2–5 letter shape check.  That field
+    is one configured default worth validating once; this one is per-payment data
+    the owner types, and the no-locking principle says the server warns about the
+    owner's own figures rather than refusing them.  A malformed code here is
+    visible on screen and fixable with a PATCH — it corrupts no arithmetic.
+    """
+    trimmed = (value or "").strip()
+    if trimmed.lower() == "null":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "received_currency cannot be cleared — send a currency code, or "
+                "omit the field to take the default."
+            ),
+        )
+    return trimmed.upper()
+
+
+def _resolve_received_currency(
+    requested: Optional[str],
+    settings_data: dict,
+    invoice_currency: str,
+) -> str:
+    """
+    Pick the currency the money arrived in.
+
+    In order: what the caller asked for, the payout currency configured in
+    invoice settings, then the invoice's own currency as the last resort — so
+    the field is never blank even before a payout currency has been configured.
+
+    ``payout_currency`` is read defensively: settings documents written before
+    it existed simply do not carry the key.
+
+    Every branch is uppercased, for the grouping reason spelled out in
+    ``_validate_received_currency``.  The settings default already is; the
+    invoice's own currency is stored verbatim as the user typed it, so an
+    invoice raised in ``"usd"`` would otherwise split against a payment that
+    took either of the other two branches.
+    """
+    if requested is not None:
+        chosen = _validate_received_currency(requested)
+        if chosen:
+            return chosen
+
+    payout = (settings_data.get("payout_currency") or "").strip()
+    return (payout or invoice_currency or "").upper()
+
+
+def _stored_payments(existing: dict) -> list:
+    """Return an invoice's stored payments, tolerating an absent or null key."""
+    return list(_value_or(existing, "payments", []) or [])
+
+
+def _payment_figures(payments, total) -> dict:
+    """
+    Recompute every payment-derived field for storage.
+
+    The one place the derived figures are produced, so create, update, status
+    change and the payment endpoints cannot drift apart.  Client-supplied
+    ``amount_paid``/``outstanding``/``rate`` are never written — like the money
+    totals, they are always recomputed here.
+    """
+    computed = compute_payments(list(payments or []), total)
+    return {
+        "payments": computed["payments"],
+        "amount_paid": computed["amount_paid"],
+        "received_totals": computed["received_totals"],
+        "outstanding": computed["outstanding"],
+        "effective_rate": computed["effective_rate"],
+    }
+
+
+def _find_payment(payments: list, payment_id: str) -> int:
+    """Return the index of a payment on an invoice. Raises 404 if not found."""
+    for index, payment in enumerate(payments):
+        if payment.get("payment_id") == payment_id:
+            return index
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Payment '{payment_id}' not found.",
+    )
+
+
+def _write_payments(doc_ref, payments, total) -> None:
+    """Persist a rebuilt payment list along with its derived figures."""
+    updates = _payment_figures(payments, total)
+    updates["datetime_updated"] = _now_sgt()
+    doc_ref.update(updates)
 
 
 # ---------------------------------------------------------------------------
@@ -1166,6 +1411,9 @@ async def create_invoice(
         "tax_percent": tax_percent,
         "tax_amount": money["tax_amount"],
         "total": money["total"],
+        # A new invoice has no payments, but the derived fields are still
+        # written so ``outstanding`` starts at the full total rather than absent.
+        **_payment_figures([], money["total"]),
         "notes": notes,
         "payment_terms": payment_terms,
         "show_due_date": True if payload.show_due_date is None else payload.show_due_date,
@@ -1304,6 +1552,11 @@ async def update_invoice(
     updates["discount_amount"] = money["discount_amount"]
     updates["tax_amount"] = money["tax_amount"]
     updates["total"] = money["total"]
+    # Payments are never rebuilt from the payload — this endpoint does not carry
+    # them — so the stored list is passed straight back through.  Without this
+    # the derived figures would go stale the moment a line changed, and a
+    # careless ``updates["payments"] = []`` would wipe real money records.
+    updates.update(_payment_figures(_stored_payments(existing), money["total"]))
     updates["project_ids"] = project_ids
     updates["project_names"] = project_names
     updates["datetime_updated"] = _now_sgt()
@@ -1344,16 +1597,172 @@ async def update_invoice_status(
 
     Any status may follow any other — marking an invoice paid and then back to
     draft is allowed, and ``void`` is not a lock.
+
+    Status and payments are **independent on purpose**.  Marking an invoice paid
+    does not require a payment record, and recording a payment does not mark it
+    paid; see the payment endpoints below.  Please do not "fix" this by deriving
+    one from the other — per the no-locking principle the owner sets the status,
+    and a deposit, a write-off or a paid-in-cash invoice would all fight a
+    derived value.
     """
     db = get_firestore_client()
-    doc_ref, _ = _fetch_invoice_ref(db, invoice_id)
+    doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
+    existing = doc.to_dict() or {}
 
-    doc_ref.update(
+    updates = {
+        "status": _validate_status(payload.status),
+        "datetime_updated": _now_sgt(),
+    }
+    # Recomputed on this write path too, so an invoice stored before payments
+    # existed gains its derived fields on any edit rather than staying without
+    # them until a payment happens to be recorded.
+    updates.update(
+        _payment_figures(_stored_payments(existing), _value_or(existing, "total", 0.0))
+    )
+    doc_ref.update(updates)
+    return _doc_to_invoice(doc_ref.get())
+
+
+@router.post(
+    "/{invoice_id}/payments",
+    response_model=InvoiceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_payment(
+    invoice_id: str,
+    payload: PaymentCreate,
+    _user: Annotated[dict, Depends(get_current_user)],
+) -> InvoiceResponse:
+    """
+    Record a payment against an invoice and return the whole updated invoice.
+
+    Two amounts are stored: ``amount_paid`` in the currency the invoice was
+    raised in, and ``amount_received`` in whatever currency the money actually
+    landed as, so FX spread and wire fees stay visible instead of inferred.  The
+    invoice's ``currency`` is snapshotted onto the payment, so re-denominating
+    the invoice later never relabels money that has already arrived.
+
+    ``received_currency`` defaults to the payout currency in invoice settings,
+    then to the invoice's own currency.
+
+    Nothing is policed: a negative amount records a refund or a correction, and
+    paying more than the total simply drives ``outstanding`` negative.  The
+    invoice **status is not touched** — recording a payment does not mark an
+    invoice paid.
+
+    - Pass ``notes="null"`` to store no note.  ``received_currency`` does *not*
+      take that sentinel and rejects it — see ``_validate_received_currency``.
+    """
+    db = get_firestore_client()
+    doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
+    existing = doc.to_dict() or {}
+
+    # Validate everything before touching the document, so a bad request 400s
+    # without leaving the invoice half-written.
+    paid_on = _validate_paid_on(payload.paid_on)
+    amount_paid = _validate_amount(payload.amount_paid, "amount_paid")
+    amount_received = _validate_amount(payload.amount_received, "amount_received")
+
+    invoice_currency = _value_or(existing, "currency", "")
+    received_currency = _resolve_received_currency(
+        payload.received_currency, get_invoice_settings(db), invoice_currency
+    )
+    notes = None if payload.notes is None else _clear_sentinel(payload.notes)
+
+    now = _now_sgt()
+    payments = _stored_payments(existing)
+    payments.append(
         {
-            "status": _validate_status(payload.status),
-            "datetime_updated": _now_sgt(),
+            "payment_id": uuid.uuid4().hex,
+            "paid_on": paid_on,
+            "amount_paid": amount_paid,
+            # Snapshot, like ``bill_to`` and a line's ``task_title``.
+            "currency": invoice_currency,
+            "amount_received": amount_received,
+            "received_currency": received_currency,
+            # ``rate`` is left to compute_payments, which always derives it.
+            "notes": notes,
+            "datetime_inserted": now,
+            "datetime_updated": now,
         }
     )
+
+    _write_payments(doc_ref, payments, _value_or(existing, "total", 0.0))
+    return _doc_to_invoice(doc_ref.get())
+
+
+@router.patch("/{invoice_id}/payments/{payment_id}", response_model=InvoiceResponse)
+async def update_payment(
+    invoice_id: str,
+    payment_id: str,
+    payload: PaymentUpdate,
+    _user: Annotated[dict, Depends(get_current_user)],
+) -> InvoiceResponse:
+    """
+    Update one payment and return the whole updated invoice.
+
+    Only fields present in the payload change; every other key on the payment —
+    including its ``currency`` snapshot and ``datetime_inserted`` — is left
+    exactly as stored.  The derived figures are recomputed from the full list
+    afterwards, and the invoice status is left alone.
+
+    - Pass ``notes="null"`` to clear the note.
+    - ``received_currency`` rejects that sentinel and ignores a blank string,
+      leaving the stored currency in place: there is no "no currency" state.
+    """
+    db = get_firestore_client()
+    doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
+    existing = doc.to_dict() or {}
+
+    payments = _stored_payments(existing)
+    index = _find_payment(payments, payment_id)
+
+    # Validate before mutating, as on create.
+    updated = dict(payments[index])
+    if payload.paid_on is not None:
+        updated["paid_on"] = _validate_paid_on(payload.paid_on)
+    if payload.amount_paid is not None:
+        updated["amount_paid"] = _validate_amount(payload.amount_paid, "amount_paid")
+    if payload.amount_received is not None:
+        updated["amount_received"] = _validate_amount(
+            payload.amount_received, "amount_received"
+        )
+    if payload.received_currency is not None:
+        # Rejects "null"; a blank means "leave it" rather than blanking the
+        # currency printed beside the money.
+        chosen = _validate_received_currency(payload.received_currency)
+        if chosen:
+            updated["received_currency"] = chosen
+    if payload.notes is not None:
+        updated["notes"] = _clear_sentinel(payload.notes)
+
+    updated["datetime_updated"] = _now_sgt()
+    payments[index] = updated
+
+    _write_payments(doc_ref, payments, _value_or(existing, "total", 0.0))
+    return _doc_to_invoice(doc_ref.get())
+
+
+@router.delete("/{invoice_id}/payments/{payment_id}", response_model=InvoiceResponse)
+async def delete_payment(
+    invoice_id: str,
+    payment_id: str,
+    _user: Annotated[dict, Depends(get_current_user)],
+) -> InvoiceResponse:
+    """
+    Remove a payment and return the whole updated invoice.
+
+    The derived figures are recomputed from what remains.  The status is not
+    touched — deleting the last payment does not un-mark a paid invoice.
+    """
+    db = get_firestore_client()
+    doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
+    existing = doc.to_dict() or {}
+
+    payments = _stored_payments(existing)
+    del payments[_find_payment(payments, payment_id)]
+
+    _write_payments(doc_ref, payments, _value_or(existing, "total", 0.0))
     return _doc_to_invoice(doc_ref.get())
 
 
