@@ -25,6 +25,11 @@ DEFAULT_SETTINGS: dict = {
     "email": "",
     "logo_url": None,
     "default_currency": "USD",
+    # The currency the owner actually receives money in, when it differs from the
+    # currency invoiced.  Empty means "not set", and the payment form falls back
+    # to the invoice's own currency rather than guessing — so this stays empty by
+    # default instead of naming a currency nobody chose.
+    "payout_currency": "",
     "default_payment_terms": "Net 14",
     "default_due_days": 14,
     "default_tax_label": "GST",
@@ -48,6 +53,11 @@ VALID_ROUNDING_DIRECTIONS = ("nearest", "up", "down")
 
 # An increment longer than a day is a typo, not a billing policy.
 MAX_ROUNDING_INCREMENT = 24.0
+
+# A currency code: the ISO-4217 alphabetic codes are three letters, with a
+# little room either side for the shorter and longer things people actually
+# type.  Letters only — a code with a digit or a space in it is a typo.
+CURRENCY_CODE_RE = re.compile(r"^[A-Z]{2,5}$")
 
 # The singleton document holding tracker defaults.
 TRACKER_SETTINGS_DOC_ID = "tracker"
@@ -91,6 +101,7 @@ class InvoiceSettingsUpdate(BaseModel):
     email: Optional[str] = None
     logo_url: Optional[str] = None
     default_currency: Optional[str] = None
+    payout_currency: Optional[str] = None
     default_payment_terms: Optional[str] = None
     default_due_days: Optional[int] = None
     default_tax_label: Optional[str] = None
@@ -109,6 +120,7 @@ class InvoiceSettingsResponse(BaseModel):
     email: str
     logo_url: Optional[str]
     default_currency: str
+    payout_currency: str
     default_payment_terms: str
     default_due_days: int
     default_tax_label: str
@@ -153,6 +165,11 @@ def _data_to_settings(data: dict) -> InvoiceSettingsResponse:
         logo_url=data.get("logo_url", DEFAULT_SETTINGS["logo_url"]),
         default_currency=data.get(
             "default_currency", DEFAULT_SETTINGS["default_currency"]
+        ),
+        # Settings documents written before the payout currency existed carry no
+        # key, so this falls back to the empty default rather than 500ing.
+        payout_currency=data.get(
+            "payout_currency", DEFAULT_SETTINGS["payout_currency"]
         ),
         default_payment_terms=data.get(
             "default_payment_terms", DEFAULT_SETTINGS["default_payment_terms"]
@@ -227,6 +244,46 @@ def _validate_rounding_increment(value: float) -> float:
             ),
         )
     return round(float(value), 4)
+
+
+def _validate_payout_currency(value: str) -> str:
+    """
+    Normalise a payout currency and return it trimmed and uppercased.
+
+    Empty is legal and is how the field is cleared: it means "not set", and the
+    payment form then falls back to the invoice's own currency instead of
+    guessing at the owner's.
+
+    The ``"null"`` sentinel used elsewhere in the repo is refused outright, in
+    any case.  A currency is printed on a client-facing document, so a field
+    storing the literal string ``"null"`` would put that word in front of a
+    client — the error says to clear it with an empty value instead of quietly
+    reinterpreting what was sent.
+    """
+    normalised = value.strip().upper()
+
+    if normalised == "":
+        return ""
+
+    if normalised == "NULL":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Payout currency cannot be the word 'null'. "
+                "Send an empty value to clear it."
+            ),
+        )
+
+    if not CURRENCY_CODE_RE.match(normalised):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Payout currency must be 2-5 letters, such as 'PHP', "
+                "or empty to clear it."
+            ),
+        )
+
+    return normalised
 
 
 def get_invoice_settings(db) -> dict:
@@ -392,6 +449,8 @@ async def update_settings(
 
     - Creates the document with defaults first if it does not exist yet.
     - Pass ``logo_url="null"`` to clear the logo.
+    - Pass ``payout_currency=""`` to clear the payout currency; the ``"null"``
+      sentinel is refused there, since a currency prints on a client document.
     - Only fields present in the payload are updated.
 
     Changing these defaults never rewrites existing invoices — issuer details
@@ -411,6 +470,15 @@ async def update_settings(
     if payload.hours_rounding_direction is not None:
         _validate_rounding_direction(payload.hours_rounding_direction)
 
+    # Validated in the same place, and for the same reason: a payout currency
+    # that failed the check must not leave a half-written document behind.  This
+    # one is cleared with ``""``, never with the ``"null"`` sentinel.
+    payout_currency = (
+        None
+        if payload.payout_currency is None
+        else _validate_payout_currency(payload.payout_currency)
+    )
+
     db = get_firestore_client()
     doc_ref = db.collection("settings").document(SETTINGS_DOC_ID)
     get_invoice_settings(db)  # Ensure the document exists before updating.
@@ -423,6 +491,7 @@ async def update_settings(
         "address",
         "email",
         "default_currency",
+        "payout_currency",
         "default_payment_terms",
         "default_due_days",
         "default_tax_label",
@@ -440,6 +509,10 @@ async def update_settings(
     # Store the quantised increment, not the number as pasted.
     if increment is not None:
         updates["hours_rounding_increment"] = increment
+
+    # Likewise store the normalised currency, not the casing as typed.
+    if payout_currency is not None:
+        updates["payout_currency"] = payout_currency
 
     if payload.logo_url is not None:
         updates["logo_url"] = (

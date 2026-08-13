@@ -118,6 +118,112 @@ def compute_money(
 
 
 # ---------------------------------------------------------------------------
+# Payments
+# ---------------------------------------------------------------------------
+#
+# What the client was billed and what actually landed in the bank are two
+# different numbers in two different currencies, and the gap between them — FX
+# spread, wire fees, an underpayment — is the thing worth seeing.  Same rules as
+# the rest of the money in this file: Decimal from ``str``, quantise each figure
+# before summing, and never silently rewrite what was entered.
+
+# Rates are not money.  Six places keeps a rate like 56.803571 meaningful, where
+# quantising to cents would flatten it to 56.80 and lose the difference between
+# two payments that settled days apart.
+_RATE_PLACES = Decimal("0.000001")
+
+
+def _quantize_rate(value: Decimal) -> Decimal:
+    """Quantise an FX rate to 6 dp using ROUND_HALF_UP."""
+    return value.quantize(_RATE_PLACES, rounding=ROUND_HALF_UP)
+
+
+def compute_payments(
+    payments: list[dict],
+    total: Optional[float] = None,
+) -> dict:
+    """
+    Recompute the payment figures on an invoice.
+
+    Every stored payment carries two amounts: ``amount_paid`` in the currency the
+    invoice was raised in, and ``amount_received`` in whatever currency the money
+    actually arrived as.  Each is quantised to 2 dp *before* being summed, so the
+    per-payment figures on screen always re-add to the totals beside them.
+
+    Received amounts are totalled **per currency**.  Adding 68,400 PHP to 900 SGD
+    would produce a number that means nothing, so a mixed-currency invoice gets a
+    total for each currency rather than one fictional sum.  ``effective_rate`` is
+    likewise only reported when there is exactly one received currency to have a
+    rate against.
+
+    ``outstanding`` is deliberately not clamped.  An overpayment yields a
+    negative figure and an unpaid invoice yields the full total; the server is a
+    calculator, and rewriting either into zero would hide a real discrepancy —
+    the same reasoning as the unclamped over-discount.
+
+    Args:
+        payments: Payment dicts carrying ``amount_paid``, ``amount_received`` and
+            ``received_currency``. Every other key is preserved untouched.
+        total: The invoice total, used only to derive ``outstanding``.
+
+    Returns:
+        A dict with the recomputed ``payments`` plus ``amount_paid``,
+        ``received_totals``, ``outstanding`` and ``effective_rate``.
+    """
+    computed: list[dict] = []
+    paid_total = Decimal("0")
+    # Insertion-ordered so the currencies come out in the order first paid,
+    # which is stable across recomputation.
+    received_by_currency: dict[str, Decimal] = {}
+
+    for payment in payments:
+        amount_paid = _quantize(_to_decimal(payment.get("amount_paid")))
+        amount_received = _quantize(_to_decimal(payment.get("amount_received")))
+        currency = (payment.get("received_currency") or "").strip()
+
+        new_payment = dict(payment)
+        new_payment["amount_paid"] = float(amount_paid)
+        new_payment["amount_received"] = float(amount_received)
+        # Per-payment rate, so a payment that settled at a bad rate is visible
+        # on its own row rather than only in the average.
+        new_payment["rate"] = (
+            float(_quantize_rate(amount_received / amount_paid))
+            if amount_paid != 0
+            else None
+        )
+        computed.append(new_payment)
+
+        paid_total += amount_paid
+        received_by_currency[currency] = (
+            received_by_currency.get(currency, Decimal("0")) + amount_received
+        )
+
+    paid_total = _quantize(paid_total)
+
+    received_totals = [
+        {"currency": currency, "amount": float(_quantize(amount))}
+        for currency, amount in received_by_currency.items()
+    ]
+
+    # One currency and something actually paid, or there is no meaningful rate
+    # to quote.  None is the honest answer, not 0.
+    effective_rate: Optional[float] = None
+    if len(received_by_currency) == 1 and paid_total != 0:
+        only_total = next(iter(received_by_currency.values()))
+        effective_rate = float(_quantize_rate(_quantize(only_total) / paid_total))
+
+    outstanding = _quantize(_to_decimal(total) - paid_total)
+
+    return {
+        "payments": computed,
+        "amount_paid": float(paid_total),
+        "received_totals": received_totals,
+        "outstanding": float(outstanding),
+        "effective_rate": effective_rate,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Invoice numbering
 # ---------------------------------------------------------------------------
 
