@@ -1,6 +1,16 @@
-import type { ExpoConfig } from 'expo/config';
+// Plain JS rather than TypeScript on purpose.
+//
+// eas-cli cannot read an `app.config.ts` here — it throws "Cannot read
+// properties of undefined (reading 'CommonJS')" from its own bundled TypeScript
+// loader, which breaks both `eas init` and `eas build`. `expo` itself reads the
+// TS form fine, so this is an eas-cli limitation, not a project one. Downgrading
+// the project's own TypeScript does not help: the CLI uses its own copy.
+//
+// The JSDoc annotation below keeps the editor's autocomplete and type checking
+// on this file, so almost nothing is lost.
 
-const config: ExpoConfig = {
+/** @type {import('expo/config').ExpoConfig} */
+const config = {
   name: 'Vibe Tracker',
   slug: 'vibe-coding-tracker',
   version: '1.0.0',
@@ -71,10 +81,15 @@ const config: ExpoConfig = {
     typedRoutes: true,
     reactCompiler: true,
   },
+  // Set by hand: `eas init` refuses to write into a dynamic config (any
+  // app.config.js/ts), so it prints the id and stops. It is not a secret — it
+  // identifies the project on expo.dev, nothing more.
+  owner: 'lalala0095',
   extra: {
-    // TODO: set by `eas init`
-    // eas: { projectId: '...' },
+    eas: {
+      projectId: 'f900e390-b3aa-4dce-82e4-ee2e3f3dec07',
+    },
   },
 };
 
-export default config;
+module.exports = config;
