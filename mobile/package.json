@@ -7,7 +7,9 @@
     "start": "expo start",
     "android": "expo start --android",
     "typecheck": "tsc --noEmit",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "test:lib": "node --experimental-strip-types --no-warnings src/lib/sgt.test.mts",
+    "verify": "npm run typecheck && npm run test:lib"
   },
   "dependencies": {
     "@react-native-community/datetimepicker": "9.1.0",
