@@ -24,6 +24,9 @@ interface MoreRow {
 }
 
 const ROWS: MoreRow[] = [
+  // Directly above Time Entries: the two are the same kind of thing seen from
+  // either end — a block of work, and the hours that come out of it.
+  { label: 'Trackers', hint: 'Every work block, running and finished.', href: '/trackers' },
   // "Time Entries", never "Sessions" — that word means `goals` on the web
   // (CLAUDE.md), which this app does not ship.
   { label: 'Time Entries', hint: 'Hours logged against tasks.', href: '/entries' },
