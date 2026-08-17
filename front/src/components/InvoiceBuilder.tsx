@@ -4,7 +4,7 @@ import type {
   InvoiceLineSource,
 } from '../types';
 import { previewInvoice, createInvoice } from '../api';
-import { computeMoney, formatMoney, type DiscountType } from '../lib/money';
+import { computeMoney, formatHours, formatMoney, type DiscountType } from '../lib/money';
 import InvoiceLineTable from './InvoiceLineTable';
 import Modal, { MODAL_CANCEL_BUTTON, MODAL_PRIMARY_BUTTON, ButtonSpinner } from './Modal';
 
@@ -431,13 +431,16 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
       footer={
         <>
           {/* Counts what will be billed, not what is on screen — an unticked
-              line is still listed and still editable. */}
+              line is still listed and still editable. Hours come from the same
+              `footerMoney` as the subtotal, so both describe the invoice about
+              to be created. */}
           <span className="text-xs text-slate-500">
             {lines.length > 0
               ? `${includedLines.length} of ${lines.length} line${lines.length !== 1 ? 's' : ''}` +
                 (trackerLineCount > 0
                   ? ` (${trackerLineCount} from ${trackerLineCount === 1 ? 'a tracker' : 'trackers'})`
                   : '') +
+                ` · Total hours: ${formatHours(footerMoney.total_hours)}` +
                 ` · ${formatMoney(footerMoney.subtotal, currency)} before discount and tax`
               : 'Server assigns the invoice number on save.'}
           </span>

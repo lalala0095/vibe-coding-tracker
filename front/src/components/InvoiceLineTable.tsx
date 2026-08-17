@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { InvoiceLine, HoursRoundingDirection } from '../types';
-import { computeMoney, formatMoney, type DiscountType } from '../lib/money';
+import { computeMoney, formatHours, formatMoney, type DiscountType } from '../lib/money';
 import { moveLine, moveSubItem, moveSubItemToLine, moveItem } from '../lib/reorder';
 import RoundHoursModal from './RoundHoursModal';
 
@@ -634,6 +634,14 @@ export default function InvoiceLineTable({
       {/* ── Totals ── */}
       <div className="flex justify-end">
         <div className="w-full sm:w-80 flex flex-col gap-1.5 text-sm">
+          {/* Context for the money below, not a money row of its own — so it
+              reads a shade dimmer than the figures it explains. Comes off
+              `money`, which covers the billed lines only, so it matches the
+              invoice about to be created rather than every row on screen. */}
+          <div className="flex justify-between text-slate-400">
+            <span>Total hours</span>
+            <span className="tabular-nums text-slate-400">{formatHours(money.total_hours)}</span>
+          </div>
           <div className="flex justify-between text-slate-400">
             <span>Subtotal</span>
             <span className="tabular-nums text-slate-200">{formatMoney(money.subtotal, currency)}</span>

@@ -164,6 +164,9 @@ export interface MoneyTotals<T> {
   discount_amount: number;
   tax_amount: number;
   total: number;
+  // Billed hours, summed the same way the money is: each line quantised to 2 dp
+  // before being added, so the total re-adds from the figures shown above it.
+  total_hours: number;
 }
 
 /**
@@ -184,6 +187,7 @@ export function computeMoney<T extends { hours: number; rate: number; amount: nu
 ): MoneyTotals<T> {
   const computedLines: T[] = [];
   let subtotal: Dec = ZERO;
+  let totalHours: Dec = ZERO;
 
   for (const line of lines) {
     const hours = quantize(toDec(line.hours));
@@ -198,9 +202,11 @@ export function computeMoney<T extends { hours: number; rate: number; amount: nu
     });
 
     subtotal = addDec(subtotal, amount);
+    totalHours = addDec(totalHours, hours);
   }
 
   subtotal = quantize(subtotal);
+  totalHours = quantize(totalHours);
 
   let discount: Dec;
   if (discountType === 'percent') {
@@ -221,7 +227,37 @@ export function computeMoney<T extends { hours: number; rate: number; amount: nu
     discount_amount: decToNumber(discount),
     tax_amount: decToNumber(tax),
     total: decToNumber(total),
+    total_hours: decToNumber(totalHours),
   };
+}
+
+/**
+ * Derive `total_hours` from an invoice's own stored lines. Mirrors
+ * `total_hours_from_lines` in `back/services/invoice_service.py`.
+ *
+ * For invoices written before the field existed. Reading it off the lines the
+ * invoice already carries beats defaulting to 0, which would state a confident
+ * and wrong "0.00 h" on a real invoice.
+ */
+/**
+ * An hours figure for display: `"12.25 h"`.
+ *
+ * `toFixed` is safe *here* specifically because the value arriving has already
+ * been quantised to 2 dp by `computeMoney` or by the server. `toFixed` must
+ * never be used to do the rounding itself — `(1.005).toFixed(2)` is `"1.00"`,
+ * the same half-cent flaw that `Decimal(1.005)` has in Python (§5 rule 1).
+ */
+export function formatHours(hours: number | null | undefined): string {
+  const value = typeof hours === 'number' && Number.isFinite(hours) ? hours : 0;
+  return `${value.toFixed(2)} h`;
+}
+
+export function totalHoursFromLines(lines: Array<{ hours: number }>): number {
+  let total: Dec = ZERO;
+  for (const line of lines ?? []) {
+    total = addDec(total, quantize(toDec(line.hours)));
+  }
+  return decToNumber(quantize(total));
 }
 
 export type HoursRoundingDirection = 'nearest' | 'up' | 'down';

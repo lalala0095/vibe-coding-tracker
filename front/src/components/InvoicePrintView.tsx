@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { getInvoice } from '../api';
-import { formatMoney, roundHours } from '../lib/money';
+import { formatHours, formatMoney, roundHours } from '../lib/money';
 import type { Invoice, InvoiceStatus } from '../types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,10 +60,11 @@ const STATUS_STYLES: Record<InvoiceStatus, string> = {
 /**
  * A print-ready A4 invoice document.
  *
- * Renders the invoice exactly as stored. `amount`, `subtotal`, `discount_amount`,
- * `tax_amount` and `total` are server-computed and snapshotted, as are `bill_to`
- * and `issued_by` — none of them are recomputed or re-resolved here, so a
- * historical invoice always prints the figures it was saved with.
+ * Renders the invoice exactly as stored. `amount`, `subtotal`, `total_hours`,
+ * `discount_amount`, `tax_amount` and `total` are server-computed and
+ * snapshotted, as are `bill_to` and `issued_by` — none of them are recomputed or
+ * re-resolved here, so a historical invoice always prints the figures it was
+ * saved with.
  *
  * The sheet is deliberately light-on-white on screen as well as on paper, so the
  * preview inside the dark app shell matches what actually comes out of the
@@ -244,6 +245,18 @@ export function InvoicePrintView({ invoice }: { invoice: Invoice }) {
       {/* Totals ------------------------------------------------------------- */}
       <section className="invoice-break-avoid mt-6 flex justify-end">
         <dl className="w-full max-w-xs space-y-1 text-sm">
+          {/* The stored figure, printed verbatim like every other total here.
+              Not summed off `invoice.lines` and not passed through
+              `computeMoney`: the server resolves it on write, including for
+              invoices saved before the field existed, so a historical invoice
+              prints the hours it was saved with. `formatHours` only formats. */}
+          <div className="flex justify-between gap-6">
+            <dt className="text-slate-600">Total hours</dt>
+            <dd className="tabular-nums text-slate-700">
+              {formatHours(invoice.total_hours)}
+            </dd>
+          </div>
+
           <div className="flex justify-between gap-6">
             <dt className="text-slate-600">Subtotal</dt>
             <dd className="tabular-nums text-slate-900">
