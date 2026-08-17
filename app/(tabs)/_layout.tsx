@@ -87,10 +87,13 @@ export default function TabsLayout() {
     >
       <Tabs.Screen name="now" options={{ title: 'Now' }} />
       <Tabs.Screen name="tasks" options={{ title: 'Tasks' }} />
-      {/* Time Entries and Clients & Projects live behind this one as pushed
-          stack routes. Three tabs plus an overflow shelf beats six tabs, and it
-          leaves room for Trackers and Invoices to arrive without another
-          re-shuffle. */}
+      {/* Promoted to a tab rather than left behind More: invoicing is the point
+          of tracking the hours, and it is the one thing here you come to the app
+          specifically to do. Four is still comfortable at this label width. */}
+      <Tabs.Screen name="invoices" options={{ title: 'Invoices' }} />
+      {/* Trackers, Time Entries and Clients & Projects live behind this one as
+          pushed stack routes. Four tabs plus an overflow shelf beats seven
+          tabs. */}
       <Tabs.Screen name="more" options={{ title: 'More' }} />
     </Tabs>
   );
