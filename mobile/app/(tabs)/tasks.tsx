@@ -1,27 +1,67 @@
 // Tasks (MobileAppPlan §6.3).
 //
 // The data-owning screen: one fetch, filters and the derived row list, the
-// optimistic status cycle, and quick-add. Presentation lives in
+// optimistic status cycle, and every write. Presentation lives in
 // `src/screens/tasks/`.
 //
-// Out of scope in v1, deliberately: attachments (`createTask` takes no files),
-// delete (`src/api.ts` exposes none), sub-task creation and re-parenting, and
-// paste-bulk — that one belongs to the tracker's Add-tasks flow, where the
-// paste parser already lives.
+// ── One modal at a time ──────────────────────────────────────────────────────
+//
+// Opening a task, editing it, adding a sub-task to it and deleting it are four
+// panes of one flow, so they are one `view` state rather than four booleans —
+// which is also what keeps a second `Modal` from being presented over a first.
+// The state holds an **id**, never the task object: a status cycle or a save
+// replaces the row, and a pane holding the old object would go stale.
+//
+// ── Clearing conventions on the wire ─────────────────────────────────────────
+//
+// `TaskForm` emits plain values, `null` meaning "cleared". The mapping onto the
+// API happens here and differs by verb:
+//
+//   PUT /tasks/{id}   `parent_task_id` and `due_date` are cleared with the
+//                     literal string `"null"` (`back/routers/tasks.py:400,410`
+//                     lower-cases and compares exactly that). A JSON null is
+//                     not it, an empty string is not it, and omitting the key
+//                     leaves the stored value untouched — which is why every
+//                     field is sent on every save.
+//   POST /tasks       there is nothing to clear on a document that does not
+//                     exist yet, so an unset field is simply omitted.
+//
+// Out of scope, deliberately: attachments (`createTask`/`updateTask` in
+// `src/api.ts` take no files) and paste-bulk — that one belongs to the tracker's
+// Add-tasks flow, where the paste parser already lives.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { FlatList, RefreshControl, Text, View } from 'react-native';
 
-import { apiErrorMessage, createTask, getClients, getProjects, getTasks, updateTask } from '@/api';
+import {
+  apiErrorMessage,
+  createTask,
+  deleteTask,
+  getClients,
+  getProjects,
+  getTasks,
+  updateTask,
+} from '@/api';
 import { Button, EmptyState, ErrorNote, LoadingBlock, Screen } from '@/components';
 import { todaySgt } from '@/lib/sgt';
+import DeleteTaskSheet from '@/screens/tasks/DeleteTaskSheet';
 import QuickAddSheet from '@/screens/tasks/QuickAddSheet';
+import TaskDetailSheet from '@/screens/tasks/TaskDetailSheet';
 import TaskFilters from '@/screens/tasks/TaskFilters';
+import TaskForm, { type TaskFormValues } from '@/screens/tasks/TaskForm';
 import TaskRow from '@/screens/tasks/TaskRow';
 import { buildTaskRows, type StatusFilter, type TaskRowItem } from '@/screens/tasks/rows';
 import { NEXT_STATUS } from '@/screens/tasks/taskMeta';
 import { theme } from '@/theme';
 import type { Client, CreateTaskPayload, Project, Task, TaskStatus } from '@/types';
+
+/** The one open pane, if any. Ids, not objects — see the header. */
+type TaskView =
+  | { kind: 'quick-add' }
+  | { kind: 'detail'; taskId: string }
+  | { kind: 'edit'; taskId: string }
+  | { kind: 'sub-task'; parentId: string }
+  | { kind: 'delete'; taskId: string };
 
 export default function TasksScreen() {
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -39,7 +79,7 @@ export default function TasksScreen() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [status, setStatus] = useState<StatusFilter>('all');
 
-  const [quickAddOpen, setQuickAddOpen] = useState(false);
+  const [view, setView] = useState<TaskView | null>(null);
 
   // ── Data ────────────────────────────────────────────────────────────────────
 
@@ -110,6 +150,19 @@ export default function TasksScreen() {
 
   const hasFilters = clientId !== null || projectId !== null || status !== 'all';
 
+  /**
+   * Relax whichever filters would hide a task that was just written.
+   *
+   * Saving something and watching the list not change reads as a failed save,
+   * so a write that lands outside the current narrowing widens it rather than
+   * leaving the screen looking untouched.
+   */
+  const revealTask = useCallback((task: Task) => {
+    setStatus((current) => (current === 'all' || current === task.status ? current : 'all'));
+    setClientId((current) => (current === null || current === task.client_id ? current : null));
+    setProjectId((current) => (current === null || current === task.project_id ? current : null));
+  }, []);
+
   const rows = useMemo<TaskRowItem[]>(
     () => buildTaskRows(tasks, { clientId, projectId, status }),
     [tasks, clientId, projectId, status],
@@ -159,18 +212,70 @@ export default function TasksScreen() {
     [cycleStatus],
   );
 
-  // ── Quick add ───────────────────────────────────────────────────────────────
+  // ── Writes ──────────────────────────────────────────────────────────────────
 
-  const handleCreate = useCallback(async (payload: CreateTaskPayload) => {
-    const created = await createTask(payload);
-    setTasks((current) => [created, ...current]);
-    // Filters that would hide what was just created get relaxed rather than
-    // leaving the screen looking like nothing happened.
-    setStatus((current) => (current === 'all' || current === created.status ? current : 'all'));
-    setClientId((current) => (current === null || current === created.client_id ? current : null));
-    setProjectId((current) =>
-      current === null || current === created.project_id ? current : null,
-    );
+  const handleQuickCreate = useCallback(
+    async (payload: CreateTaskPayload) => {
+      const created = await createTask(payload);
+      setTasks((current) => [created, ...current]);
+      revealTask(created);
+    },
+    [revealTask],
+  );
+
+  /** A sub-task: the parent and its project come pre-filled, both editable. */
+  const handleCreateSubTask = useCallback(
+    async (values: TaskFormValues) => {
+      const created = await createTask({
+        title: values.title,
+        // Optional fields are omitted rather than cleared: nothing exists yet
+        // to clear, and `POST /tasks` reads a falsy value as "not set".
+        ...(values.description ? { description: values.description } : {}),
+        project_id: values.project_id,
+        ...(values.parent_task_id ? { parent_task_id: values.parent_task_id } : {}),
+        status: values.status,
+        priority: values.priority,
+        ...(values.due_date ? { due_date: values.due_date } : {}),
+      });
+      setTasks((current) => [created, ...current]);
+      revealTask(created);
+      setView(null);
+    },
+    [revealTask],
+  );
+
+  const handleUpdate = useCallback(
+    async (task: Task, values: TaskFormValues) => {
+      const updated = await updateTask(task.id, {
+        title: values.title,
+        // `description` is a plain string server-side, not a nullable field:
+        // "" is its cleared state, and no `"null"` is involved.
+        description: values.description,
+        project_id: values.project_id,
+        // The clearing convention. `"null"` is the literal string the server
+        // compares against; a JSON null would arrive as the four characters
+        // "None" through multipart, and omitting the key would leave the
+        // existing parent in place.
+        parent_task_id: values.parent_task_id ?? 'null',
+        status: values.status,
+        priority: values.priority,
+        due_date: values.due_date ?? 'null',
+      });
+      setTasks((current) => current.map((row) => (row.id === updated.id ? updated : row)));
+      revealTask(updated);
+      setView(null);
+    },
+    [revealTask],
+  );
+
+  /**
+   * No cascade, by design server-side. Sub-tasks and time entries survive this;
+   * `DeleteTaskSheet` is where that is spelled out before it happens.
+   */
+  const handleDelete = useCallback(async (task: Task) => {
+    await deleteTask(task.id);
+    setTasks((current) => current.filter((row) => row.id !== task.id));
+    setView(null);
   }, []);
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -178,6 +283,18 @@ export default function TasksScreen() {
   const today = todaySgt();
   // With a project pinned, every row would repeat the same breadcrumb.
   const showBreadcrumb = projectId === null;
+
+  const openTask = useCallback((task: Task) => {
+    setView({ kind: 'detail', taskId: task.id });
+  }, []);
+
+  // Re-read from the list on every render: the pane must follow a status cycle
+  // or a save, and must close by itself if its task is deleted underneath it.
+  const viewedTask = useMemo<Task | null>(() => {
+    if (!view || view.kind === 'quick-add') return null;
+    const id = view.kind === 'sub-task' ? view.parentId : view.taskId;
+    return tasks.find((task) => task.id === id) ?? null;
+  }, [view, tasks]);
 
   const header = (
     <View className="gap-3 border-b border-slate-800 px-4 pb-3 pt-2">
@@ -202,7 +319,7 @@ export default function TasksScreen() {
 
   const footer = (
     <View className="border-t border-slate-800 px-4 py-3">
-      <Button label="New task" onPress={() => setQuickAddOpen(true)} testID="tasks-new" />
+      <Button label="New task" onPress={() => setView({ kind: 'quick-add' })} testID="tasks-new" />
     </View>
   );
 
@@ -218,7 +335,7 @@ export default function TasksScreen() {
       title="No tasks yet"
       subtitle="Capture one now and sort out the details later."
       actionLabel="New task"
-      onAction={() => setQuickAddOpen(true)}
+      onAction={() => setView({ kind: 'quick-add' })}
     />
   );
 
@@ -254,6 +371,7 @@ export default function TasksScreen() {
               showBreadcrumb={showBreadcrumb}
               today={today}
               onCycleStatus={handleCycleStatus}
+              onOpen={openTask}
             />
           )}
           contentContainerStyle={{ flexGrow: 1, padding: 16, gap: 10 }}
@@ -273,12 +391,56 @@ export default function TasksScreen() {
       )}
 
       <QuickAddSheet
-        open={quickAddOpen}
+        open={view?.kind === 'quick-add'}
         projects={projects}
         defaultProjectId={projectId}
-        onClose={() => setQuickAddOpen(false)}
-        onCreate={handleCreate}
+        onClose={() => setView(null)}
+        onCreate={handleQuickCreate}
       />
+
+      {view?.kind === 'detail' ? (
+        <TaskDetailSheet
+          task={viewedTask}
+          tasks={tasks}
+          today={today}
+          onCycleStatus={handleCycleStatus}
+          onEdit={(task) => setView({ kind: 'edit', taskId: task.id })}
+          onAddSubTask={(task) => setView({ kind: 'sub-task', parentId: task.id })}
+          onDelete={(task) => setView({ kind: 'delete', taskId: task.id })}
+          onClose={() => setView(null)}
+        />
+      ) : null}
+
+      {view?.kind === 'edit' && viewedTask ? (
+        <TaskForm
+          task={viewedTask}
+          parent={null}
+          tasks={tasks}
+          projects={projects}
+          onSubmit={(values) => handleUpdate(viewedTask, values)}
+          onCancel={() => setView(null)}
+        />
+      ) : null}
+
+      {view?.kind === 'sub-task' && viewedTask ? (
+        <TaskForm
+          task={null}
+          parent={viewedTask}
+          tasks={tasks}
+          projects={projects}
+          onSubmit={handleCreateSubTask}
+          onCancel={() => setView(null)}
+        />
+      ) : null}
+
+      {view?.kind === 'delete' ? (
+        <DeleteTaskSheet
+          task={viewedTask}
+          tasks={tasks}
+          onConfirm={handleDelete}
+          onClose={() => setView(null)}
+        />
+      ) : null}
     </Screen>
   );
 }

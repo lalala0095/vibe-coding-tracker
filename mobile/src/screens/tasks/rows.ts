@@ -5,9 +5,11 @@
 // a round trip per tap for data already in hand, so the tree is assembled here
 // from the single response.
 //
-// Sub-tasks are **shown, not managed** (MobileAppPlan §6.3): they render
-// indented under their parent, and nothing in this app re-parents them or
-// creates one.
+// Sub-tasks render indented under their parent. They are now also *managed* —
+// created, re-parented and deleted — so this file additionally owns
+// `descendantIds`, the cycle guard the parent picker filters with. The server
+// stores whatever `parent_task_id` it is given and checks nothing, so the loop
+// has to be refused here or not at all.
 
 import { parseSgt } from '@/lib/sgt';
 import type { Task, TaskStatus } from '@/types';
@@ -95,4 +97,49 @@ export function buildTaskRows(tasks: Task[], filters: TaskFilterState): TaskRowI
 
   for (const root of roots) visit(root, 0);
   return rows;
+}
+
+/**
+ * Every task below `rootId`, at any depth.
+ *
+ * Used for two things, both of which need the *whole* subtree rather than the
+ * five levels the list renders:
+ *
+ *   - the parent picker, which must offer neither the task itself nor anything
+ *     under it — `parent_task_id` self-nests and the server accepts a loop
+ *     without complaint, so `A → B → A` is stored happily and then hangs
+ *     every reader of the tree;
+ *   - the delete confirmation, which counts what it is about to strand.
+ *
+ * `seen` makes this terminate on data that is *already* looped, which is a
+ * state the API can return today even though this app will not create it.
+ */
+export function descendantIds(tasks: Task[], rootId: string): Set<string> {
+  const childrenOf = new Map<string, string[]>();
+  for (const task of tasks) {
+    const parentId = task.parent_task_id;
+    if (!parentId || parentId === task.id) continue;
+    const siblings = childrenOf.get(parentId);
+    if (siblings) siblings.push(task.id);
+    else childrenOf.set(parentId, [task.id]);
+  }
+
+  const seen = new Set<string>();
+  const stack = [rootId];
+  while (stack.length > 0) {
+    const id = stack.pop() as string;
+    for (const childId of childrenOf.get(id) ?? []) {
+      // The root itself can be reached again only through an existing loop;
+      // it is not its own descendant, and re-entering it would not terminate.
+      if (childId === rootId || seen.has(childId)) continue;
+      seen.add(childId);
+      stack.push(childId);
+    }
+  }
+  return seen;
+}
+
+/** The tasks whose stored `parent_task_id` points straight at `taskId`. */
+export function directChildren(tasks: Task[], taskId: string): Task[] {
+  return tasks.filter((task) => task.parent_task_id === taskId && task.id !== taskId);
 }
