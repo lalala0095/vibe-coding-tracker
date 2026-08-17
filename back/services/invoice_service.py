@@ -75,12 +75,20 @@ def compute_money(
         discount_value: Percentage or absolute amount, per ``discount_type``.
         tax_percent: Tax rate applied to the discounted subtotal.
 
+    ``total_hours`` is the sum of the billed hours. It follows the same rule as
+    the money: each line is quantised to 2 dp *before* being added, so the total
+    always re-adds from the per-line figures printed above it. It is stored
+    rather than derived at render time for the same reason every other figure
+    here is — an invoice is a record of what was billed, and
+    ``InvoicePrintView`` must be able to print it verbatim.
+
     Returns:
         A dict with the recomputed ``lines`` plus ``subtotal``,
-        ``discount_amount``, ``tax_amount``, and ``total``.
+        ``discount_amount``, ``tax_amount``, ``total``, and ``total_hours``.
     """
     computed_lines: list[dict] = []
     subtotal = Decimal("0")
+    total_hours = Decimal("0")
 
     for line in lines:
         hours = _quantize(_to_decimal(line.get("hours")))
@@ -94,8 +102,10 @@ def compute_money(
         computed_lines.append(new_line)
 
         subtotal += amount
+        total_hours += hours
 
     subtotal = _quantize(subtotal)
+    total_hours = _quantize(total_hours)
 
     if discount_type == "percent":
         discount_amount = _quantize(subtotal * _to_decimal(discount_value) / Decimal("100"))
@@ -114,7 +124,26 @@ def compute_money(
         "discount_amount": float(discount_amount),
         "tax_amount": float(tax_amount),
         "total": float(total),
+        "total_hours": float(total_hours),
     }
+
+
+def total_hours_from_lines(lines: list[dict]) -> float:
+    """
+    Derive ``total_hours`` from an invoice's own stored lines.
+
+    For invoices written before ``total_hours`` existed. Defaulting the missing
+    field to 0.0 would print a confident, wrong "0.00 h" on a real invoice;
+    reading it off the lines that invoice already carries gives the true figure.
+
+    This is not re-resolving anything live — the lines are part of the invoice's
+    own snapshot, so the answer cannot drift the way looking a task or a rate up
+    again would.
+    """
+    total = Decimal("0")
+    for line in lines or []:
+        total += _quantize(_to_decimal(line.get("hours")))
+    return float(_quantize(total))
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ from services.invoice_service import (
     build_issued_by,
     compute_money,
     compute_payments,
+    total_hours_from_lines,
 )
 from services.rate_service import resolve_currency, resolve_rate
 
@@ -178,6 +179,7 @@ class InvoiceResponse(BaseModel):
     currency: str
     lines: list[InvoiceLineResponse]
     subtotal: float
+    total_hours: float
     discount_type: Optional[str]
     discount_value: float
     discount_amount: float
@@ -244,6 +246,7 @@ class InvoicePreviewResponse(BaseModel):
     period_end: str
     lines: list[InvoicePreviewLine]
     subtotal: float
+    total_hours: float
     running_entry_count: int
     claimed_entry_count: int
     tracker_line_count: int = 0
@@ -756,6 +759,7 @@ def _doc_to_preview_line(data: dict) -> InvoicePreviewLine:
 
 def _doc_to_invoice(doc) -> InvoiceResponse:
     data = doc.to_dict()
+    stored_lines = _value_or(data, "lines", [])
     return InvoiceResponse(
         id=doc.id,
         invoice_number=_value_or(data, "invoice_number", ""),
@@ -769,8 +773,16 @@ def _doc_to_invoice(doc) -> InvoiceResponse:
         period_start=data.get("period_start"),
         period_end=data.get("period_end"),
         currency=_value_or(data, "currency", "USD"),
-        lines=[_doc_to_line(line) for line in _value_or(data, "lines", [])],
+        lines=[_doc_to_line(line) for line in stored_lines],
         subtotal=_value_or(data, "subtotal", 0.0),
+        # Not defaulted to 0.0.  An invoice written before this field existed
+        # would then print a confident, wrong "0.00 h"; re-adding its own stored
+        # lines gives the true figure.  That is not re-resolving live data — the
+        # lines are part of the invoice's snapshot — so the answer cannot drift.
+        # ``_value_or`` is the right helper because it fires only on absent-or-
+        # null: an invoice genuinely billing zero hours holds a stored 0.0, which
+        # is not None and so is preserved rather than being re-derived.
+        total_hours=_value_or(data, "total_hours", total_hours_from_lines(stored_lines)),
         discount_type=data.get("discount_type"),
         discount_value=_value_or(data, "discount_value", 0.0),
         discount_amount=_value_or(data, "discount_amount", 0.0),
@@ -1307,6 +1319,7 @@ async def preview_invoice(
         period_end=payload.period_end,
         lines=[_doc_to_preview_line(line) for line in money["lines"]],
         subtotal=money["subtotal"],
+        total_hours=money["total_hours"],
         running_entry_count=running_entry_count,
         claimed_entry_count=sum(line["claimed_entry_count"] for line in money["lines"]),
         tracker_line_count=len(tracker_lines),
@@ -1404,6 +1417,9 @@ async def create_invoice(
         or resolve_currency(client_data, settings_data.get("default_currency", "USD")),
         "lines": money["lines"],
         "subtotal": money["subtotal"],
+        # Stored, not derived at render time, for the same reason as every other
+        # figure here — the print view must be able to print it verbatim.
+        "total_hours": money["total_hours"],
         "discount_type": discount_type,
         "discount_value": payload.discount_value,
         "discount_amount": money["discount_amount"],
@@ -1544,6 +1560,7 @@ async def update_invoice(
 
     updates["lines"] = money["lines"]
     updates["subtotal"] = money["subtotal"]
+    updates["total_hours"] = money["total_hours"]
     # Written back even when the payload did not touch them, so a document
     # holding a null from before the guard was fixed is repaired by any edit
     # rather than staying poisoned until someone happens to set the field.
