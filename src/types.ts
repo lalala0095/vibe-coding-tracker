@@ -321,6 +321,12 @@ export interface Invoice {
   currency: string;
   lines: InvoiceLine[];
   subtotal: number;
+  // Billed hours across every line, server-computed and stored alongside the
+  // money. Each line is quantised to 2 dp before being summed, so this re-adds
+  // from the per-line figures. Stored rather than derived at render time so a
+  // historical invoice prints the number it was saved with; invoices written
+  // before this field existed have it derived from their own stored lines.
+  total_hours: number;
   discount_type: 'percent' | 'amount' | null;
   discount_value: number;
   discount_amount: number;
@@ -377,6 +383,9 @@ export interface InvoicePreviewResponse {
   period_end: string;
   lines: InvoicePreviewLine[];
   subtotal: number;
+  // Hours across the previewed lines, so the builder can show what is about to
+  // be billed before the invoice exists.
+  total_hours: number;
   running_entry_count: number;  // entries with no end_time and no manual hours
   claimed_entry_count: number;  // entries already billed on another invoice
   tracker_line_count: number;   // how many of the lines came from a tracker
