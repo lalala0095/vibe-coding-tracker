@@ -11,15 +11,24 @@ import axios, { AxiosError, type InternalAxiosRequestConfig } from 'axios';
 import type {
   BulkCreateTasksPayload,
   Client,
+  CreateInvoicePayload,
+  CreatePaymentPayload,
   CreateSessionPayload,
   CreateTaskPayload,
   CreateTrackerPayload,
   BillTrackerPayload,
+  Invoice,
+  InvoicePreviewRequest,
+  InvoicePreviewResponse,
+  InvoiceSettings,
+  InvoiceStatus,
   Project,
   Session,
   Task,
   Tracker,
   TrackerSettings,
+  UpdateInvoicePayload,
+  UpdatePaymentPayload,
   UpdateSessionPayload,
   UpdateTaskPayload,
   UpdateTrackerPayload,
@@ -169,12 +178,35 @@ export async function exchangeGoogleToken(
 }
 
 // ── Clients & Projects ────────────────────────────────────────────────────────
-// Read-only here. Both exist so a task can be filed against a project and a
-// time entry filtered by client; neither is editable on the phone.
 
 export async function getClients(): Promise<Client[]> {
   const res = await apiClient.get<Client[]>('/clients');
   return res.data;
+}
+
+export interface ClientOptions {
+  default_rate?: number | null;  // real JSON null clears it
+  currency?: string;             // server defaults to "USD"
+  billing_email?: string;        // the literal string "null" clears it
+  billing_address?: string;      // the literal string "null" clears it
+}
+
+export async function createClient(name: string, options?: ClientOptions): Promise<Client> {
+  const res = await apiClient.post<Client>('/clients', { name, ...options });
+  return res.data;
+}
+
+export async function updateClient(
+  id: string,
+  payload: { name?: string } & ClientOptions
+): Promise<Client> {
+  const res = await apiClient.put<Client>(`/clients/${id}`, payload);
+  return res.data;
+}
+
+/** No cascade server-side: projects and tasks under this client survive it. */
+export async function deleteClient(id: string): Promise<void> {
+  await apiClient.delete(`/clients/${id}`);
 }
 
 export async function getProjects(clientId?: string): Promise<Project[]> {
@@ -182,6 +214,36 @@ export async function getProjects(clientId?: string): Promise<Project[]> {
     params: clientId ? { client_id: clientId } : undefined,
   });
   return res.data;
+}
+
+export interface ProjectOptions {
+  rate?: number | null;  // real JSON null clears it, falling back to the client default
+}
+
+export async function createProject(
+  name: string,
+  clientId: string,
+  options?: ProjectOptions
+): Promise<Project> {
+  const res = await apiClient.post<Project>('/projects', {
+    name,
+    client_id: clientId,
+    ...options,
+  });
+  return res.data;
+}
+
+export async function updateProject(
+  id: string,
+  payload: { name?: string; client_id?: string } & ProjectOptions
+): Promise<Project> {
+  const res = await apiClient.put<Project>(`/projects/${id}`, payload);
+  return res.data;
+}
+
+/** No cascade server-side: tasks under this project survive it. */
+export async function deleteProject(id: string): Promise<void> {
+  await apiClient.delete(`/projects/${id}`);
 }
 
 // ── Tasks ─────────────────────────────────────────────────────────────────────
@@ -247,6 +309,17 @@ export async function updateTask(id: string, payload: UpdateTaskPayload): Promis
   return res.data;
 }
 
+/**
+ * Delete a task. Its GCS attachments go with it (best-effort, server-side).
+ *
+ * There is no cascade: sub-tasks keep pointing at a `parent_task_id` that no
+ * longer resolves, and time entries keep their denormalised `task_title`. The
+ * UI must say so before doing it rather than discovering it afterwards.
+ */
+export async function deleteTask(id: string): Promise<void> {
+  await apiClient.delete(`/tasks/${id}`);
+}
+
 // ── Trackers ──────────────────────────────────────────────────────────────────
 
 export async function getTrackers(params?: { active_only?: boolean }): Promise<Tracker[]> {
@@ -294,6 +367,18 @@ export async function billTracker(
   return res.data;
 }
 
+/**
+ * Delete a tracker.
+ *
+ * No cascade: time entries already created from it survive, keeping their
+ * `tracker_id` pointing at nothing. That is deliberate server-side — billed
+ * hours must not vanish because the block they came from was tidied away — but
+ * it means the UI has to say so before deleting.
+ */
+export async function deleteTracker(id: string): Promise<void> {
+  await apiClient.delete(`/trackers/${id}`);
+}
+
 // ── Time Entries ──────────────────────────────────────────────────────────────
 // The `sessions` collection. Never labelled "Sessions" in the UI — that word
 // belongs to `goals`, which this app does not ship.
@@ -326,11 +411,108 @@ export async function deleteSession(id: string): Promise<void> {
   await apiClient.delete(`/sessions/${id}`);
 }
 
+// ── Invoices ──────────────────────────────────────────────────────────────────
+//
+// Core CRUD only. The desk-bound tools stay on the web: no regenerate-from-time-
+// entries diff, no drag-to-reorder, no round-hours, no print view.
+//
+// Every money field — each line's ``amount``, the subtotal, discount, tax,
+// total and ``total_hours`` — is recomputed by the server on write and ignored
+// if sent. The phone displays what comes back; `src/lib/money.ts` exists only to
+// show live totals *while editing*, and is a verbatim copy of the web's so the
+// two cannot drift.
+
+export async function getInvoices(params?: {
+  client_id?: string;
+  status?: InvoiceStatus;
+}): Promise<Invoice[]> {
+  const res = await apiClient.get<Invoice[]>('/invoices', { params });
+  return res.data;
+}
+
+export async function getInvoice(id: string): Promise<Invoice> {
+  const res = await apiClient.get<Invoice>(`/invoices/${id}`);
+  return res.data;
+}
+
+/** Build draft lines from time entries and trackers in a period. Persists nothing. */
+export async function previewInvoice(
+  payload: InvoicePreviewRequest
+): Promise<InvoicePreviewResponse> {
+  const res = await apiClient.post<InvoicePreviewResponse>('/invoices/preview', payload);
+  return res.data;
+}
+
+export async function createInvoice(payload: CreateInvoicePayload): Promise<Invoice> {
+  const res = await apiClient.post<Invoice>('/invoices', payload);
+  return res.data;
+}
+
+export async function updateInvoice(
+  id: string,
+  payload: UpdateInvoicePayload
+): Promise<Invoice> {
+  const res = await apiClient.put<Invoice>(`/invoices/${id}`, payload);
+  return res.data;
+}
+
+export async function updateInvoiceStatus(
+  id: string,
+  status: InvoiceStatus
+): Promise<Invoice> {
+  const res = await apiClient.patch<Invoice>(`/invoices/${id}/status`, { status });
+  return res.data;
+}
+
+/** Clears the back-links on any time entry or tracker still pointing at it. */
+export async function deleteInvoice(id: string): Promise<void> {
+  await apiClient.delete(`/invoices/${id}`);
+}
+
+// Payments. All three return the WHOLE invoice, not the payment — the derived
+// figures (amount_paid, received_totals, outstanding, effective_rate) are
+// recomputed server-side on every change.
+
+export async function addInvoicePayment(
+  invoiceId: string,
+  payload: CreatePaymentPayload
+): Promise<Invoice> {
+  const res = await apiClient.post<Invoice>(`/invoices/${invoiceId}/payments`, payload);
+  return res.data;
+}
+
+export async function updateInvoicePayment(
+  invoiceId: string,
+  paymentId: string,
+  payload: UpdatePaymentPayload
+): Promise<Invoice> {
+  const res = await apiClient.patch<Invoice>(
+    `/invoices/${invoiceId}/payments/${paymentId}`,
+    payload
+  );
+  return res.data;
+}
+
+export async function deleteInvoicePayment(
+  invoiceId: string,
+  paymentId: string
+): Promise<Invoice> {
+  const res = await apiClient.delete<Invoice>(
+    `/invoices/${invoiceId}/payments/${paymentId}`
+  );
+  return res.data;
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
-// Read-only: the phone renders a new tracker's name from the stored template,
-// but editing that template stays on the web.
+// Read-only. The phone needs the defaults — currency, tax, due days, payout
+// currency, the tracker name template — but editing them stays on the web.
 
 export async function getTrackerSettings(): Promise<TrackerSettings> {
   const res = await apiClient.get<TrackerSettings>('/settings/tracker');
+  return res.data;
+}
+
+export async function getInvoiceSettings(): Promise<InvoiceSettings> {
+  const res = await apiClient.get<InvoiceSettings>('/settings/invoice');
   return res.data;
 }

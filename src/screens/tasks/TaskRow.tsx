@@ -1,9 +1,14 @@
 // One task in the list.
 //
-// The only interaction is the status chip: tapping it cycles
-// `todo → in_progress → done → todo`, the gesture the web's `TaskRow` puts on a
-// checkbox. There is no task detail screen in v1, so the card body is not
-// pressable — a tap target that opens nothing is worse than none.
+// Two tap targets, deliberately separate:
+//
+//   the status chip  cycles `todo → in_progress → done → todo`, the gesture the
+//                    web's `TaskRow` puts on a checkbox;
+//   the card body    opens the task.
+//
+// The chip is a `Pressable` nested inside the card's own `Pressable`, and React
+// Native's responder system gives the innermost one the touch — so cycling a
+// status never opens the sheet behind it.
 
 import { memo } from 'react';
 import { Text, View } from 'react-native';
@@ -31,9 +36,19 @@ export interface TaskRowProps {
   /** Today's Singapore date, `YYYY-MM-DD`, for the overdue colour. */
   today: string;
   onCycleStatus: (task: Task) => void;
+  /** Opens the detail sheet — the whole card body. */
+  onOpen: (task: Task) => void;
 }
 
-function TaskRow({ task, depth, detached, showBreadcrumb, today, onCycleStatus }: TaskRowProps) {
+function TaskRow({
+  task,
+  depth,
+  detached,
+  showBreadcrumb,
+  today,
+  onCycleStatus,
+  onOpen,
+}: TaskRowProps) {
   const isDone = task.status === 'done';
   const isSub = depth > 0 || detached;
 
@@ -41,7 +56,7 @@ function TaskRow({ task, depth, detached, showBreadcrumb, today, onCycleStatus }
     // Indent is arithmetic rather than a class: NativeWind extracts class
     // strings at build time and cannot see a computed one. Layout only.
     <View style={{ paddingLeft: depth * 14 }}>
-      <Card className="gap-2">
+      <Card className="gap-2" onPress={() => onOpen(task)} testID={`task-row-${task.id}`}>
         <View className="flex-row items-start gap-3">
           {isSub ? <Text className="text-sm text-slate-600">↳</Text> : null}
 
@@ -74,11 +89,15 @@ function TaskRow({ task, depth, detached, showBreadcrumb, today, onCycleStatus }
 
           {detached ? <Chip label="Sub-task" tone="violet" /> : null}
 
-          {task.due_date ? (
-            <Text className={`ml-auto text-xs font-medium ${dueDateClass(task.due_date, today)}`}>
-              Due {formatDueDate(task.due_date)}
-            </Text>
-          ) : null}
+          <View className="ml-auto flex-row items-center gap-2">
+            {task.due_date ? (
+              <Text className={`text-xs font-medium ${dueDateClass(task.due_date, today)}`}>
+                Due {formatDueDate(task.due_date)}
+              </Text>
+            ) : null}
+            {/* The card opens; without this it reads as a static row. */}
+            <Text className="text-sm text-slate-600">›</Text>
+          </View>
         </View>
       </Card>
     </View>
