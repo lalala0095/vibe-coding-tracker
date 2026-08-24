@@ -1,22 +1,26 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import AppNav from '../components/AppNav';
 import DateTimeInput from '../components/DateTimeInput';
 import Modal, { MODAL_CANCEL_BUTTON, MODAL_PRIMARY_BUTTON } from '../components/Modal';
 import ConfirmDialog from '../components/ConfirmDialog';
+import WeeklySummaryPane from '../components/WeeklySummaryPane';
 import {
   getTrackers, createTracker, updateTracker, deleteTracker,
   addTasksToTracker, removeTaskFromTracker, billTracker,
   getTasks, getClients, getProjects, createTasksBulk, getSessions,
-  getTrackerSettings,
+  getTrackerSettings, getInvoiceSettings,
 } from '../api';
 import { parseTaskList } from '../lib/taskPaste';
 import { renderTrackerName } from '../lib/trackerName';
+import { recentWeekStarts } from '../lib/week';
+import { summariseWeeks } from '../lib/weeklySummary';
 import type {
   Tracker, Task, Client, Project, TrackerSettings,
   CreateTrackerPayload, UpdateTrackerPayload,
   TrackerTaskRef, TaskStatus, TaskPriority,
+  Session, InvoiceSettings,
 } from '../types';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -856,9 +860,15 @@ interface TrackerPanelProps {
   // Awaited by the confirmation, so a failed removal keeps the dialog open and
   // shows why instead of leaving the row in place with no explanation.
   onRemoveTask: (taskId: string) => Promise<void>;
+  // Billing is the only action on this page that writes to the `sessions`
+  // collection, which is the sole source of the weekly summary's figures. The
+  // panel owns the billing form, so the page cannot see the write happen — this
+  // is how it hears about it. Fire-and-forget: the billing result is already
+  // shown here and must not depend on whatever the page does next.
+  onBilled: () => void;
 }
 
-function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveTask }: TrackerPanelProps) {
+function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveTask, onBilled }: TrackerPanelProps) {
   const isActive = !tracker.end_time;
   const navigate = useNavigate();
 
@@ -924,6 +934,9 @@ function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveT
       setBillCount(created.length);
       // The panel stays open, so the warning has to reflect what was just billed.
       refreshBilledTasks();
+      // New time entries exist, so the weekly summary is stale from this moment
+      // on — even if the user is looking at this panel and not at that tab.
+      onBilled();
     } catch (e) {
       setBillErr(errorDetail(e, 'Failed to create time entries. Please try again.'));
     } finally {
@@ -1177,6 +1190,15 @@ type ModalState =
   | { kind: 'edit_tracker'; tracker: Tracker }
   | { kind: 'add_tasks'; tracker: Tracker };
 
+// The page-level tabs. `trackers` is the two-column body this page has always
+// been; `weekly` swaps that body out for the summary.
+const PAGE_TABS = [
+  ['trackers', 'Trackers'],
+  ['weekly', 'Weekly summary'],
+] as const;
+
+type PageTab = (typeof PAGE_TABS)[number][0];
+
 export default function TrackersPage() {
   const [trackers, setTrackers] = useState<Tracker[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -1185,6 +1207,8 @@ export default function TrackersPage() {
   const [trackerSettings, setTrackerSettings] = useState<TrackerSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+
+  const [tab, setTab] = useState<PageTab>('trackers');
 
   const [filterActive, setFilterActive] = useState<'all' | 'active' | 'done'>('all');
 
@@ -1226,6 +1250,108 @@ export default function TrackersPage() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
+  // ── Weekly summary data ──
+  //
+  // Kept entirely apart from `loading`/`error` above, which belong to the
+  // tracker list: a failed time-entry fetch must not blank the Trackers tab,
+  // and a failed tracker fetch must not be reported as a broken summary.
+
+  const [weekCount, setWeekCount] = useState(12);
+  const [weeklySessions, setWeeklySessions] = useState<Session[]>([]);
+  const [invoiceSettings, setInvoiceSettings] = useState<InvoiceSettings | null>(null);
+  const [weeklyLoading, setWeeklyLoading] = useState(false);
+  const [weeklyError, setWeeklyError] = useState('');
+  // Non-fatal: the rates fell back a level, but every figure still renders.
+  const [rateNote, setRateNote] = useState('');
+
+  // Bumped only by billing, which is the one action on this page that writes
+  // time entries. Not read by the fetcher — it exists purely as an invalidation
+  // signal in the effect's dependency list, which is the cheapest honest way to
+  // say "the answer you have is out of date" without threading a refetch
+  // through the panel that caused it. See the note above the tracker actions
+  // for why nothing else bumps it.
+  const [weeklyStamp, setWeeklyStamp] = useState(0);
+  const bumpWeekly = useCallback(() => setWeeklyStamp(n => n + 1), []);
+
+  // Lazy: only ever set, never cleared, so the fetch happens the first time the
+  // Weekly tab is opened and the Trackers tab costs exactly what it did before
+  // this tab existed. Switching back and forth afterwards costs nothing either
+  // — the effect below re-runs on `weekCount` and `weeklyStamp`, not on `tab`.
+  const [weeklyOpened, setWeeklyOpened] = useState(false);
+  useEffect(() => {
+    if (tab === 'weekly') setWeeklyOpened(true);
+  }, [tab]);
+
+  // Newest Monday first. Recomputed only when the window size changes, so it is
+  // a stable dependency for the fetcher and the summary below.
+  const weekStarts = useMemo(() => recentWeekStarts(weekCount), [weekCount]);
+
+  const fetchWeekly = useCallback(async () => {
+    // The window's first day is the OLDEST Monday, which is the LAST element —
+    // `recentWeekStarts` hands them back newest first.
+    const from = weekStarts[weekStarts.length - 1];
+    if (!from) return;
+
+    setWeeklyLoading(true);
+    setWeeklyError('');
+    setRateNote('');
+    try {
+      // Deliberately no `date_to`. A time entry dated into the future still
+      // belongs to the week it is dated to, and capping the range at today
+      // would drop it silently instead of showing it in a week that is simply
+      // ahead of now.
+      setWeeklySessions(await getSessions({ date_from: from }));
+    } catch {
+      setWeeklySessions([]);
+      setWeeklyError('Failed to load time entries.');
+      setWeeklyLoading(false);
+      return;
+    }
+
+    // Invoice settings are the last link in the rate chain (project → client →
+    // settings), so losing them is not the harmless miss that a failed
+    // `getTrackerSettings()` is — that one costs a pre-filled name, this one
+    // silently changes money. It is fetched outside the block above so it can
+    // neither fail the tab nor be swallowed: the summary still renders with
+    // `settings: null`, every rate that would have come from settings falls
+    // back, and the note says so out loud.
+    try {
+      setInvoiceSettings(await getInvoiceSettings());
+    } catch {
+      setInvoiceSettings(null);
+      setRateNote(
+        'Invoice settings could not be loaded, so any rate that falls back to them reads as “No rate set”. The hours are unaffected.'
+      );
+    } finally {
+      setWeeklyLoading(false);
+    }
+  }, [weekStarts]);
+
+  useEffect(() => {
+    if (!weeklyOpened) return;
+    fetchWeekly();
+    // `weeklyStamp` is not read inside `fetchWeekly`; it is the invalidation
+    // signal described above. `fetchWeekly` itself changes with `weekCount`,
+    // which is what makes resizing the window refetch.
+  }, [weeklyOpened, fetchWeekly, weeklyStamp]);
+
+  // All the arithmetic lives in `summariseWeeks`. `trackers`, `projects` and
+  // `clients` are the page's own state, already loaded by `fetchData` — the
+  // summary reuses them rather than fetching a second copy, which also means a
+  // tracker created, edited, stopped or deleted is reflected here the moment
+  // the list updates, with no request at all.
+  const weeks = useMemo(
+    () => summariseWeeks({
+      sessions: weeklySessions,
+      trackers,
+      projects,
+      clients,
+      settings: invoiceSettings,
+      weekStarts,
+    }),
+    [weeklySessions, trackers, projects, clients, invoiceSettings, weekStarts]
+  );
+
   function openTracker(t: Tracker) {
     setSelectedTracker(t);
   }
@@ -1237,6 +1363,18 @@ export default function TrackersPage() {
   });
 
   // ── Tracker actions ──
+  //
+  // Only billing invalidates the weekly summary, and it does so through
+  // `onBilled` on the panel below — it is the one action here that writes to
+  // the `sessions` collection, which the page has no other way to observe.
+  //
+  // Creating, editing, stopping and deleting a tracker deliberately do NOT
+  // refetch. Each of them writes the server's own answer straight into
+  // `trackers`, and `trackers` is a dependency of the `weeks` memo, so the
+  // summary already follows them instantly and with no request. Bumping here as
+  // well would cost a full scan of the time entries to arrive at the figures
+  // the memo has produced already. `delete_tracker` does not cascade to
+  // sessions (back/routers/trackers.py), so even a delete cannot change them.
 
   async function handleCreateTracker(payload: CreateTrackerPayload) {
     const created = await createTracker(payload);
@@ -1304,7 +1442,57 @@ export default function TrackersPage() {
     <div className="flex flex-col h-screen bg-slate-950 text-slate-100 overflow-hidden">
       <AppNav active="trackers" wide />
 
-      {/* ── Body: two-column layout ── */}
+      {/* ── Page tabs ──
+          Its own `shrink-0` row: the page is a fixed-height column, so the
+          strip must take its natural height and leave the body below to be the
+          only thing that flexes. */}
+      <div className="flex gap-1 px-4 py-2 border-b border-slate-800 shrink-0">
+        {PAGE_TABS.map(([value, label]) => (
+          <button
+            key={value}
+            onClick={() => {
+              setTab(value);
+              // A modal opened from the tracker body has no meaning once that
+              // body is unmounted, and leaving the state set would spring it
+              // back open on the way here. Closing beats hiding.
+              if (value !== 'trackers') {
+                setModal({ kind: 'none' });
+                setDeleteTarget(null);
+              }
+            }}
+            className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${
+              tab === value
+                ? 'bg-slate-800 text-white'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'weekly' ? (
+        <div className="flex flex-col flex-1 overflow-hidden">
+          {/* Non-fatal, and page-owned rather than passed to the pane: the pane's
+              `error` is the fatal channel that replaces the summary with a retry,
+              and a fallen-back rate must not blank figures that are still true. */}
+          {rateNote && (
+            <div className="px-4 py-2 text-xs text-amber-300 bg-amber-400/10 border-b border-amber-400/20 shrink-0">
+              {rateNote}
+            </div>
+          )}
+          <WeeklySummaryPane
+            weeks={weeks}
+            weekCount={weekCount}
+            onChangeWeekCount={setWeekCount}
+            loading={weeklyLoading}
+            error={weeklyError}
+            onRetry={fetchWeekly}
+          />
+        </div>
+      ) : (
+
+      /* ── Body: two-column layout ── */
       <div className="flex flex-1 overflow-hidden">
       {/* ── Left column: tracker list ── */}
       <div className="flex flex-col w-96 border-r border-slate-800 shrink-0">
@@ -1405,6 +1593,7 @@ export default function TrackersPage() {
             onStop={() => handleStopTracker(selectedTracker)}
             onAddTasks={() => setModal({ kind: 'add_tasks', tracker: selectedTracker })}
             onRemoveTask={handleRemoveTask}
+            onBilled={bumpWeekly}
           />
         ) : (
           <div className="flex items-center justify-center h-full text-slate-500 text-sm">
@@ -1451,6 +1640,8 @@ export default function TrackersPage() {
         />
       )}
       </div>
+
+      )}
     </div>
   );
 }
