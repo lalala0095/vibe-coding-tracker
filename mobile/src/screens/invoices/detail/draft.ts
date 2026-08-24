@@ -250,6 +250,22 @@ function fingerprint(draft: InvoiceDraft): string {
   });
 }
 
+/**
+ * Whether the draft differs from the invoice it was opened on.
+ *
+ * ⚠️ It compares the DRAFT, and `InvoiceDraft` has no `period_start` /
+ * `period_end` — those live on the `Invoice` and `toUpdatePayload` does not
+ * emit them. So a change that moves only the period is invisible here and this
+ * returns false.
+ *
+ * That is reachable: regenerating over a wider span that happens to contain no
+ * further time entries returns lines identical to the current ones while the
+ * period genuinely moved. A caller holding a pending period must OR its own
+ * check in rather than trust this alone — `app/invoice/[id].tsx` does exactly
+ * that with `unsaved = dirty || periodMoved`, and keeps the two apart on
+ * purpose: a moved period changes no money, so it must not flip the line
+ * amounts into preview mode.
+ */
 export function isDirty(draft: InvoiceDraft, invoice: Invoice): boolean {
   return fingerprint(draft) !== fingerprint(draftFromInvoice(invoice));
 }

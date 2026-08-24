@@ -35,6 +35,24 @@
 // `YYYY-MM-DD`. Nothing here calls `.toISOString()`; day values go through
 // `dayFromFieldValue`, which reads the Singapore calendar date via
 // `src/lib/sgt.ts`.
+//
+// ── The regenerated period ─────────────────────────────────────────────
+//
+// Regenerate rebuilds the lines from a period the user picks, and that period
+// is what the invoice then covers — so the two have to be saved together or
+// the document prints one span over another span's work.
+//
+// `period_start` / `period_end` live on the `Invoice`, not on `InvoiceDraft`,
+// and `toUpdatePayload` does not emit them. So the period a regenerate settled
+// on is held here in `pendingPeriod` until the next save, exactly as
+// `front/src/pages/InvoicesPage.tsx` holds it, and merged into the payload at
+// the one call site that writes. Two rules the web learned the hard way:
+//
+//   * it is cleared when the invoice identity changes, or a period regenerated
+//     for one invoice would be written onto the next one;
+//   * it does not make the *draft* dirty — `isDirty` cannot see it — so the
+//     save affordance keys off `unsaved`, not off `dirty`. A regenerate that
+//     moved only the period would otherwise leave no way to save it.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
@@ -44,6 +62,8 @@ import {
   apiErrorMessage,
   deleteInvoice,
   getInvoice,
+  getInvoiceSettings,
+  getProjects,
   updateInvoice,
   updateInvoiceStatus,
 } from '@/api';
@@ -59,6 +79,7 @@ import AdjustmentsCard from '@/screens/invoices/detail/AdjustmentsCard';
 import HeaderCard from '@/screens/invoices/detail/HeaderCard';
 import LineCard from '@/screens/invoices/detail/LineCard';
 import MetaCard from '@/screens/invoices/detail/MetaCard';
+import RegenerateSheet from '@/screens/invoices/detail/RegenerateSheet';
 import TotalsCard from '@/screens/invoices/detail/TotalsCard';
 import {
   blankLine,
@@ -74,8 +95,9 @@ import {
   invoiceDeletionDetail,
   invoiceDeletionMessage,
 } from '@/screens/invoices/detail/deletion';
+import { periodLabel } from '@/screens/invoices/invoiceMeta';
 import PaymentsPanel from '@/screens/invoices/payments/PaymentsPanel';
-import type { Invoice, InvoiceStatus } from '@/types';
+import type { HoursRoundingDirection, Invoice, InvoiceStatus, Project } from '@/types';
 
 /**
  * `app/_layout.tsx` gives a header only to route names it holds a title for,
@@ -101,6 +123,23 @@ export default function InvoiceDetailScreen() {
   const [statusBusy, setStatusBusy] = useState(false);
   const [statusError, setStatusError] = useState('');
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+
+  const [regenerating, setRegenerating] = useState(false);
+  /**
+   * The period a regenerate settled on, held until the next save.
+   *
+   * It rides with `draft.lines` rather than being written when the sheet
+   * closes, because the lines and the span they cover have to move together —
+   * see the note in the file header for why it cannot live on the draft.
+   */
+  const [pendingPeriod, setPendingPeriod] = useState<{ start: string; end: string } | null>(null);
+
+  // Picker aids for the sheet, both best-effort — see their loaders below.
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [rounding, setRounding] = useState<{
+    increment: number;
+    direction: HoursRoundingDirection;
+  } | null>(null);
 
   // ── Fetching ─────────────────────────────────────────────────────────────
 
@@ -132,12 +171,102 @@ export default function InvoiceDetailScreen() {
     load();
   }, [load]);
 
+  /**
+   * Projects and the rounding defaults, for the regenerate sheet.
+   *
+   * Best-effort, exactly like `getTrackerSettings()` on the tracker screens: a
+   * project list is a picker aid and the rounding increment only decides
+   * whether the sheet offers to round, so neither failure may take the invoice
+   * down with it. No error state and nothing shown — the sheet degrades to an
+   * empty project list and no rounding option.
+   *
+   * The increment is passed on only when it is a positive number. `0` means
+   * rounding is switched off in settings, and the sheet's prop is optional so
+   * that "off" is expressed by sending nothing at all.
+   */
+  const loadPickerAids = useCallback(async () => {
+    try {
+      setProjects(await getProjects());
+    } catch {
+      setProjects([]);
+    }
+    try {
+      const settings = await getInvoiceSettings();
+      setRounding(
+        settings.hours_rounding_increment > 0
+          ? {
+              increment: settings.hours_rounding_increment,
+              direction: settings.hours_rounding_direction,
+            }
+          : null,
+      );
+    } catch {
+      setRounding(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadPickerAids();
+  }, [loadPickerAids]);
+
+  /**
+   * A different invoice means the held period is no longer about anything.
+   *
+   * The web hit this as a real bug: `pendingPeriod` was keyed on the selected
+   * invoice and, left standing, a period regenerated for one invoice was saved
+   * onto whichever was selected next. This route usually remounts per id, but
+   * `router.replace` to another `/invoice/[id]` reuses the component — so the
+   * reset is keyed on `id` rather than left to the mount. A sheet opened
+   * against the previous invoice is dropped for the same reason: its defaults
+   * were read from an invoice that is no longer on screen.
+   *
+   * Deliberately not folded into `load()`, which pull-to-refresh also calls:
+   * refreshing the same invoice must keep the pending period, not silently
+   * discard it.
+   */
+  useEffect(() => {
+    setPendingPeriod(null);
+    setRegenerating(false);
+  }, [id]);
+
   // ── Derived ──────────────────────────────────────────────────────────────
 
   const dirty = useMemo(
     () => (invoice && draft ? isDirty(draft, invoice) : false),
     [draft, invoice],
   );
+
+  /**
+   * Whether the held period actually differs from the stored one.
+   *
+   * Regenerating over the invoice's own period is a no-op for this field, and
+   * `period_start`/`period_end` have no clearing sentinel — they are plain
+   * dates — so an empty one is never sent at all. Same three conditions the web
+   * applies before it puts them in the payload.
+   */
+  const periodMoved =
+    invoice !== null &&
+    pendingPeriod !== null &&
+    pendingPeriod.start !== '' &&
+    pendingPeriod.end !== '' &&
+    (pendingPeriod.start !== (invoice.period_start ?? '') ||
+      pendingPeriod.end !== (invoice.period_end ?? ''));
+
+  /**
+   * Is there anything to save? Not the same question as `dirty`.
+   *
+   * `isDirty` compares the draft against the invoice, and the period is on
+   * neither side of that comparison — `InvoiceDraft` has no period field, so
+   * `fingerprint` cannot see one. A regenerate that rebuilt the same lines over
+   * a different span therefore leaves `dirty` false, and keying the footer off
+   * `dirty` would leave the user no way to save the period they just chose.
+   *
+   * The two are kept apart rather than merged because `dirty` also decides
+   * whether the money on screen is the stored figure or the preview. A moved
+   * period changes no figure, so it must not flip the screen into preview mode
+   * and label the server's own numbers "unsaved".
+   */
+  const unsaved = dirty || periodMoved;
 
   /**
    * The live preview of the draft.
@@ -176,9 +305,12 @@ export default function InvoiceDetailScreen() {
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
-    await load({ silent: true, keepDraft: dirty });
+    // `unsaved`, not `dirty`: a refresh that rebuilt the draft would be
+    // harmless while only the period is pending, but the period is kept either
+    // way and the two should not be able to drift apart.
+    await load({ silent: true, keepDraft: unsaved });
     setRefreshing(false);
-  }, [load, dirty]);
+  }, [load, unsaved]);
 
   // ── Editing ──────────────────────────────────────────────────────────────
 
@@ -205,17 +337,52 @@ export default function InvoiceDetailScreen() {
       prev ? { ...prev, lines: prev.lines.filter((line) => line.key !== key) } : prev,
     );
 
+  /**
+   * The merge's result, into the working draft. Nothing is written until save.
+   *
+   * The lines arrive already merged — which fields are facts about the work and
+   * which were authored by the owner is `lib/regenerate.ts`'s decision, and no
+   * hours or money arithmetic happens on this screen either way.
+   *
+   * The sheet closes itself, but closing here too costs nothing and means a
+   * successful apply can never leave it standing over the lines it just
+   * replaced.
+   */
+  const handleRegenerateApply = (
+    lines: LineDraft[],
+    periodStart: string,
+    periodEnd: string,
+  ) => {
+    setDraft((prev) => (prev ? { ...prev, lines } : prev));
+    setPendingPeriod({ start: periodStart, end: periodEnd });
+    setRegenerating(false);
+  };
+
   const handleSave = async () => {
     if (!invoice || !draft) return;
     setSaving(true);
     setSaveError('');
     try {
-      const updated = await updateInvoice(invoice.id, toUpdatePayload(draft));
+      // The period is spread in here rather than emitted by `toUpdatePayload`,
+      // which builds its payload from the draft alone and has no period to
+      // give. `UpdateInvoicePayload` accepts both keys — they are optional on
+      // it — so this is the whole of what carries the regenerated span, and
+      // only when it actually moved.
+      const payload = {
+        ...toUpdatePayload(draft),
+        ...(periodMoved && pendingPeriod
+          ? { period_start: pendingPeriod.start, period_end: pendingPeriod.end }
+          : {}),
+      };
+      const updated = await updateInvoice(invoice.id, payload);
       // The response is the truth: every money field on it was recomputed
       // server-side. Both the invoice and the draft are rebuilt from it, which
       // is what retires the preview.
       setInvoice(updated);
       setDraft(draftFromInvoice(updated));
+      // Stored now, so it stops being pending. Left standing it would keep
+      // re-sending itself on every later save.
+      setPendingPeriod(null);
     } catch (e: unknown) {
       setSaveError(apiErrorMessage(e, 'Could not save this invoice.'));
     } finally {
@@ -225,6 +392,10 @@ export default function InvoiceDetailScreen() {
 
   const handleDiscard = () => {
     if (invoice) setDraft(draftFromInvoice(invoice));
+    // A regenerate is one change: the lines and the span they cover. Dropping
+    // the lines back to the stored ones while keeping the new period would
+    // leave the invoice claiming to cover work it no longer lists.
+    setPendingPeriod(null);
     setSaveError('');
   };
 
@@ -313,6 +484,32 @@ export default function InvoiceDetailScreen() {
           )}
 
           <Button label="+ Add a line" onPress={addLine} variant="secondary" testID="add-line" />
+
+          {/*
+            Beside "+ Add a line" because it is the other thing that can change
+            what the lines are. Never gated on status: a sent or paid invoice
+            regenerates like any other and the sheet is where the warning goes
+            (CLAUDE.md, "no locking" — warn, never block).
+          */}
+          <Button
+            label="Regenerate from time entries"
+            onPress={() => setRegenerating(true)}
+            variant="secondary"
+            testID="regenerate-invoice"
+          />
+
+          {/*
+            The held period, said out loud. Nothing else on the screen would
+            show it: `HeaderCard` prints the invoice's stored period, and until
+            a save lands that is no longer the span these lines cover.
+          */}
+          {periodMoved && pendingPeriod ? (
+            <Text className="text-xs leading-relaxed text-amber-300/80">
+              These lines now cover {periodLabel(pendingPeriod.start, pendingPeriod.end)}. The
+              invoice still says {periodLabel(invoice.period_start, invoice.period_end)} until you
+              save.
+            </Text>
+          ) : null}
         </View>
 
         <AdjustmentsCard
@@ -358,6 +555,28 @@ export default function InvoiceDetailScreen() {
           </Text>
         </View>
 
+        {/*
+          Mounted only while open, like `ConfirmSheet` below, so each opening
+          re-reads its defaults from the invoice and the lines as they are now
+          rather than as they were the first time it was opened.
+        */}
+        {regenerating ? (
+          <RegenerateSheet
+            open
+            invoice={invoice}
+            projects={projects}
+            // The working lines, not the stored ones, so unsaved hand-edits
+            // take part in the merge instead of being reverted by it.
+            currentLines={draft.lines}
+            // Absent when settings did not load or rounding is switched off —
+            // the sheet then simply does not offer to round.
+            roundingIncrement={rounding?.increment}
+            roundingDirection={rounding?.direction}
+            onApply={handleRegenerateApply}
+            onClose={() => setRegenerating(false)}
+          />
+        ) : null}
+
         {confirmingDelete ? (
           <ConfirmSheet
             open
@@ -376,7 +595,7 @@ export default function InvoiceDetailScreen() {
   // Only while there is something to save. `disabled` here is the in-flight
   // double-submit guard, never a lock on a value.
   const footer =
-    dirty && invoice && draft ? (
+    unsaved && invoice && draft ? (
       <View className="gap-2 border-t border-slate-800 px-4 py-3">
         {saveError ? <ErrorNote message={saveError} /> : null}
         <View className="flex-row gap-3">
