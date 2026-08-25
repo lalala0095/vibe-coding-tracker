@@ -6,9 +6,28 @@
 // wrote. Neither may overwrite the other wholesale, so this module splits every
 // field into one camp or the other and merges field by field:
 //
-//   refreshed  hours, session_ids, date_from, date_to   — facts about the work
-//   preserved  rate, description, sub_items, task_title,
-//              project_name, line_id                    — authored content
+//   refreshed  hours, session_ids, date_from, date_to,
+//              sub_items (tracker lines only)           — facts about the work
+//   preserved  rate, description, task_title,
+//              project_name, line_id,
+//              sub_items (task lines)                   — authored content
+//
+// `sub_items` sits in both camps, and the split is not arbitrary — it follows
+// who actually knows the answer:
+//
+//   tracker line  The server rebuilds `sub_items` from the tracker's CURRENT
+//                 task list on every preview (`invoices.py:1296`). That makes
+//                 it derived data, and keeping the stored copy is what made a
+//                 task added to a tracker never appear on a regenerate.
+//   task line     The preview never populates `sub_items` for these at all —
+//                 the `(task_id, project_id)` grouping reads time entries and
+//                 never opens the task document, so `match.sub_items` is
+//                 always `[]`. Taking the fresh value here would replace a
+//                 hand-written bullet list with nothing.
+//
+// So a tracker line's bullets refresh and a task line's are left alone. If
+// task lines are ever taught to carry their sub-tasks, this is the one line
+// that has to change with them.
 //
 // Lines are paired by *source key*, not by position or line_id: a stored line
 // and a fresh line describe the same work when they came from the same tracker,
@@ -38,6 +57,8 @@ export interface LineChange {
   hoursBefore: number | null; // null for 'added'
   hoursAfter: number | null;  // null for 'removed'
   datesChanged: boolean;
+  /** The bullet list under the description moved. Tracker lines only. */
+  subItemsChanged: boolean;
   isTracker: boolean;
 }
 
@@ -73,6 +94,12 @@ function asArray(value: string[] | null | undefined): string[] {
 
 function isBlank(value: string | null | undefined): boolean {
   return value === null || value === undefined || value === '';
+}
+
+// Order matters: these are printed as a bullet list, so re-ordering them is a
+// visible change to the document even when the same titles are present.
+function sameItems(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((item, index) => item === b[index]);
 }
 
 /**
@@ -192,6 +219,7 @@ export function mergeRegeneratedLines(
         hoursBefore: stored.hours,
         hoursAfter: stored.hours,
         datesChanged: false,
+        subItemsChanged: false,
         isTracker: false,
       });
       continue;
@@ -210,6 +238,7 @@ export function mergeRegeneratedLines(
         hoursBefore: stored.hours,
         hoursAfter: null,
         datesChanged: false,
+        subItemsChanged: false,
         isTracker: !isBlank(stored.tracker_id),
       });
       continue;
@@ -230,23 +259,32 @@ export function mergeRegeneratedLines(
     // Only the four refreshed fields move; everything else, including `amount`,
     // is the stored line's. A new object either way — the stored one is input
     // and must not be touched.
+    // See the header for why this is split by line kind rather than simply
+    // refreshed or simply preserved.
+    const storedSubItems = asArray(stored.sub_items);
+    const subItems = isBlank(stored.tracker_id)
+      ? storedSubItems
+      : asArray(match.sub_items);
+    const subItemsChanged = !sameItems(storedSubItems, subItems);
+
     const merged: InvoiceLine = {
       ...stored,
       hours: freshHours,
       session_ids: asArray(match.session_ids),
       date_from: match.date_from,
       date_to: match.date_to,
-      sub_items: asArray(stored.sub_items),
+      sub_items: subItems,
     };
 
     lines.push(merged);
     changes.push({
-      kind: hoursChanged || datesChanged ? 'updated' : 'unchanged',
+      kind: hoursChanged || datesChanged || subItemsChanged ? 'updated' : 'unchanged',
       title: lineTitle(merged),
       line: merged,
       hoursBefore: stored.hours,
       hoursAfter: merged.hours,
       datesChanged,
+      subItemsChanged,
       isTracker: !isBlank(merged.tracker_id),
     });
   }
@@ -262,6 +300,7 @@ export function mergeRegeneratedLines(
       hoursBefore: null,
       hoursAfter: added.hours,
       datesChanged: false,
+      subItemsChanged: false,
       isTracker: !isBlank(added.tracker_id),
     });
   });

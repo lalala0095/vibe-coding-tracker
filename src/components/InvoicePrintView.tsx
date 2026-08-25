@@ -53,6 +53,22 @@ const STATUS_STYLES: Record<InvoiceStatus, string> = {
   void: 'border-red-400 text-red-600',
 };
 
+/**
+ * Whether the status badge belongs on the document at all.
+ *
+ * `draft` does not. This route *is* the thing that gets printed and handed to
+ * a client, and "DRAFT" stamped across the top of it says the invoice is not
+ * real yet — which is either wrong or, worse, a reason for the client not to
+ * pay it. Draft is an internal state of the editor and it stays there.
+ *
+ * The other three earn their place on paper: PAID and VOID change what the
+ * reader should do about the document, and SENT records that it was issued.
+ * Nothing about the badge is load-bearing for the figures either way.
+ */
+function showsStatus(status: InvoiceStatus): boolean {
+  return status !== 'draft';
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The document
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,11 +142,13 @@ export function InvoicePrintView({ invoice }: { invoice: Invoice }) {
           <p className="mt-1 text-lg font-semibold text-slate-900">
             {invoice.invoice_number}
           </p>
-          <span
-            className={`mt-2 inline-block rounded border px-2 py-0.5 text-xs font-semibold uppercase tracking-wider ${STATUS_STYLES[invoice.status]}`}
-          >
-            {invoice.status}
-          </span>
+          {showsStatus(invoice.status) && (
+            <span
+              className={`mt-2 inline-block rounded border px-2 py-0.5 text-xs font-semibold uppercase tracking-wider ${STATUS_STYLES[invoice.status]}`}
+            >
+              {invoice.status}
+            </span>
+          )}
         </div>
       </header>
 
