@@ -11,6 +11,11 @@
 // of it to reach the server. That is stated on screen too, because "Apply" in a
 // sheet that just made a network call reads like a save.
 //
+// The same goes for the issue date. Ticking "Update the issue date to today"
+// only makes `onApply` hand back a bare `YYYY-MM-DD`; whether and when that
+// reaches the invoice is `app/invoice/[id].tsx`'s business, and it too waits
+// for Save changes.
+//
 // It also does no arithmetic of its own. `mergeRegeneratedLines` decides which
 // fields are refreshed and which are preserved, `roundHoursToIncrement` (called
 // from inside the merge) does the increment rounding, and `formatHours` does
@@ -34,6 +39,7 @@ import { Pressable, Text, View } from 'react-native';
 import { apiErrorMessage, previewInvoice } from '@/api';
 import { Button, Chip, DateTimeField, ErrorNote, LoadingBlock } from '@/components';
 import { formatHours } from '@/lib/money';
+import { todaySgt } from '@/lib/sgt';
 import {
   mergeRegeneratedLines,
   type LineChange,
@@ -120,7 +126,13 @@ export interface RegenerateSheetProps {
   roundingIncrement?: number;
   roundingDirection?: HoursRoundingDirection;
   /** Hands back merged draft lines plus the period the regenerate settled on. Writes nothing. */
-  onApply: (lines: LineDraft[], periodStart: string, periodEnd: string) => void;
+  onApply: (
+    lines: LineDraft[],
+    periodStart: string,
+    periodEnd: string,
+    /** A bare `YYYY-MM-DD` to set as the issue date, or null to leave it alone. */
+    issueDate: string | null,
+  ) => void;
   onClose: () => void;
 }
 
@@ -151,6 +163,17 @@ export default function RegenerateSheet({
   // hand back raw figures they would then have to round again by hand.
   const [roundHours, setRoundHours] = useState(canRound);
 
+  // Pinned for as long as the sheet is open, so the date printed on the tick
+  // row is exactly the date Apply hands back even if the sheet is left standing
+  // across Singapore midnight. `todaySgt()` and never `.toISOString()`: the
+  // latter is UTC, which between midnight and 08:00 SGT names the day before —
+  // see the rule at the top of `src/lib/sgt.ts`.
+  const today = useMemo(() => todaySgt(), [open]);
+  // On by default: a regenerated invoice is being re-issued, and the document
+  // should carry the day it was re-issued rather than the day it was first
+  // raised. A default, not a constraint — untick it and the stored date stands.
+  const [updateIssueDate, setUpdateIssueDate] = useState(true);
+
   // The preview is kept RAW rather than pre-merged, so flipping the rounding
   // toggle re-merges in place instead of sending the user back to Load. The
   // merge is pure and cheap; the network call is neither.
@@ -170,6 +193,7 @@ export default function RegenerateSheet({
     setIncludeTrackers(true);
     setIncludeInvoiced(false);
     setRoundHours(canRound);
+    setUpdateIssueDate(true);
     setPreview(null);
     setError('');
     setLoading(false);
@@ -244,7 +268,12 @@ export default function RegenerateSheet({
     }
     // Nothing is posted. The merged lines become the editor's draft, keeping
     // each surviving row's React key so a focused text input does not jump.
-    onApply(invoiceLinesToDraftLines(result.lines, currentLines), startDay, endDay);
+    onApply(
+      invoiceLinesToDraftLines(result.lines, currentLines),
+      startDay,
+      endDay,
+      updateIssueDate ? today : null,
+    );
     onClose();
   }
 
@@ -262,6 +291,27 @@ export default function RegenerateSheet({
         </Text>
       </CheckRow>
     ) : null;
+
+  // Also rendered in both steps, beside the rounding toggle. The date is spelled
+  // out the same way the rounding rule is: the user should not have to work out
+  // which day they are agreeing to stamp on the document. Bare `YYYY-MM-DD`,
+  // matching how `HeaderCard` prints `Issued`, so the two compare like for like.
+  // `hasChanges` speaks only for the LINES. With the issue-date option on,
+  // Apply still does something to an invoice whose lines already match — it
+  // re-dates the document — so gating the button on `hasChanges` alone would
+  // make the option unreachable in exactly the case someone regenerates a
+  // settled invoice just to re-issue it today. Mirrors the web.
+  const issueDateWouldMove = updateIssueDate && today !== (invoice.issue_date ?? '');
+  const canApply = result !== null && (result.hasChanges || issueDateWouldMove);
+
+  const issueDateToggle = (
+    <CheckRow checked={updateIssueDate} onToggle={() => setUpdateIssueDate((prev) => !prev)}>
+      <Text className="text-xs text-slate-400">
+        Update the issue date to today
+        <Text className="text-slate-500"> · {today}</Text>
+      </Text>
+    </CheckRow>
+  );
 
   if (!open) return null;
 
@@ -295,10 +345,11 @@ export default function RegenerateSheet({
             <View className="flex-1">
               {result === null ? (
                 <Button label="Load changes" loading={loading} onPress={handleLoad} />
-              ) : result.hasChanges ? (
+              ) : canApply ? (
+                /* Offered whenever applying would change something — the lines,
+                   or the issue date on its own. A true no-op is not offered. */
                 <Button label="Apply to invoice" onPress={handleApply} testID="regenerate-apply" />
               ) : (
-                /* Already up to date: Apply would be a no-op, so it is not offered. */
                 <Button label="Close" variant="secondary" onPress={onClose} />
               )}
             </View>
@@ -408,6 +459,7 @@ export default function RegenerateSheet({
               </Text>
             </CheckRow>
             {roundingToggle}
+            {issueDateToggle}
           </View>
 
           <Text className="text-xs leading-relaxed text-slate-500">{KEPT_BLURB}</Text>
@@ -417,12 +469,13 @@ export default function RegenerateSheet({
       ) : (
         // ── Step 2: what applying would do ──
         <View className="gap-4">
-          {roundingToggle ? (
-            <View className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2">
-              {roundingToggle}
-            </View>
-          ) : null}
-          <ChangeSummary result={result} />
+          {/* Unconditional now: the issue-date toggle is always offered, so this
+              box no longer hangs on a rounding increment being configured. */}
+          <View className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2">
+            {roundingToggle}
+            {issueDateToggle}
+          </View>
+          <ChangeSummary result={result} issueDate={issueDateWouldMove ? today : null} />
           {periodChanged ? (
             <Text className="rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2 text-xs leading-relaxed text-slate-400">
               The period differs from the one stored on this invoice. Applying also updates it to{' '}
@@ -439,7 +492,7 @@ export default function RegenerateSheet({
 
 // ── Change summary ───────────────────────────────────────────────────────────
 
-function ChangeSummary({ result }: { result: MergeResult }) {
+function ChangeSummary({ result, issueDate }: { result: MergeResult; issueDate: string | null }) {
   const delta = result.hoursAfter - result.hoursBefore;
   // Only worth showing once it survives the 2 dp the figure is rendered at.
   // Both totals are sums of floats that came back through JSON, so a bare
@@ -453,6 +506,13 @@ function ChangeSummary({ result }: { result: MergeResult }) {
           This invoice is already up to date — the current time entries produce exactly the lines
           it already has.
         </Text>
+        {/* Without this the panel reads as "nothing to do" while an Apply
+            button sits below it offering to change the date. */}
+        {issueDate ? (
+          <Text className="text-sm leading-relaxed text-slate-300">
+            Applying would still re-date it to {issueDate}.
+          </Text>
+        ) : null}
         <Text className="text-xs text-slate-500">
           {hoursText(result.hoursBefore)} across {result.lines.length} line
           {result.lines.length !== 1 ? 's' : ''}.

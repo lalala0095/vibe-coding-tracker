@@ -53,7 +53,21 @@
 //   * it does not make the *draft* dirty — `isDirty` cannot see it — so the
 //     save affordance keys off `unsaved`, not off `dirty`. A regenerate that
 //     moved only the period would otherwise leave no way to save it.
-
+//
+// ── The regenerated issue date ───────────────────────────────────────────────
+//
+// Regenerating re-issues the invoice, so it offers to stamp today's date on it.
+// On the web that lands in an editable `issue_date` box and the owner can still
+// change it before saving. **Here there is no such box**: `issue_date` is not on
+// `InvoiceDraft` and `HeaderCard` only prints it. So the new date needs the same
+// treatment as the period — held in `pendingIssueDate`, spread onto the payload
+// at the one call site that writes, folded into `unsaved`, and cleared in every
+// place the period is cleared.
+//
+// It is also why the pending note below spells the change out. A value the user
+// can neither see nor change is exactly what CLAUDE.md's "no locking" principle
+// exists to prevent; showing it — with Discard as the way to undo it — is the
+// least this screen can do while the field itself is display-only.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { Text, View } from 'react-native';
@@ -133,6 +147,15 @@ export default function InvoiceDetailScreen() {
    * see the note in the file header for why it cannot live on the draft.
    */
   const [pendingPeriod, setPendingPeriod] = useState<{ start: string; end: string } | null>(null);
+  /**
+   * The issue date a regenerate settled on, held until the next save.
+   *
+   * `null` means "leave the stored one alone" — either the sheet's toggle was
+   * unticked, or no regenerate has happened. Same lifetime and same clearing
+   * rules as `pendingPeriod`; see the file header for why it cannot live on the
+   * draft.
+   */
+  const [pendingIssueDate, setPendingIssueDate] = useState<string | null>(null);
 
   // Picker aids for the sheet, both best-effort — see their loaders below.
   const [projects, setProjects] = useState<Project[]>([]);
@@ -226,6 +249,9 @@ export default function InvoiceDetailScreen() {
    */
   useEffect(() => {
     setPendingPeriod(null);
+    // Cleared for the same reason and with the same urgency: left standing, a
+    // date agreed for one invoice would be stamped on whichever is shown next.
+    setPendingIssueDate(null);
     setRegenerating(false);
   }, [id]);
 
@@ -253,6 +279,19 @@ export default function InvoiceDetailScreen() {
       pendingPeriod.end !== (invoice.period_end ?? ''));
 
   /**
+   * Whether the held issue date actually differs from the stored one.
+   *
+   * Regenerating on the day the invoice was raised is a no-op for this field,
+   * and `issue_date` has no clearing sentinel — it is a plain date — so an empty
+   * one is never sent. Mirrors `periodMoved` exactly.
+   */
+  const issueDateMoved =
+    invoice !== null &&
+    pendingIssueDate !== null &&
+    pendingIssueDate !== '' &&
+    pendingIssueDate !== (invoice.issue_date ?? '');
+
+  /**
    * Is there anything to save? Not the same question as `dirty`.
    *
    * `isDirty` compares the draft against the invoice, and the period is on
@@ -266,7 +305,7 @@ export default function InvoiceDetailScreen() {
    * period changes no figure, so it must not flip the screen into preview mode
    * and label the server's own numbers "unsaved".
    */
-  const unsaved = dirty || periodMoved;
+  const unsaved = dirty || periodMoved || issueDateMoved;
 
   /**
    * The live preview of the draft.
@@ -352,9 +391,14 @@ export default function InvoiceDetailScreen() {
     lines: LineDraft[],
     periodStart: string,
     periodEnd: string,
+    issueDate: string | null,
   ) => {
     setDraft((prev) => (prev ? { ...prev, lines } : prev));
     setPendingPeriod({ start: periodStart, end: periodEnd });
+    // `null` when the sheet's toggle was unticked, and it overwrites rather than
+    // merges: the latest regenerate is the whole answer, so a second run with
+    // the toggle off takes back the date the first one proposed.
+    setPendingIssueDate(issueDate);
     setRegenerating(false);
   };
 
@@ -373,6 +417,11 @@ export default function InvoiceDetailScreen() {
         ...(periodMoved && pendingPeriod
           ? { period_start: pendingPeriod.start, period_end: pendingPeriod.end }
           : {}),
+        // The issue date rides along the same way and for the same reason: it
+        // is on the `Invoice`, not on the draft. `UpdateInvoicePayload` extends
+        // `Partial<CreateInvoicePayload>`, which declares `issue_date`, and
+        // `back/routers/invoices.py` writes it when it is not None.
+        ...(issueDateMoved && pendingIssueDate ? { issue_date: pendingIssueDate } : {}),
       };
       const updated = await updateInvoice(invoice.id, payload);
       // The response is the truth: every money field on it was recomputed
@@ -380,9 +429,10 @@ export default function InvoiceDetailScreen() {
       // is what retires the preview.
       setInvoice(updated);
       setDraft(draftFromInvoice(updated));
-      // Stored now, so it stops being pending. Left standing it would keep
-      // re-sending itself on every later save.
+      // Stored now, so they stop being pending. Left standing they would keep
+      // re-sending themselves on every later save.
       setPendingPeriod(null);
+      setPendingIssueDate(null);
     } catch (e: unknown) {
       setSaveError(apiErrorMessage(e, 'Could not save this invoice.'));
     } finally {
@@ -396,6 +446,10 @@ export default function InvoiceDetailScreen() {
     // the lines back to the stored ones while keeping the new period would
     // leave the invoice claiming to cover work it no longer lists.
     setPendingPeriod(null);
+    // Discard is the only way to take back a proposed issue date, since the
+    // field itself cannot be edited here. It must therefore actually take it
+    // back — see the file header.
+    setPendingIssueDate(null);
     setSaveError('');
   };
 
@@ -510,6 +564,23 @@ export default function InvoiceDetailScreen() {
               save.
             </Text>
           ) : null}
+
+          {/*
+            The held issue date, said out loud — the one thing on this screen the
+            user cannot open and retype. `HeaderCard` prints the stored date and
+            has no idea a new one is waiting, so without this the change would
+            land at save time unannounced. Seeing it, and being able to undo it
+            with Discard, is what keeps a display-only field honest (CLAUDE.md,
+            "no locking" — never present a value the user can neither see nor
+            take back).
+          */}
+          {issueDateMoved && pendingIssueDate ? (
+            <Text className="text-xs leading-relaxed text-amber-300/80">
+              The issue date becomes {pendingIssueDate} when you save
+              {invoice.issue_date ? `, replacing ${invoice.issue_date}` : ''}. Discard to keep it
+              as it is.
+            </Text>
+          ) : null}
         </View>
 
         <AdjustmentsCard
@@ -534,7 +605,16 @@ export default function InvoiceDetailScreen() {
           overDiscounted={overDiscounted}
         />
 
-        <MetaCard draft={draft} onChange={patchDraft} issueDate={invoice.issue_date || ''} />
+        {/*
+          The issue date the invoice will HAVE after saving, so the card's "due
+          before the issue date" warning is about the dates that will actually be
+          stored together. It is a warning either way — nothing there blocks.
+        */}
+        <MetaCard
+          draft={draft}
+          onChange={patchDraft}
+          issueDate={(issueDateMoved ? pendingIssueDate : invoice.issue_date) || ''}
+        />
 
         {/*
           Owned by another workstream and mounted against the agreed contract.
