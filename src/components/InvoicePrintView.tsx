@@ -154,6 +154,58 @@ export function InvoicePrintView({ invoice }: { invoice: Invoice }) {
 
       <div className="my-6 border-t border-slate-300" />
 
+      {/* Summary ------------------------------------------------------------
+          The three figures a client looks for first, before the detail. Every
+          one is the invoice's STORED value printed verbatim — the same numbers
+          the totals block at the foot of the page shows, read from the same
+          fields, not recomputed here (see the header comment). Nothing in this
+          band can therefore disagree with the bottom of the document.
+
+          Labelled "Total", not "Amount due". This view never prints payments —
+          `PaymentsPanel` states the rule outright: what reached the owner's
+          bank after FX is internal. So the document has no idea whether any of
+          this has been settled, and a band promising "amount due" would state
+          the full figure to a client who had already paid half of it. "Total"
+          is what the invoice bills, which is true whatever has been paid.
+
+          The background survives printing: `.invoice-sheet *` already carries
+          `print-color-adjust: exact` in index.css, which is there precisely so
+          fills like this one are not dropped by the browser. */}
+      <section className="invoice-break-avoid mb-6 rounded border border-slate-300 bg-slate-50 px-5 py-4">
+        <dl className="flex flex-wrap items-baseline justify-between gap-x-10 gap-y-4">
+          <div className="min-w-0">
+            <dt className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+              Total
+            </dt>
+            <dd className="mt-1 text-2xl font-bold tabular-nums text-slate-900">
+              {formatMoney(invoice.total, currency)}
+            </dd>
+          </div>
+
+          <div className="min-w-0">
+            <dt className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+              Total hours
+            </dt>
+            <dd className="mt-1 text-2xl font-bold tabular-nums text-slate-900">
+              {formatHours(invoice.total_hours)}
+            </dd>
+          </div>
+
+          {/* Dropped rather than shown empty: an invoice raised with no period
+              is legitimate, and an unlabelled dash reads like missing data. */}
+          {periodLabel && (
+            <div className="min-w-0">
+              <dt className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                Period
+              </dt>
+              <dd className="mt-1 whitespace-nowrap text-sm font-medium text-slate-900">
+                {periodLabel}
+              </dd>
+            </div>
+          )}
+        </dl>
+      </section>
+
       {/* Bill-to and meta --------------------------------------------------- */}
       <section className="invoice-break-avoid flex items-start justify-between gap-8">
         <div className="min-w-0">
