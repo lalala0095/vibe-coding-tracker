@@ -33,7 +33,8 @@ const KIND_STYLE: Record<LineChangeKind, string> = {
 
 const KIND_BLURB: Record<LineChangeKind, string> = {
   added: 'New work found in this period.',
-  updated: 'Hours or dates moved. Your rate, description and task list are kept.',
+  updated:
+    'Hours, dates, or a tracker’s sub-tasks moved. Your rate and description are kept.',
   removed: 'No longer backed by any time entry in this period. Applying drops these lines.',
   unchanged: 'Nothing to do.',
   manual: 'Added by hand, so nothing regenerates them.',
@@ -416,6 +417,16 @@ function ChangeRow({ change }: { change: LineChange }) {
         {change.datesChanged && (
           <p className="text-xs opacity-80 mt-0.5">
             Dates change to {change.line.date_from ?? '—'} – {change.line.date_to ?? '—'}
+          </p>
+        )}
+        {/* Only tracker lines can reach this — the merge leaves a task line's
+            bullets alone. Spelled out rather than counted: the whole point of
+            the change is *which* sub-tasks the client will see listed. */}
+        {change.subItemsChanged && (
+          <p className="text-xs opacity-80 mt-0.5">
+            {change.line.sub_items.length > 0
+              ? `Sub-tasks change to: ${change.line.sub_items.join(', ')}`
+              : 'Sub-tasks cleared — the tracker no longer lists any.'}
           </p>
         )}
       </div>
