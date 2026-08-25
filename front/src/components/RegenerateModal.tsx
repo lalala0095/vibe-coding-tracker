@@ -2,6 +2,10 @@ import { useMemo, useState } from 'react';
 import type { HoursRoundingDirection, Invoice, InvoiceLine, InvoicePreviewLine, Project } from '../types';
 import { previewInvoice } from '../api';
 import { mergeRegeneratedLines, type LineChange, type LineChangeKind, type MergeResult } from '../lib/regenerate';
+// `todaySgt()` and not `new Date().toISOString()`: the latter is UTC, so
+// between midnight and 08:00 in Singapore it names yesterday — and the whole
+// point of this option is to stamp the day the invoice was actually re-issued.
+import { todaySgt } from '../lib/week';
 import Modal, { MODAL_CANCEL_BUTTON, MODAL_PRIMARY_BUTTON, ButtonSpinner } from './Modal';
 // The form classes live with the other shared invoice-UI pieces rather than
 // being restated here, which is what let the three dialogs drift.
@@ -64,7 +68,13 @@ interface Props {
   // configured, and the option is not offered at all.
   roundingIncrement?: number;
   roundingDirection?: HoursRoundingDirection;
-  onApply: (lines: InvoiceLine[], periodStart: string, periodEnd: string) => void;
+  onApply: (
+    lines: InvoiceLine[],
+    periodStart: string,
+    periodEnd: string,
+    /** A bare `YYYY-MM-DD` to set as the issue date, or null to leave it alone. */
+    issueDate: string | null,
+  ) => void;
   onClose: () => void;
 }
 
@@ -76,6 +86,15 @@ export default function RegenerateModal({
   const [projectIds, setProjectIds] = useState<string[]>(invoice.project_ids ?? []);
   const [includeTrackers, setIncludeTrackers] = useState(true);
   const [includeInvoiced, setIncludeInvoiced] = useState(false);
+
+  // Pinned once for the life of the dialog, so the date shown on the checkbox
+  // is exactly the date Apply hands back even if the modal is left open across
+  // Singapore midnight.
+  const today = useMemo(() => todaySgt(), []);
+  // On by default: a regenerated invoice is being re-issued, and the printed
+  // document should carry the day it was re-issued rather than the day it was
+  // first raised. It stays a default — the field itself remains editable.
+  const [updateIssueDate, setUpdateIssueDate] = useState(true);
 
   const canRound =
     typeof roundingIncrement === 'number' && Number.isFinite(roundingIncrement) && roundingIncrement > 0;
@@ -157,6 +176,32 @@ export default function RegenerateModal({
       </label>
     ) : null;
 
+  // Also rendered in both steps. The date is spelled out the way the rounding
+  // rule is: the user should not have to work out which day they are agreeing
+  // to stamp on the document.
+  // `hasChanges` speaks only for the LINES. With the issue-date option on,
+  // Apply still does something to an invoice whose lines already match — it
+  // re-dates the document — so gating the button on `hasChanges` alone would
+  // make the option unreachable in exactly the case someone regenerates a
+  // settled invoice just to re-issue it today.
+  const issueDateWouldMove = updateIssueDate && today !== (invoice.issue_date ?? '');
+  const canApply = result !== null && (result.hasChanges || issueDateWouldMove);
+
+  const issueDateToggle = (
+    <label className="flex items-center gap-2 cursor-pointer">
+      <input
+        type="checkbox"
+        checked={updateIssueDate}
+        onChange={(e) => setUpdateIssueDate(e.target.checked)}
+        className={CHECKBOX}
+      />
+      <span className="text-xs text-slate-400">
+        Update the issue date to today
+        <span className="text-slate-500"> · {today}</span>
+      </span>
+    </label>
+  );
+
   return (
     <Modal
       title={`Regenerate lines · ${invoice.invoice_number}`}
@@ -176,7 +221,7 @@ export default function RegenerateModal({
               </button>
             )}
             <button onClick={onClose} className={MODAL_CANCEL_BUTTON}>
-              {result !== null && !result.hasChanges ? 'Close' : 'Cancel'}
+              {result !== null && !canApply ? 'Close' : 'Cancel'}
             </button>
             {result === null ? (
               <button
@@ -188,10 +233,17 @@ export default function RegenerateModal({
                 Load changes
               </button>
             ) : (
-              /* Already up to date: Apply would be a no-op, so it is not offered */
-              result.hasChanges && (
+              /* Offered whenever applying would change something — the lines,
+                 or the issue date on its own. A true no-op is not offered. */
+              canApply && (
                 <button
-                  onClick={() => { onApply(result.lines, periodStart, periodEnd); onClose(); }}
+                  onClick={() => {
+                    onApply(
+                      result.lines, periodStart, periodEnd,
+                      updateIssueDate ? today : null,
+                    );
+                    onClose();
+                  }}
                   className={MODAL_PRIMARY_BUTTON}
                 >
                   Apply to invoice
@@ -285,6 +337,7 @@ export default function RegenerateModal({
               </span>
             </label>
             {roundingToggle}
+            {issueDateToggle}
           </div>
 
           <p className="text-xs text-slate-500 leading-relaxed">
@@ -295,12 +348,13 @@ export default function RegenerateModal({
       ) : (
         /* ── Step 2: what applying would do ── */
         <div className="flex flex-col gap-4">
-          {roundingToggle && (
-            <div className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2">
-              {roundingToggle}
-            </div>
-          )}
-          <ChangeSummary result={result} />
+          {/* Unconditional now: the issue-date toggle is always offered, so
+              this box no longer hangs on a rounding increment existing. */}
+          <div className="flex items-center gap-4 flex-wrap rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2">
+            {roundingToggle}
+            {issueDateToggle}
+          </div>
+          <ChangeSummary result={result} issueDate={issueDateWouldMove ? today : null} />
         </div>
       )}
 
@@ -322,7 +376,7 @@ export default function RegenerateModal({
 
 // ── Change summary ────────────────────────────────────────────────────────────
 
-function ChangeSummary({ result }: { result: MergeResult }) {
+function ChangeSummary({ result, issueDate }: { result: MergeResult; issueDate: string | null }) {
   const delta = result.hoursAfter - result.hoursBefore;
 
   if (!result.hasChanges) {
@@ -332,6 +386,13 @@ function ChangeSummary({ result }: { result: MergeResult }) {
           This invoice is already up to date — the current time entries produce exactly the lines
           it already has.
         </p>
+        {/* Without this the panel reads as "nothing to do" while an Apply
+            button sits below it offering to change the date. */}
+        {issueDate && (
+          <p className="text-sm text-slate-300">
+            Applying would still re-date it to {issueDate}.
+          </p>
+        )}
         <p className="text-xs text-slate-500">
           {hoursText(result.hoursBefore)} across {result.lines.length} line
           {result.lines.length !== 1 ? 's' : ''}.
