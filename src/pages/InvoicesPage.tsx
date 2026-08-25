@@ -488,9 +488,19 @@ export default function InvoicesPage() {
           // configured and the modal simply does not offer rounding.
           roundingIncrement={settings?.hours_rounding_increment}
           roundingDirection={settings?.hours_rounding_direction}
-          onApply={(merged, periodStart, periodEnd) => {
+          onApply={(merged, periodStart, periodEnd, issueDate) => {
             setLines(merged);
             setPendingPeriod({ start: periodStart, end: periodEnd });
+            // Straight into the working meta rather than a pending value of its
+            // own: `issue_date` is already an ordinary editable field in
+            // InvoiceMetaFields and handleSave already sends it, so landing it
+            // here makes the regenerate a *default* the owner can still change
+            // — or put back — before saving. A separate pending date would slip
+            // past the form and become a constraint, which §1 forbids.
+            // `meta` is null whenever nothing is loaded into the editor.
+            if (issueDate !== null) {
+              setMeta((prev) => (prev === null ? prev : { ...prev, issue_date: issueDate }));
+            }
             setDirty(true);   // nothing is written until the user saves
           }}
           onClose={() => setShowRegenerate(false)}
