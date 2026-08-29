@@ -32,12 +32,20 @@
 //      header, and `screens/invoices/payments/PaymentsPanel`'s received_totals,
 //      which makes the same call.
 //
-//   2. The unbilled-tracker note is the most important thing on a card. Every
-//      figure here comes from time entries, because a tracker has no project
-//      and therefore no rate to price it with. A tracker you stopped but never
-//      billed contributes nothing — so without this note the week silently
-//      reads low, and reads low in precisely the situation you opened this view
-//      to look at.
+//   2. The provenance split is the most important thing on a card. Hours here
+//      come from two places: time entries, which are billed and invoiceable,
+//      and trackers that have not been billed yet, which `@/lib/weeklySummary`
+//      now prices by hopping `TrackerTaskRef.task_id` → `Task.project_id` — the
+//      same hop `bill_tracker` makes. Tracker time is therefore INSIDE every
+//      figure on a card, not missing from it, and the card no longer reads low
+//      for someone who bills at month end. But it is a projection of a bill
+//      that has not been raised, so wherever a figure is mixed the card says
+//      how much of it came from a tracker (`entry_hours` vs `trackers.hours`,
+//      `tracker_amount` on a currency, a chip on a project row). Nothing extra
+//      renders when the tracker part is zero: a fully-billed week must look
+//      exactly as clean as it always did. Running trackers and hours that
+//      reached no project (`unpriced_hours` — in the total, in no money figure)
+//      are called out for the same reason.
 //
 //   3. The estimate disclaimer is not boilerplate. These figures are
 //      `hours × rate` and nothing else, while a real invoice can carry a
@@ -59,6 +67,7 @@ import {
   averageWeeklyHours,
   totalAcross,
   type ProjectTotal,
+  type TrackerHours,
   type WeekSummary,
 } from '@/lib/weeklySummary';
 
@@ -123,6 +132,42 @@ function zeroRateNote(row: ProjectTotal): string | null {
   return `Zero is a real rate — ${RATE_SOURCE_LABEL[row.rate_source].toLowerCase()} bills nothing for this project.`;
 }
 
+/**
+ * What the tracker share of a figure has to say, in order of what it changes.
+ *
+ * Every line here qualifies hours that are already counted above it: the
+ * projection, the timer that is still running, and the part nothing could price.
+ * One helper rather than two copies because the week card and the window totals
+ * must not drift into describing the same arithmetic differently.
+ *
+ * Nothing is clamped or hidden, including a timer left running overnight —
+ * CLAUDE.md § "no locking". Every figure below arrives pre-quantised from
+ * `@/lib/weeklySummary`; this only chooses words.
+ */
+function trackerNoteLines(trackers: TrackerHours): string[] {
+  const lines = [
+    `${formatHours(trackers.hours)} of that is tracker time not billed into time entries yet — included above as a projection. Bill it from the Trackers tab to make it invoiceable.`,
+  ];
+
+  if (trackers.running_count > 0) {
+    lines.push(
+      trackers.running_count === 1
+        ? `1 tracker is still running: ${formatHours(trackers.running_hours)} of it is measured to right now and still growing.`
+        : `${trackers.running_count} trackers are still running: ${formatHours(trackers.running_hours)} of that is measured to right now and still growing.`
+    );
+  }
+
+  // In the hours, in no money figure — the one line here that says a figure is
+  // genuinely incomplete rather than merely provisional.
+  if (trackers.unpriced_hours > 0) {
+    lines.push(
+      `${formatHours(trackers.unpriced_hours)} reached no project, so it counts in the hours but in no money figure. Attach a task to that tracker to price it.`
+    );
+  }
+
+  return lines;
+}
+
 // ── Week card ─────────────────────────────────────────────────────────────────
 
 function WeekCard({
@@ -173,6 +218,24 @@ function WeekCard({
           </View>
         </View>
 
+        {/* ── Where the headline hours came from ──
+            Only when the two sources are actually mixed. The figure above is
+            time entries plus unbilled tracker time, and those two are worth
+            very different amounts today: one is invoiceable, the other is a
+            projection. A fully-billed week renders none of this. */}
+        {week.trackers.hours > 0 ? (
+          <View className="flex-row flex-wrap items-baseline gap-x-4 gap-y-1">
+            <Text className="text-xs text-slate-400">
+              Time entries{' '}
+              <Text className="tabular-nums text-slate-200">{formatHours(week.entry_hours)}</Text>
+            </Text>
+            <Text className="text-xs text-slate-400">
+              Not billed yet{' '}
+              <Text className="tabular-nums text-amber-300">{formatHours(week.trackers.hours)}</Text>
+            </Text>
+          </View>
+        ) : null}
+
         {/* ── Billable / non-billable ──
             Non-billable hours are real hours that convert to no money. They are
             inside the headline figure and outside every money figure, so the
@@ -199,36 +262,50 @@ function WeekCard({
         {week.totals.length > 0 ? (
           <View className="gap-1">
             {week.totals.map((total) => (
-              <View key={total.currency} className="flex-row items-baseline gap-2">
-                <Text className="text-base font-medium tabular-nums text-slate-100">
-                  {formatMoney(total.amount, total.currency)}
-                </Text>
-                <Text className="min-w-0 flex-1 text-xs text-slate-500" numberOfLines={1}>
-                  {total.currency} · {formatHours(total.hours)}
-                </Text>
+              <View key={total.currency}>
+                <View className="flex-row items-baseline gap-2">
+                  <Text className="text-base font-medium tabular-nums text-slate-100">
+                    {formatMoney(total.amount, total.currency)}
+                  </Text>
+                  <Text className="min-w-0 flex-1 text-xs text-slate-500" numberOfLines={1}>
+                    {total.currency} · {formatHours(total.hours)}
+                  </Text>
+                </View>
+                {/* Part of the amount above, never an addend — the money a
+                    tracker would raise if it were billed. No `numberOfLines`:
+                    the line may wrap, but truncating a money figure at 375px is
+                    not an option. */}
+                {total.tracker_hours > 0 ? (
+                  <Text className="text-xs tabular-nums text-amber-300/70">
+                    of which {formatMoney(total.tracker_amount, total.currency)} ·{' '}
+                    {formatHours(total.tracker_hours)} not billed yet
+                  </Text>
+                ) : null}
               </View>
             ))}
           </View>
         ) : week.hours > 0 ? (
           <Text className="text-xs leading-relaxed text-slate-500">
-            Nothing billable — every time entry this week is marked non-billable.
+            {week.entry_hours === 0 && week.trackers.unpriced_hours > 0
+              ? 'No money figure — the tracker time this week reached no project, so nothing prices it.'
+              : 'Nothing billable — every time entry this week is marked non-billable.'}
           </Text>
         ) : null}
 
-        {/* ── Unbilled trackers ──
-            The one note that changes what the numbers above MEAN. These hours
-            are absent from every figure on this card, so the card reads low
-            until they are billed. Written as an explanation and a next step,
-            not as an error: not billing a tracker yet is normal. */}
-        {week.unbilled.count > 0 ? (
+        {/* ── Tracker time inside the figures above ──
+            Not a warning that something is missing: these hours ARE counted in
+            every figure on this card. What they are not is billed, and until
+            they are they cannot go on an invoice. Written as provenance and a
+            next step — billing at month end is the normal way to work here. */}
+        {week.trackers.count > 0 ? (
           <AmberNote
             title={
-              week.unbilled.count === 1
-                ? '1 tracker stopped this week was never billed into time entries.'
-                : `${week.unbilled.count} trackers stopped this week were never billed into time entries.`
+              week.trackers.count === 1
+                ? '1 tracker this week is counted here but not billed yet.'
+                : `${week.trackers.count} trackers this week are counted here but not billed yet.`
             }
           >
-            {`Roughly ${formatHours(week.unbilled.hours)} of elapsed tracker time is missing from every figure on this card, so the week reads low. Bill the tracker from the Trackers tab and its hours appear here.`}
+            {trackerNoteLines(week.trackers).join('\n')}
           </AmberNote>
         ) : null}
       </View>
@@ -290,6 +367,14 @@ function WeekCard({
                       <Text className="text-slate-600"> · {RATE_SOURCE_LABEL[row.rate_source]}</Text>
                     </Text>
 
+                    {/* Part of the hours and amount on this row, not extra. The
+                        row's `entry_count` can legitimately be 0 while the row
+                        carries real hours — a project reached only through a
+                        tracker — so the chip is what explains the row at all. */}
+                    {row.tracker_hours > 0 ? (
+                      <Chip label={`${formatHours(row.tracker_hours)} not billed`} tone="amber" />
+                    ) : null}
+
                     {/* Hours that were logged but not billable do not reach the
                         amount, so the row only adds up when the gap is named. */}
                     {row.billable_hours !== row.hours ? (
@@ -347,11 +432,16 @@ export default function WeeklySummaryView({
   // weeks themselves are still real and still listed below by `summariseWeeks`;
   // this only decides whether to explain the emptiness first.
   //
-  // Keyed on `entry_count`, not on `hours === 0`: those two come apart when
-  // every entry in the window rounds to 0.00 h, and saying "no time entries
-  // fall in the last N weeks" over a window that has some would be a plain
-  // falsehood. The two cases get different copy below.
-  const nothingTracked = weeks.length === 0 || totals.entry_count === 0;
+  // `hours` first, because hours now arrive from time entries AND from trackers
+  // not yet billed: a month of daily trackers and no billing run has
+  // `entry_count === 0` and is emphatically not empty, and keying on the count
+  // alone would hide the whole window behind an empty state.
+  //
+  // `entry_count` still has one job — the window where entries exist but every
+  // one of them rounds to 0.00 h. That is not "nothing tracked" and gets its
+  // own copy below, so the two conditions stay separate rather than collapsing
+  // into `hours === 0`.
+  const nothingTracked = weeks.length === 0 || (totals.hours === 0 && totals.entry_count === 0);
   const trackedButUnmeasured = !nothingTracked && totals.hours === 0;
 
   const toggleWeek = (key: string, fallback: boolean) => {
@@ -402,7 +492,19 @@ export default function WeeklySummaryView({
             <Card>
               <View className="gap-3">
                 <View className="flex-row flex-wrap gap-x-6 gap-y-3">
-                  <Figure label="Total hours" value={formatHours(totals.hours)} />
+                  <Figure
+                    label="Total hours"
+                    value={formatHours(totals.hours)}
+                    // Only when the two sources are mixed — an all-billed
+                    // window keeps the bare figure it has always had.
+                    hint={
+                      totals.trackers.hours > 0
+                        ? `${formatHours(totals.entry_hours)} billed · ${formatHours(
+                            totals.trackers.hours
+                          )} not yet`
+                        : undefined
+                    }
+                  />
                   <Figure
                     label="Average week"
                     value={formatHours(average)}
@@ -416,7 +518,16 @@ export default function WeeklySummaryView({
                       key={total.currency}
                       label={total.currency}
                       value={formatMoney(total.amount, total.currency)}
-                      hint={formatHours(total.hours)}
+                      // The second line is part of the amount above, not an
+                      // addition to it.
+                      hint={
+                        total.tracker_hours > 0
+                          ? `${formatHours(total.hours)}\nof which ${formatMoney(
+                              total.tracker_amount,
+                              total.currency
+                            )} not billed yet`
+                          : formatHours(total.hours)
+                      }
                     />
                   ))}
                 </View>
@@ -435,6 +546,20 @@ export default function WeeklySummaryView({
                     </Text>
                     {' of the total is non-billable and earns nothing.'}
                   </Text>
+                ) : null}
+
+                {/* The window's version of the card note: these hours are in
+                    the figures above, they are simply not invoiceable yet. */}
+                {totals.trackers.count > 0 ? (
+                  <AmberNote
+                    title={
+                      totals.trackers.count === 1
+                        ? '1 tracker in this window is counted here but not billed yet.'
+                        : `${totals.trackers.count} trackers in this window are counted here but not billed yet.`
+                    }
+                  >
+                    {trackerNoteLines(totals.trackers).join('\n')}
+                  </AmberNote>
                 ) : null}
 
                 {/* Said once, quietly, next to the figures it qualifies. */}
@@ -463,28 +588,17 @@ export default function WeeklySummaryView({
             </Card>
           ) : null}
 
-          {/* ── Nothing tracked ── */}
+          {/* ── Nothing tracked ──
+              Genuinely nothing now: no time entries and no tracker time either,
+              since an unbilled tracker counts towards `totals.hours` and would
+              have kept the window out of this branch. So there is no
+              unbilled-tracker note to make here any more — a window with
+              trackers in it renders cards. */}
           {nothingTracked ? (
-            <View className="gap-3">
-              <EmptyState
-                title={`No time entries fall in the last ${weekCount} weeks.`}
-                subtitle="Hours only reach this view once a tracker has been billed into time entries — a tracker on its own is a grouping and carries no rate to price it with. Bill one from the Trackers tab and its hours appear in the week it started."
-              />
-
-              {/* The likeliest reason the window is empty, so it belongs here
-                  and not only on the individual cards below. */}
-              {totals.unbilled.count > 0 ? (
-                <AmberNote
-                  title={
-                    totals.unbilled.count === 1
-                      ? '1 stopped tracker in this window was never billed into time entries.'
-                      : `${totals.unbilled.count} stopped trackers in this window were never billed into time entries.`
-                  }
-                >
-                  {`That is roughly ${formatHours(totals.unbilled.hours)} of elapsed tracker time not counted anywhere on this view.`}
-                </AmberNote>
-              ) : null}
-            </View>
+            <EmptyState
+              title={`Nothing tracked in the last ${weekCount} weeks.`}
+              subtitle="Hours arrive here from time entries and from trackers you have not billed yet — neither has anything in this window. Start a tracker, or add a time entry, and it appears in the week it began."
+            />
           ) : null}
 
           {/* ── One card per week, newest first ──
