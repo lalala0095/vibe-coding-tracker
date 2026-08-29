@@ -19,15 +19,21 @@
 // The second tab is the same summary the web's `TrackersPage` shows, over the
 // same arithmetic: `src/lib/week.ts` and `src/lib/weeklySummary.ts` are copies
 // of the web's, so the phone and the browser cannot quote different money for
-// the same week. Nothing is computed here — this file gathers the six inputs
+// the same week. Nothing is computed here — this file gathers the inputs
 // `summariseWeeks` asks for and hands them over.
 //
-// Four of the six were already on this screen. In particular `getSessions()`
+// Trackers and time entries are both hours, and the summary counts both: an
+// unbilled tracker contributes `span - hours already billed against it`, so
+// the week you have just worked reads right before you have billed any of it.
+// Half those inputs were already on this screen. In particular `getSessions()`
 // was already being called on mount, counted per tracker for the delete
 // confirmation, and then thrown away; the entries are kept now, so the summary
-// costs no extra request for the hours it is made of. Only clients and invoice
-// settings are new, and they are fetched the first time the tab is opened, so
-// the Trackers tab costs exactly what it cost before this tab existed.
+// costs no extra request for the hours it is made of. Clients, tasks and
+// invoice settings are the additions, and all three are fetched the first time
+// the tab is opened, so the Trackers tab costs exactly what it cost before
+// this tab existed. Tasks are there for one reason: a tracker has no project,
+// and `TrackerTaskRef.task_id` -> `Task.project_id` is the only route from a
+// tracker's hours to a rate.
 //
 // ── The two rules this file is where they are kept ───────────────────────────
 //
@@ -73,6 +79,7 @@ import {
   getInvoiceSettings,
   getProjects,
   getSessions,
+  getTasks,
   getTrackerSettings,
   getTrackers,
   removeTaskFromTracker,
@@ -110,6 +117,7 @@ import type {
   Client,
   InvoiceSettings,
   Project,
+  Task,
   Session,
   Tracker,
   TrackerSettings,
@@ -196,6 +204,12 @@ export default function TrackersScreen() {
   // read by the summary, which is why neither is in `load()` — a client outage
   // must not cost the user their tracker list.
   const [clients, setClients] = useState<Client[]>([]);
+  // Load-bearing for the summary, not incidental. A tracker carries no
+  // `project_id`, so the only way its unbilled hours reach a rate is
+  // `TrackerTaskRef.task_id` -> `Task.project_id` — the same hop
+  // `bill_tracker` makes on the server. Without this list every tracker hour
+  // still shows up in the week's hours, but with no money against it.
+  const [tasks, setTasks] = useState<Task[]>([]);
   // Note the name: `settings` above is the *tracker* settings (the auto-name
   // template). These are the invoice settings, the last link in the rate chain,
   // and the two must never be conflated.
@@ -263,18 +277,22 @@ export default function TrackersScreen() {
   }, []);
 
   /**
-   * Clients and invoice settings — the rest of the rate chain.
+   * Clients, tasks and invoice settings — the rest of the rate chain.
    *
-   * Neither is fatal, but neither is swallowed either. `getTrackerSettings()`
+   * None is fatal, but none is swallowed either. `getTrackerSettings()`
    * above can fail in silence because it costs a pre-filled title; losing a
    * link of the rate chain silently *changes money*. So the summary still
    * renders with what did arrive — `settings: null` makes every rate that would
    * have come from settings fall back to "No rate set" rather than to a
    * plausible wrong number — and `rateNote` says so out loud above it.
    *
+   * Tasks are in here rather than in `load()` for the same reason as the other
+   * two: they are read only by the summary. Losing them is the mildest of the
+   * three — the tracker hours still appear, they just arrive unpriced.
+   *
    * Sequential, not `Promise.all`: each has its own fallback and its own
-   * sentence, and the two notes are joined into one so a double outage reads as
-   * one message instead of overwriting itself.
+   * sentence, and the notes are joined into one so a double outage reads as one
+   * message instead of overwriting itself.
    */
   const loadRates = useCallback(async (options?: { silent?: boolean }) => {
     if (!options?.silent) setRatesLoading(true);
@@ -284,6 +302,14 @@ export default function TrackersScreen() {
     } catch {
       setClients([]);
       notes.push('Clients could not be loaded, so no client default rate is applied.');
+    }
+    try {
+      setTasks(await getTasks());
+    } catch {
+      setTasks([]);
+      notes.push(
+        'Tasks could not be loaded, so hours from trackers that are not billed yet are counted but not priced.',
+      );
     }
     try {
       setInvoiceSettings(await getInvoiceSettings());
@@ -408,10 +434,11 @@ export default function TrackersScreen() {
         trackers,
         projects,
         clients,
+        tasks,
         settings: invoiceSettings,
         weekStarts,
       }),
-    [entries, trackers, projects, clients, invoiceSettings, weekStarts],
+    [entries, trackers, projects, clients, tasks, invoiceSettings, weekStarts],
   );
 
   const applyTracker = useCallback((updated: Tracker) => {
