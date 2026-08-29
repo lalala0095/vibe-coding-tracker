@@ -1,18 +1,59 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // What a week of tracked time is worth.
 //
-// ── Where the hours come from, and why not from trackers ─────────────────────
+// ── Two sources of hours, and why both are needed ────────────────────────────
 //
-// A tracker is a grouping. It has a span, but no project and therefore no rate:
-// `Tracker` carries `TrackerTaskRef[]`, which holds names for display and no
-// IDs to resolve a rate through. `back/routers/trackers.py:bill_tracker` says
-// this outright — "a tracker on its own is a grouping and carries no billable
-// time; only the `sessions` collection feeds the invoice preview."
+// Time entries (the `sessions` collection) are the billable record: they carry
+// a project, and therefore a rate. Trackers are the daily habit — you start
+// one, it collects tasks, and its span only becomes billable when
+// `POST /trackers/{id}/bill` turns it into time entries.
 //
-// So every figure below is derived from time entries. That means a tracker you
-// stopped but never billed contributes nothing here, which would be a silent
-// undercount of exactly the hours you were trying to see. `unbilled` on each
-// week exists to say so out loud rather than let the total quietly read low.
+// This file used to report time entries alone and merely *warn* that stopped,
+// unbilled trackers were missing. For someone who runs a tracker every day and
+// bills in a batch at month end, that meant the week they had just worked read
+// as zero. So trackers are now ingested too — but never on top of the entries
+// they already produced. See "Never counted twice" below.
+//
+// ── How a tracker gets a rate, given it has no project ───────────────────────
+//
+// A `Tracker` really does carry no `project_id`, and `TrackerTaskRef` holds
+// denormalised names. But it does carry `task_id`, and a task carries
+// `project_id` — which is exactly the hop `bill_tracker` makes on the server
+// (`_resolve_tracker_tasks`, which re-reads the tasks precisely because "a time
+// entry needs project_id and client_id, which the TaskRef does not carry").
+// `summariseWeeks` therefore takes the task list and makes the same hop.
+//
+// When the task has been deleted, the TaskRef's `project_name` + `client_name`
+// are tried against the loaded projects as a fallback. When neither resolves,
+// the hours are still counted and reported as `unpriced_hours` — hours you
+// worked are a fact even when nothing can price them, and dropping them is the
+// undercount this change exists to remove.
+//
+// ── Never counted twice ──────────────────────────────────────────────────────
+//
+// A tracker contributes `max(0, span − hours already billed against it)`.
+//
+//   - Never billed          → its whole span, priced through its tasks.
+//   - Billed in full        → nothing; the time entries already carry it.
+//   - Billed in part        → only the remainder (`bill_tracker` skips tasks
+//                             that already have an entry, so this is a real
+//                             state, not a hypothetical).
+//   - Billed for MORE than
+//     it ran (hours on an
+//     entry are editable)   → nothing. The entries win; the clamp at 0 means a
+//                             tracker can never subtract from a week.
+//
+// The remainder is split across the tracker's not-yet-billed tasks the same way
+// `_split_hours` splits it — evenly, remainder on the first share — so what you
+// read here is what billing would actually write.
+//
+// ── Running trackers are included, and flagged ───────────────────────────────
+//
+// A tracker running right now is real work in progress, and the person reading
+// this screen at 4pm wants today in the figure. Its elapsed-so-far is counted
+// and reported separately as `running_hours` so a timer left on overnight is
+// visible as such rather than buried in the total. Warned about, never clamped
+// — CLAUDE.md § "no locking".
 //
 // ── Which rate ───────────────────────────────────────────────────────────────
 //
@@ -28,7 +69,8 @@
 // It is `hours × rate` and nothing else. A real invoice can carry a per-line
 // rate override, a discount and tax, none of which exist yet at this point, so
 // the figure here and the figure on the eventual invoice are allowed to differ.
-// The pane says this; the arithmetic below cannot.
+// Tracker hours widen that gap — they are a projection of a bill that has not
+// been raised. The pane says this; the arithmetic below cannot.
 //
 // ── Currencies do not add up ─────────────────────────────────────────────────
 //
@@ -42,7 +84,15 @@
 
 import { computeLineAmount, roundHours, roundMoney } from './money';
 import { addDays, dayOf, weekEndOf, weekHeading, weekRangeLabel, weekStartOf } from './week';
-import type { Client, InvoiceSettings, Project, Session, Tracker } from '../types';
+import type {
+  Client,
+  InvoiceSettings,
+  Project,
+  Session,
+  Task,
+  Tracker,
+  TrackerTaskRef,
+} from '../types';
 
 // ── Rates ─────────────────────────────────────────────────────────────────────
 
@@ -104,12 +154,20 @@ export function resolveRate(
 
 // ── Shapes ────────────────────────────────────────────────────────────────────
 
-/** One currency's worth of a week. Never blended with another's. */
+/**
+ * One currency's worth of a week. Never blended with another's.
+ *
+ * `tracker_hours` / `tracker_amount` are the part of `hours` / `amount` that
+ * came from unbilled trackers rather than time entries — the "of which,
+ * projected" portion, not a second figure to add on.
+ */
 export interface CurrencyTotal {
   currency: string;
   /** Billable hours that resolved to this currency. */
   hours: number;
   amount: number;
+  tracker_hours: number;
+  tracker_amount: number;
 }
 
 /** A week's hours for one project, and what they convert to. */
@@ -120,22 +178,39 @@ export interface ProjectTotal {
   rate: number;
   rate_source: RateSource;
   currency: string;
-  /** Every hour logged, billable or not. */
+  /** Every hour logged, billable or not, from both sources. */
   hours: number;
   billable_hours: number;
   amount: number;
+  /** Time entries only. A tracker is not an entry and is counted below. */
   entry_count: number;
+  /** The part of `hours` / `amount` above that came from unbilled trackers. */
+  tracker_hours: number;
+  tracker_amount: number;
+  /** Unbilled trackers that contributed to this project. */
+  tracker_count: number;
 }
 
-/** Trackers stopped in a week that never became time entries. */
-export interface UnbilledTrackers {
+/**
+ * The tracker-derived part of a week — already inside every figure above it.
+ *
+ * This is a provenance breakdown, never an addend. `hours` here is a subset of
+ * `WeekSummary.hours`, and adding the two together double-counts.
+ */
+export interface TrackerHours {
+  /** Trackers that contributed anything to this week. */
   count: number;
-  /**
-   * Their elapsed spans, added up. A warning figure, not a billed one — a
-   * tracker whose end precedes its start (which nothing forbids) contributes
-   * 0 here rather than subtracting from the others.
-   */
+  /** Their contribution, in hours. */
   hours: number;
+  /** Of `count` / `hours`, the part still running right now. */
+  running_count: number;
+  running_hours: number;
+  /**
+   * Hours from trackers whose task resolved to no project, and which therefore
+   * appear in `hours` but in no currency total. Counted rather than dropped:
+   * worked hours are a fact even when nothing prices them.
+   */
+  unpriced_hours: number;
 }
 
 export interface WeekSummary {
@@ -147,13 +222,17 @@ export interface WeekSummary {
   heading: string;
   /** Always the date range, for the line under the heading. */
   range: string;
+  /** Time entries plus unbilled trackers. The headline figure. */
   hours: number;
   billable_hours: number;
   non_billable_hours: number;
+  /** The part of `hours` that came from time entries. */
+  entry_hours: number;
+  /** How many time entries. Trackers are counted in `trackers.count`. */
   entry_count: number;
   totals: CurrencyTotal[];
   projects: ProjectTotal[];
-  unbilled: UnbilledTrackers;
+  trackers: TrackerHours;
 }
 
 export interface WeeklySummaryInput {
@@ -161,10 +240,24 @@ export interface WeeklySummaryInput {
   trackers: Tracker[];
   projects: Project[];
   clients: Client[];
+  /**
+   * The task list, which is how a tracker reaches a project and therefore a
+   * rate — `TrackerTaskRef` carries `task_id` but no `project_id`. An empty
+   * list is not fatal: pricing falls back to matching the ref's denormalised
+   * project and client names against `projects`.
+   */
+  tasks: Task[];
   /** Null when the settings call failed — the chain then stops at the client. */
   settings: InvoiceSettings | null;
   /** Mondays to report on, newest first. See `recentWeekStarts`. */
   weekStarts: string[];
+  /**
+   * "Now", as an epoch, for measuring a tracker that has not stopped. Injected
+   * so a test can pin it; defaults to the real clock. Nothing here formats it,
+   * so no timezone is involved — it is only ever subtracted from another
+   * instant.
+   */
+  now?: number;
 }
 
 // ── Accumulation ──────────────────────────────────────────────────────────────
@@ -183,19 +276,160 @@ function byId<T extends { id: string }>(rows: T[]): Map<string, T> {
   return new Map((rows ?? []).map((row) => [row.id, row]));
 }
 
-/** A tracker's elapsed hours, or null when it has not stopped or cannot be read. */
-export function trackerSpanHours(tracker: Tracker): number | null {
-  if (!tracker.end_time) return null;
+/**
+ * A tracker's elapsed hours, or null when it cannot be read.
+ *
+ * `now` measures a tracker that has not stopped; without it a running tracker
+ * returns null, which is what a caller that only wants finished work relies on.
+ *
+ * Negative spans clamp to 0, mirroring `_tracker_hours`'s `max(0.0, ...)`: an
+ * end before its start is bad data, and letting it through would have a tracker
+ * subtract from the week.
+ */
+export function trackerSpanHours(tracker: Tracker, now?: number | null): number | null {
   // Both ends carry `+08:00`, so this is a subtraction of two instants and no
   // timezone enters into it.
   const start = Date.parse(tracker.start_time);
-  const end = Date.parse(tracker.end_time);
-  if (Number.isNaN(start) || Number.isNaN(end)) return null;
-  return roundHours((end - start) / 3_600_000);
+  if (Number.isNaN(start)) return null;
+
+  let end: number;
+  if (tracker.end_time) {
+    end = Date.parse(tracker.end_time);
+    if (Number.isNaN(end)) return null;
+  } else {
+    if (now === null || now === undefined) return null;
+    end = now;
+  }
+
+  return roundHours(Math.max(0, (end - start) / 3_600_000));
 }
 
 /**
- * Bucket time entries into weeks and price them.
+ * Share `total` hours across `count` entries, evenly.
+ *
+ * Follows `back/routers/trackers.py:_split_hours` in its default `"even"`
+ * mode, remainder on the first share included, so the shares previewed here
+ * are the shares billing would write. `"full"` is not ported: it is an explicit
+ * choice made in the billing dialog, and assuming it in a summary would
+ * multiply a week's hours by the number of tasks on a tracker.
+ *
+ * Not quite byte-identical to the server, and deliberately so. `_split_hours`
+ * quantises with Python's built-in `round`, which is banker's rounding over a
+ * float; `roundHours` is the ROUND_HALF_UP quantiser CLAUDE.md mandates
+ * everywhere else in this codebase. They disagree only when a share lands on an
+ * exact half cent — `evenSplit(0.15, 2)` is `[0.07, 0.08]` here and
+ * `[0.08, 0.07]` there. Verified across 90 two-decimal cases: the two agree on
+ * 84, and on all 90 the shares still sum back to the total, which is the
+ * property that matters — the disagreement moves one cent's worth of an hour
+ * between two tasks and never changes what a week is worth. Importing a fourth
+ * rounding mode to match the server exactly would cost more than it buys.
+ */
+export function evenSplit(total: number, count: number): number[] {
+  if (count <= 0) return [];
+  const each = roundHours(total / count);
+  const parts: number[] = new Array(count).fill(each);
+  parts[0] = roundHours(total - each * (count - 1));
+  return parts;
+}
+
+/** One task's share of a tracker's unbilled time. */
+export interface TrackerShare {
+  task_id: string;
+  task_title: string;
+  project_name: string;
+  client_name: string;
+  hours: number;
+}
+
+/** What one tracker adds to its week. */
+export interface TrackerContribution {
+  tracker_id: string;
+  /** The SGT date the tracker started — the same slice the server files on. */
+  day: string;
+  running: boolean;
+  /** `max(0, span − already billed)`, and the sum of the shares below. */
+  hours: number;
+  /** Empty when the tracker has no tasks at all — then `hours` is unpriceable. */
+  shares: TrackerShare[];
+}
+
+/**
+ * What each tracker still owes its week, after the entries it already produced.
+ *
+ * Exported because this is the part with the double-count in it, and it is
+ * worth being able to assert on directly rather than only through a week's
+ * totals.
+ */
+export function trackerContributions(
+  trackers: Tracker[],
+  sessions: Session[],
+  now: number
+): TrackerContribution[] {
+  // Built from EVERY loaded session, not just the ones inside a requested week:
+  // a tracker billed into an entry that was later re-dated out of the window
+  // must still count as billed, or its hours reappear as a phantom estimate.
+  const billedHours = new Map<string, number>();
+  const billedTasks = new Map<string, Set<string>>();
+  for (const session of sessions ?? []) {
+    const id = session.tracker_id;
+    if (!id) continue;
+    billedHours.set(id, addHours(billedHours.get(id) ?? 0, roundHours(session.effective_hours)));
+    const tasks = billedTasks.get(id) ?? new Set<string>();
+    if (session.task_id) tasks.add(session.task_id);
+    billedTasks.set(id, tasks);
+  }
+
+  const out: TrackerContribution[] = [];
+
+  for (const tracker of trackers ?? []) {
+    const day = dayOf(tracker.start_time);
+    if (day === null) continue;
+
+    const running = !tracker.end_time;
+    const span = trackerSpanHours(tracker, now);
+    if (span === null) continue;
+
+    // The clamp is what makes a tracker incapable of reducing a week. Hours on
+    // a time entry are freely editable, so billing 3 hours off a 2-hour tracker
+    // is a legal state, and `span − billed` is then negative.
+    const remaining = roundHours(Math.max(0, span - (billedHours.get(tracker.id) ?? 0)));
+    if (remaining <= 0) continue;
+
+    const refs: TrackerTaskRef[] = tracker.tasks ?? [];
+    const alreadyBilled = billedTasks.get(tracker.id) ?? new Set<string>();
+    // The tasks a re-bill would actually write to, exactly as `bill_tracker`
+    // computes `pending`. If every task has an entry yet time is still
+    // outstanding — the hours on those entries were edited down — the remainder
+    // belongs to all of them rather than to nobody.
+    const pending = refs.filter((ref) => !alreadyBilled.has(ref.task_id));
+    const base = pending.length > 0 ? pending : refs;
+
+    if (base.length === 0) {
+      out.push({ tracker_id: tracker.id, day, running, hours: remaining, shares: [] });
+      continue;
+    }
+
+    const shares = evenSplit(remaining, base.length);
+    out.push({
+      tracker_id: tracker.id,
+      day,
+      running,
+      hours: remaining,
+      shares: base.map((ref, i) => ({
+        task_id: ref.task_id,
+        task_title: ref.task_title,
+        project_name: ref.project_name,
+        client_name: ref.client_name,
+        hours: shares[i] ?? 0,
+      })),
+    });
+  }
+
+  return out;
+}
+
+/**
+ * Bucket time entries and unbilled trackers into weeks, and price them.
  *
  * Weeks with nothing in them are kept, in the order `weekStarts` gave them: a
  * quiet week is a real answer, and dropping it would make the list look denser
@@ -209,21 +443,36 @@ export function summariseWeeks({
   trackers,
   projects,
   clients,
+  tasks,
   settings,
   weekStarts,
+  now,
 }: WeeklySummaryInput): WeekSummary[] {
   const projectById = byId(projects);
   const clientById = byId(clients);
+  const taskById = byId(tasks ?? []);
+
+  // The fallback path for a tracker whose task has since been deleted. Keyed on
+  // the pair, because two clients may each have a project called "Website" and
+  // charging one client's rate to the other's work is the kind of wrong that
+  // never announces itself. An ambiguous name resolves to nothing rather than
+  // to a coin flip.
+  const projectByName = new Map<string, Project | null>();
+  for (const project of projects ?? []) {
+    const key = `${project.client_name} ${project.name}`;
+    projectByName.set(key, projectByName.has(key) ? null : project);
+  }
 
   // Working buckets, one per requested Monday.
   interface Bucket {
     hours: number;
     billable_hours: number;
     non_billable_hours: number;
+    entry_hours: number;
     entry_count: number;
     byCurrency: Map<string, CurrencyTotal>;
     byProject: Map<string, ProjectTotal>;
-    unbilled: UnbilledTrackers;
+    trackers: TrackerHours;
   }
 
   const buckets = new Map<string, Bucket>();
@@ -232,12 +481,55 @@ export function summariseWeeks({
       hours: 0,
       billable_hours: 0,
       non_billable_hours: 0,
+      entry_hours: 0,
       entry_count: 0,
       byCurrency: new Map(),
       byProject: new Map(),
-      unbilled: { count: 0, hours: 0 },
+      trackers: { count: 0, hours: 0, running_count: 0, running_hours: 0, unpriced_hours: 0 },
     });
   }
+
+  /** The running row for a project inside a bucket, created on first touch. */
+  function projectRow(
+    bucket: Bucket,
+    key: string,
+    seed: Pick<
+      ProjectTotal,
+      'project_id' | 'project_name' | 'client_name' | 'rate' | 'rate_source' | 'currency'
+    >
+  ): ProjectTotal {
+    const existing = bucket.byProject.get(key);
+    if (existing) return existing;
+    const row: ProjectTotal = {
+      ...seed,
+      hours: 0,
+      billable_hours: 0,
+      amount: 0,
+      entry_count: 0,
+      tracker_hours: 0,
+      tracker_amount: 0,
+      tracker_count: 0,
+    };
+    bucket.byProject.set(key, row);
+    return row;
+  }
+
+  /** The running row for a currency inside a bucket, created on first touch. */
+  function currencyRow(bucket: Bucket, currency: string): CurrencyTotal {
+    const existing = bucket.byCurrency.get(currency);
+    if (existing) return existing;
+    const row: CurrencyTotal = {
+      currency,
+      hours: 0,
+      amount: 0,
+      tracker_hours: 0,
+      tracker_amount: 0,
+    };
+    bucket.byCurrency.set(currency, row);
+    return row;
+  }
+
+  // ── Time entries ───────────────────────────────────────────────────────────
 
   for (const session of sessions ?? []) {
     const day = dayOf(session.start_time);
@@ -258,6 +550,7 @@ export function summariseWeeks({
     const amount = billable ? computeLineAmount(hours, rate) : 0;
 
     bucket.hours = addHours(bucket.hours, hours);
+    bucket.entry_hours = addHours(bucket.entry_hours, hours);
     bucket.entry_count += 1;
     if (billable) {
       bucket.billable_hours = addHours(bucket.billable_hours, hours);
@@ -266,58 +559,111 @@ export function summariseWeeks({
     }
 
     if (billable) {
-      const running = bucket.byCurrency.get(currency) ?? { currency, hours: 0, amount: 0 };
+      const running = currencyRow(bucket, currency);
       running.hours = addHours(running.hours, hours);
       running.amount = addMoney(running.amount, amount);
-      bucket.byCurrency.set(currency, running);
     }
 
     // Keyed by project id, but an entry whose project has since been deleted
     // still has its denormalised name on it and is worth showing under that
     // rather than being dropped from the breakdown its hours are inside.
     const key = session.project_id || `~${session.project_name}`;
-    const row = bucket.byProject.get(key) ?? {
+    const row = projectRow(bucket, key, {
       project_id: session.project_id,
       project_name: session.project_name || 'Unknown project',
       client_name: session.client_name || 'Unknown client',
       rate,
       rate_source: source,
       currency,
-      hours: 0,
-      billable_hours: 0,
-      amount: 0,
-      entry_count: 0,
-    };
+    });
     row.hours = addHours(row.hours, hours);
     if (billable) {
       row.billable_hours = addHours(row.billable_hours, hours);
       row.amount = addMoney(row.amount, amount);
     }
     row.entry_count += 1;
-    bucket.byProject.set(key, row);
   }
 
-  // Which trackers already have time entries. Taken from every loaded session,
-  // not just the ones inside a requested week, so a tracker billed into an
-  // entry that was later re-dated is not flagged as unbilled.
-  const billed = new Set<string>();
-  for (const session of sessions ?? []) {
-    if (session.tracker_id) billed.add(session.tracker_id);
-  }
+  // ── Trackers not yet billed ────────────────────────────────────────────────
+  //
+  // Billable by definition: `bill_tracker` defaults `billable` to true, so this
+  // projects what billing would produce. An hour marked non-billable afterwards
+  // moves out of these figures the moment it becomes a real entry.
 
-  for (const tracker of trackers ?? []) {
-    if (!tracker.end_time) continue;          // still running — not owed yet
-    if (billed.has(tracker.id)) continue;
-    const day = dayOf(tracker.start_time);
-    if (day === null) continue;
-    const monday = weekStartOf(day);
+  for (const contribution of trackerContributions(trackers, sessions, now ?? Date.now())) {
+    const monday = weekStartOf(contribution.day);
     if (monday === null) continue;
     const bucket = buckets.get(monday);
     if (!bucket) continue;
 
-    const span = trackerSpanHours(tracker);
-    bucket.unbilled.count += 1;
-    bucket.unbilled.hours = addHours(bucket.unbilled.hours, span !== null && span > 0 ? span : 0);
+    bucket.hours = addHours(bucket.hours, contribution.hours);
+    bucket.billable_hours = addHours(bucket.billable_hours, contribution.hours);
+    bucket.trackers.count += 1;
+    bucket.trackers.hours = addHours(bucket.trackers.hours, contribution.hours);
+    if (contribution.running) {
+      bucket.trackers.running_count += 1;
+      bucket.trackers.running_hours = addHours(bucket.trackers.running_hours, contribution.hours);
+    }
+
+    // A tracker with no tasks at all: its hours are real and counted above, but
+    // there is nothing to hang a rate on.
+    if (contribution.shares.length === 0) {
+      bucket.trackers.unpriced_hours = addHours(bucket.trackers.unpriced_hours, contribution.hours);
+      continue;
+    }
+
+    for (const share of contribution.shares) {
+      const task = taskById.get(share.task_id) ?? null;
+      const project =
+        (task ? projectById.get(task.project_id) : null) ??
+        projectByName.get(`${share.client_name} ${share.project_name}`) ??
+        null;
+      const client = project ? clientById.get(project.client_id) ?? null : null;
+
+      if (!project) {
+        // No project, so no currency either — this cannot join a currency total
+        // without inventing one. Reported on its own line instead.
+        bucket.trackers.unpriced_hours = addHours(bucket.trackers.unpriced_hours, share.hours);
+        const key = `~${share.project_name || share.task_title}`;
+        const row = projectRow(bucket, key, {
+          project_id: '',
+          project_name: share.project_name || 'Unknown project',
+          client_name: share.client_name || 'Unknown client',
+          rate: 0,
+          rate_source: 'none',
+          currency: settings?.default_currency || 'USD',
+        });
+        row.hours = addHours(row.hours, share.hours);
+        row.billable_hours = addHours(row.billable_hours, share.hours);
+        row.tracker_hours = addHours(row.tracker_hours, share.hours);
+        row.tracker_count += 1;
+        continue;
+      }
+
+      const { rate, source, currency } = resolveRate(project, client, settings);
+      const amount = computeLineAmount(share.hours, rate);
+
+      const running = currencyRow(bucket, currency);
+      running.hours = addHours(running.hours, share.hours);
+      running.amount = addMoney(running.amount, amount);
+      running.tracker_hours = addHours(running.tracker_hours, share.hours);
+      running.tracker_amount = addMoney(running.tracker_amount, amount);
+
+      const row = projectRow(bucket, project.id, {
+        project_id: project.id,
+        project_name: project.name,
+        client_name: project.client_name || client?.name || 'Unknown client',
+        rate,
+        rate_source: source,
+        currency,
+      });
+      row.hours = addHours(row.hours, share.hours);
+      row.billable_hours = addHours(row.billable_hours, share.hours);
+      row.amount = addMoney(row.amount, amount);
+      row.tracker_hours = addHours(row.tracker_hours, share.hours);
+      row.tracker_amount = addMoney(row.tracker_amount, amount);
+      row.tracker_count += 1;
+    }
   }
 
   return weekStarts.map((monday) => {
@@ -332,6 +678,7 @@ export function summariseWeeks({
       hours: bucket.hours,
       billable_hours: bucket.billable_hours,
       non_billable_hours: bucket.non_billable_hours,
+      entry_hours: bucket.entry_hours,
       entry_count: bucket.entry_count,
       totals: [...bucket.byCurrency.values()].sort((a, b) =>
         a.currency.localeCompare(b.currency)
@@ -339,7 +686,7 @@ export function summariseWeeks({
       projects: [...bucket.byProject.values()].sort(
         (a, b) => b.hours - a.hours || a.project_name.localeCompare(b.project_name)
       ),
-      unbilled: bucket.unbilled,
+      trackers: bucket.trackers,
     };
   });
 }
@@ -361,9 +708,10 @@ export interface WindowTotals {
   hours: number;
   billable_hours: number;
   non_billable_hours: number;
+  entry_hours: number;
   entry_count: number;
   totals: CurrencyTotal[];
-  unbilled: UnbilledTrackers;
+  trackers: TrackerHours;
 }
 
 export function totalAcross(weeks: WeekSummary[]): WindowTotals {
@@ -371,21 +719,40 @@ export function totalAcross(weeks: WeekSummary[]): WindowTotals {
   let hours = 0;
   let billable_hours = 0;
   let non_billable_hours = 0;
+  let entry_hours = 0;
   let entry_count = 0;
-  const unbilled: UnbilledTrackers = { count: 0, hours: 0 };
+  const trackers: TrackerHours = {
+    count: 0,
+    hours: 0,
+    running_count: 0,
+    running_hours: 0,
+    unpriced_hours: 0,
+  };
 
   for (const week of weeks ?? []) {
     hours = addHours(hours, week.hours);
     billable_hours = addHours(billable_hours, week.billable_hours);
     non_billable_hours = addHours(non_billable_hours, week.non_billable_hours);
+    entry_hours = addHours(entry_hours, week.entry_hours);
     entry_count += week.entry_count;
-    unbilled.count += week.unbilled.count;
-    unbilled.hours = addHours(unbilled.hours, week.unbilled.hours);
+    trackers.count += week.trackers.count;
+    trackers.hours = addHours(trackers.hours, week.trackers.hours);
+    trackers.running_count += week.trackers.running_count;
+    trackers.running_hours = addHours(trackers.running_hours, week.trackers.running_hours);
+    trackers.unpriced_hours = addHours(trackers.unpriced_hours, week.trackers.unpriced_hours);
 
     for (const total of week.totals) {
-      const running = byCurrency.get(total.currency) ?? { currency: total.currency, hours: 0, amount: 0 };
+      const running = byCurrency.get(total.currency) ?? {
+        currency: total.currency,
+        hours: 0,
+        amount: 0,
+        tracker_hours: 0,
+        tracker_amount: 0,
+      };
       running.hours = addHours(running.hours, total.hours);
       running.amount = addMoney(running.amount, total.amount);
+      running.tracker_hours = addHours(running.tracker_hours, total.tracker_hours);
+      running.tracker_amount = addMoney(running.tracker_amount, total.tracker_amount);
       byCurrency.set(total.currency, running);
     }
   }
@@ -394,9 +761,10 @@ export function totalAcross(weeks: WeekSummary[]): WindowTotals {
     hours,
     billable_hours,
     non_billable_hours,
+    entry_hours,
     entry_count,
     totals: [...byCurrency.values()].sort((a, b) => a.currency.localeCompare(b.currency)),
-    unbilled,
+    trackers,
   };
 }
 

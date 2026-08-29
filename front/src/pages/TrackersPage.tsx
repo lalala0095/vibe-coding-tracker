@@ -1296,11 +1296,21 @@ export default function TrackersPage() {
     setWeeklyError('');
     setRateNote('');
     try {
-      // Deliberately no `date_to`. A time entry dated into the future still
-      // belongs to the week it is dated to, and capping the range at today
-      // would drop it silently instead of showing it in a week that is simply
-      // ahead of now.
-      setWeeklySessions(await getSessions({ date_from: from }));
+      // Deliberately unfiltered — no `date_from`, no `date_to`.
+      //
+      // `date_to` was always wrong: an entry dated into the future still
+      // belongs to the week it is dated to, and capping at today would drop it
+      // silently rather than show it in a week that is simply ahead of now.
+      //
+      // `date_from` became wrong when the summary started counting trackers.
+      // `summariseWeeks` decides how much of a tracker is still unbilled by
+      // finding its id across *every* entry; narrowing the list to the window
+      // hides an entry dated before it, and the tracker then reappears as
+      // phantom hours that were billed months ago. `mobile/app/trackers.tsx`
+      // has fetched the whole list for this reason from the start.
+      //
+      // `from` is still read above: it guards against an empty window.
+      setWeeklySessions(await getSessions());
     } catch {
       setWeeklySessions([]);
       setWeeklyError('Failed to load time entries.');
@@ -1335,21 +1345,28 @@ export default function TrackersPage() {
     // which is what makes resizing the window refetch.
   }, [weeklyOpened, fetchWeekly, weeklyStamp]);
 
-  // All the arithmetic lives in `summariseWeeks`. `trackers`, `projects` and
-  // `clients` are the page's own state, already loaded by `fetchData` — the
-  // summary reuses them rather than fetching a second copy, which also means a
-  // tracker created, edited, stopped or deleted is reflected here the moment
-  // the list updates, with no request at all.
+  // All the arithmetic lives in `summariseWeeks`. `trackers`, `tasks`,
+  // `projects` and `clients` are the page's own state, already loaded by
+  // `fetchData` — the summary reuses them rather than fetching a second copy,
+  // which also means a tracker created, edited, stopped or deleted is reflected
+  // here the moment the list updates, with no request at all.
+  //
+  // `tasks` is load-bearing, not incidental: a tracker has no `project_id`, so
+  // the only way its unbilled hours reach a rate is `TrackerTaskRef.task_id` →
+  // `Task.project_id` — the same hop `bill_tracker` makes on the server. Drop
+  // it and every tracker hour falls into `trackers.unpriced_hours` and shows up
+  // in the hours with no money against it.
   const weeks = useMemo(
     () => summariseWeeks({
       sessions: weeklySessions,
       trackers,
       projects,
       clients,
+      tasks,
       settings: invoiceSettings,
       weekStarts,
     }),
-    [weeklySessions, trackers, projects, clients, invoiceSettings, weekStarts]
+    [weeklySessions, trackers, projects, clients, tasks, invoiceSettings, weekStarts]
   );
 
   function openTracker(t: Tracker) {
