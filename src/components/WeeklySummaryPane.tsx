@@ -117,17 +117,20 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
  * no note at all.
  */
 function TrackerNote({ trackers, scope }: { trackers: TrackerHours; scope: 'week' | 'window' }) {
-  if (trackers.hours <= 0 || trackers.count === 0) return null;
+  // Keyed on `outstanding_*`, never on `hours` / `count`. Tracker time already
+  // billed straight onto an invoice line is inside `hours`, and reporting it as
+  // owing was the defect this note is named for.
+  if (trackers.outstanding_hours <= 0 || trackers.outstanding_count === 0) return null;
   const where = scope === 'week' ? 'this week' : 'the last few weeks';
   const above = scope === 'week' ? 'on this card' : 'above';
 
   return (
     <AmberNote
-      title={`${formatHours(trackers.hours)} of ${where} is projected from ${plural(
-        trackers.count,
+      title={`${formatHours(trackers.outstanding_hours)} of ${where} is projected from ${plural(
+        trackers.outstanding_count,
         'tracker',
         'trackers'
-      )} not yet billed into time entries.`}
+      )} not billed or invoiced yet.`}
     >
       <p>
         Those hours <span className="font-medium text-amber-300">are included</span> in every figure{' '}
@@ -232,11 +235,23 @@ function WeekCard({
             Time entries{' '}
             <span className="text-slate-200 tabular-nums">{formatHours(week.entry_hours)}</span>
           </span>
-          <span className="text-amber-300/90">
-            Not billed yet{' '}
-            <span className="tabular-nums">{formatHours(week.trackers.hours)}</span>
-          </span>
-          <span className="text-slate-600">— both are inside the total above.</span>
+          {/* Tracker time that already reached an invoice directly. Billed
+              work, so it is named separately from what is still owed. */}
+          {week.trackers.invoiced_hours > 0 && (
+            <span className="text-slate-400">
+              Invoiced from trackers{' '}
+              <span className="text-slate-200 tabular-nums">
+                {formatHours(week.trackers.invoiced_hours)}
+              </span>
+            </span>
+          )}
+          {week.trackers.outstanding_hours > 0 && (
+            <span className="text-amber-300/90">
+              Not billed yet{' '}
+              <span className="tabular-nums">{formatHours(week.trackers.outstanding_hours)}</span>
+            </span>
+          )}
+          <span className="text-slate-600">— all inside the total above.</span>
         </div>
       )}
 
@@ -495,9 +510,16 @@ export default function WeeklySummaryPane({
                         <span className="block">
                           {formatHours(totals.entry_hours)} from time entries
                         </span>
-                        <span className="block text-amber-300/70">
-                          {formatHours(totals.trackers.hours)} not yet billed
-                        </span>
+                        {totals.trackers.invoiced_hours > 0 && (
+                          <span className="block">
+                            {formatHours(totals.trackers.invoiced_hours)} invoiced from trackers
+                          </span>
+                        )}
+                        {totals.trackers.outstanding_hours > 0 && (
+                          <span className="block text-amber-300/70">
+                            {formatHours(totals.trackers.outstanding_hours)} not billed yet
+                          </span>
+                        )}
                       </>
                     ) : undefined
                   }

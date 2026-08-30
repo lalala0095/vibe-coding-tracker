@@ -31,7 +31,7 @@
 //
 // ── Never counted twice ──────────────────────────────────────────────────────
 //
-// A tracker contributes `max(0, span − hours already billed against it)`.
+// A tracker contributes `max(0, span − hours already billed into time entries)`.
 //
 //   - Never billed          → its whole span, priced through its tasks.
 //   - Billed in full        → nothing; the time entries already carry it.
@@ -46,6 +46,31 @@
 // The remainder is split across the tracker's not-yet-billed tasks the same way
 // `_split_hours` splits it — evenly, remainder on the first share — so what you
 // read here is what billing would actually write.
+//
+// ── Invoiced directly, which is NOT the same as unbilled ─────────────────────
+//
+// `bill_tracker` is not the only way a tracker's time reaches an invoice. An
+// invoice line can carry a `tracker_id` and bill the span *directly*, with no
+// time entries created at all (`back/routers/invoices.py` builds those lines,
+// and `Tracker.invoice_ids` records the claim). Such a tracker has no session
+// carrying its id, so the rule above alone reports its whole span as still
+// owed — hours the client has already been invoiced for, sitting in a figure
+// labelled "not billed yet".
+//
+// So the contribution is split rather than reduced:
+//
+//   invoiced    = hours on non-void invoice lines carrying this tracker's id
+//   outstanding = contribution − invoiced
+//
+// Both are real worked hours and both stay in `hours`, the money and the
+// project breakdown — removing the invoiced part would make the week read low
+// again, which is the whole defect this file exists to avoid. Only
+// `outstanding` is reported as not yet billed.
+//
+// A **void** invoice is deliberately not counted as invoiced. `void` "is not a
+// lock" on the server and voiding does not release the claim, but a cancelled
+// invoice is never going to be paid — those hours genuinely still need
+// invoicing, and saying so is the useful answer.
 //
 // ── Running trackers are included, and flagged ───────────────────────────────
 //
@@ -86,6 +111,7 @@ import { computeLineAmount, roundHours, roundMoney } from './money';
 import { addDays, dayOf, weekEndOf, weekHeading, weekRangeLabel, weekStartOf } from './week';
 import type {
   Client,
+  Invoice,
   InvoiceSettings,
   Project,
   Session,
@@ -158,8 +184,11 @@ export function resolveRate(
  * One currency's worth of a week. Never blended with another's.
  *
  * `tracker_hours` / `tracker_amount` are the part of `hours` / `amount` that
- * came from unbilled trackers rather than time entries — the "of which,
- * projected" portion, not a second figure to add on.
+ * came from tracker time nobody has billed or invoiced yet — the "of which,
+ * projected" portion, not a second figure to add on. Tracker time that IS
+ * already on an invoice is inside `hours` / `amount` like any other billed
+ * work and deliberately not here: this pair answers "what is still owed to
+ * me", and an invoiced hour is not.
  */
 export interface CurrencyTotal {
   currency: string;
@@ -184,10 +213,14 @@ export interface ProjectTotal {
   amount: number;
   /** Time entries only. A tracker is not an entry and is counted below. */
   entry_count: number;
-  /** The part of `hours` / `amount` above that came from unbilled trackers. */
+  /**
+   * The part of `hours` / `amount` above that is tracker time not billed into
+   * time entries and not on an invoice either. Excludes tracker time already
+   * invoiced directly, which is ordinary billed work.
+   */
   tracker_hours: number;
   tracker_amount: number;
-  /** Unbilled trackers that contributed to this project. */
+  /** Trackers that contributed anything to this project, invoiced or not. */
   tracker_count: number;
 }
 
@@ -200,8 +233,29 @@ export interface ProjectTotal {
 export interface TrackerHours {
   /** Trackers that contributed anything to this week. */
   count: number;
-  /** Their contribution, in hours. */
+  /** Their contribution, in hours. `invoiced_hours + outstanding_hours`. */
   hours: number;
+  /**
+   * Of `hours`, the part already billed directly onto an invoice line carrying
+   * this tracker's id. Real, billed work — counted in every money figure, and
+   * never reported as owing.
+   */
+  invoiced_hours: number;
+  /** Trackers with any directly invoiced time. */
+  invoiced_count: number;
+  /**
+   * Of `hours`, the part on no invoice and in no time entry. THIS is the
+   * "not billed yet" figure; `hours` is not, and using `hours` for it reports
+   * invoiced work as outstanding.
+   */
+  outstanding_hours: number;
+  /**
+   * Trackers with any outstanding time. Not `count`: a week whose trackers are
+   * all invoiced still has `count > 0`, and a note reading "3 trackers not
+   * billed yet" over 0 outstanding hours is the same class of wrong this field
+   * was added to fix.
+   */
+  outstanding_count: number;
   /** Of `count` / `hours`, the part still running right now. */
   running_count: number;
   running_hours: number;
@@ -247,6 +301,13 @@ export interface WeeklySummaryInput {
    * project and client names against `projects`.
    */
   tasks: Task[];
+  /**
+   * Every invoice, so a tracker billed straight onto a line is not reported as
+   * still owing. Only `line.tracker_id` and `line.hours` are read. An empty
+   * list degrades the way it always behaved: directly invoiced trackers read as
+   * outstanding.
+   */
+  invoices: Invoice[];
   /** Null when the settings call failed — the chain then stops at the client. */
   settings: InvoiceSettings | null;
   /** Mondays to report on, newest first. See `recentWeekStarts`. */
@@ -332,13 +393,16 @@ export function evenSplit(total: number, count: number): number[] {
   return parts;
 }
 
-/** One task's share of a tracker's unbilled time. */
+/** One task's share of a tracker's time. */
 export interface TrackerShare {
   task_id: string;
   task_title: string;
   project_name: string;
   client_name: string;
+  /** This task's slice of the whole contribution, invoiced part included. */
   hours: number;
+  /** Of `hours`, the slice that is on no invoice. Never greater than `hours`. */
+  outstanding_hours: number;
 }
 
 /** What one tracker adds to its week. */
@@ -347,8 +411,12 @@ export interface TrackerContribution {
   /** The SGT date the tracker started — the same slice the server files on. */
   day: string;
   running: boolean;
-  /** `max(0, span − already billed)`, and the sum of the shares below. */
+  /** `max(0, span − billed into time entries)`, and the sum of the shares. */
   hours: number;
+  /** Of `hours`, the part already on a non-void invoice line. */
+  invoiced_hours: number;
+  /** Of `hours`, the part on no invoice — the real "not billed yet". */
+  outstanding_hours: number;
   /** Empty when the tracker has no tasks at all — then `hours` is unpriceable. */
   shares: TrackerShare[];
 }
@@ -363,8 +431,22 @@ export interface TrackerContribution {
 export function trackerContributions(
   trackers: Tracker[],
   sessions: Session[],
+  invoices: Invoice[],
   now: number
 ): TrackerContribution[] {
+  // Hours already invoiced straight off a tracker, with no time entry between.
+  // Void invoices are skipped: the claim survives a void on the server, but a
+  // cancelled invoice will never be paid and those hours do still need billing.
+  const invoicedHours = new Map<string, number>();
+  for (const invoice of invoices ?? []) {
+    if (invoice.status === 'void') continue;
+    for (const line of invoice.lines ?? []) {
+      const id = line.tracker_id;
+      if (!id) continue;
+      invoicedHours.set(id, addHours(invoicedHours.get(id) ?? 0, roundHours(line.hours)));
+    }
+  }
+
   // Built from EVERY loaded session, not just the ones inside a requested week:
   // a tracker billed into an entry that was later re-dated out of the window
   // must still count as billed, or its hours reappear as a phantom estimate.
@@ -404,23 +486,41 @@ export function trackerContributions(
     const pending = refs.filter((ref) => !alreadyBilled.has(ref.task_id));
     const base = pending.length > 0 ? pending : refs;
 
+    // Capped at the contribution: invoicing MORE hours than the tracker ran is
+    // legal (line hours are editable), and an uncapped subtraction would make
+    // `outstanding` negative and start eating other trackers' hours.
+    const invoiced = Math.min(remaining, roundHours(invoicedHours.get(tracker.id) ?? 0));
+    const outstanding = roundHours(remaining - invoiced);
+
     if (base.length === 0) {
-      out.push({ tracker_id: tracker.id, day, running, hours: remaining, shares: [] });
+      out.push({
+        tracker_id: tracker.id,
+        day,
+        running,
+        hours: remaining,
+        invoiced_hours: invoiced,
+        outstanding_hours: outstanding,
+        shares: [],
+      });
       continue;
     }
 
     const shares = evenSplit(remaining, base.length);
+    const outstandingShares = evenSplit(outstanding, base.length);
     out.push({
       tracker_id: tracker.id,
       day,
       running,
       hours: remaining,
+      invoiced_hours: invoiced,
+      outstanding_hours: outstanding,
       shares: base.map((ref, i) => ({
         task_id: ref.task_id,
         task_title: ref.task_title,
         project_name: ref.project_name,
         client_name: ref.client_name,
         hours: shares[i] ?? 0,
+        outstanding_hours: Math.min(shares[i] ?? 0, outstandingShares[i] ?? 0),
       })),
     });
   }
@@ -444,6 +544,7 @@ export function summariseWeeks({
   projects,
   clients,
   tasks,
+  invoices,
   settings,
   weekStarts,
   now,
@@ -485,7 +586,17 @@ export function summariseWeeks({
       entry_count: 0,
       byCurrency: new Map(),
       byProject: new Map(),
-      trackers: { count: 0, hours: 0, running_count: 0, running_hours: 0, unpriced_hours: 0 },
+      trackers: {
+        count: 0,
+        hours: 0,
+        invoiced_hours: 0,
+        invoiced_count: 0,
+        outstanding_hours: 0,
+        outstanding_count: 0,
+        running_count: 0,
+        running_hours: 0,
+        unpriced_hours: 0,
+      },
     });
   }
 
@@ -590,7 +701,12 @@ export function summariseWeeks({
   // projects what billing would produce. An hour marked non-billable afterwards
   // moves out of these figures the moment it becomes a real entry.
 
-  for (const contribution of trackerContributions(trackers, sessions, now ?? Date.now())) {
+  for (const contribution of trackerContributions(
+    trackers,
+    sessions,
+    invoices,
+    now ?? Date.now()
+  )) {
     const monday = weekStartOf(contribution.day);
     if (monday === null) continue;
     const bucket = buckets.get(monday);
@@ -600,6 +716,16 @@ export function summariseWeeks({
     bucket.billable_hours = addHours(bucket.billable_hours, contribution.hours);
     bucket.trackers.count += 1;
     bucket.trackers.hours = addHours(bucket.trackers.hours, contribution.hours);
+    bucket.trackers.invoiced_hours = addHours(
+      bucket.trackers.invoiced_hours,
+      contribution.invoiced_hours
+    );
+    bucket.trackers.outstanding_hours = addHours(
+      bucket.trackers.outstanding_hours,
+      contribution.outstanding_hours
+    );
+    if (contribution.invoiced_hours > 0) bucket.trackers.invoiced_count += 1;
+    if (contribution.outstanding_hours > 0) bucket.trackers.outstanding_count += 1;
     if (contribution.running) {
       bucket.trackers.running_count += 1;
       bucket.trackers.running_hours = addHours(bucket.trackers.running_hours, contribution.hours);
@@ -635,19 +761,23 @@ export function summariseWeeks({
         });
         row.hours = addHours(row.hours, share.hours);
         row.billable_hours = addHours(row.billable_hours, share.hours);
-        row.tracker_hours = addHours(row.tracker_hours, share.hours);
+        row.tracker_hours = addHours(row.tracker_hours, share.outstanding_hours);
         row.tracker_count += 1;
         continue;
       }
 
       const { rate, source, currency } = resolveRate(project, client, settings);
       const amount = computeLineAmount(share.hours, rate);
+      // Priced separately rather than scaled from `amount`: quantise-then-sum
+      // is the rule, and deriving one money figure from another by ratio is
+      // exactly the sum-then-round trap CLAUDE.md § "Money rules" forbids.
+      const outstandingAmount = computeLineAmount(share.outstanding_hours, rate);
 
       const running = currencyRow(bucket, currency);
       running.hours = addHours(running.hours, share.hours);
       running.amount = addMoney(running.amount, amount);
-      running.tracker_hours = addHours(running.tracker_hours, share.hours);
-      running.tracker_amount = addMoney(running.tracker_amount, amount);
+      running.tracker_hours = addHours(running.tracker_hours, share.outstanding_hours);
+      running.tracker_amount = addMoney(running.tracker_amount, outstandingAmount);
 
       const row = projectRow(bucket, project.id, {
         project_id: project.id,
@@ -660,8 +790,8 @@ export function summariseWeeks({
       row.hours = addHours(row.hours, share.hours);
       row.billable_hours = addHours(row.billable_hours, share.hours);
       row.amount = addMoney(row.amount, amount);
-      row.tracker_hours = addHours(row.tracker_hours, share.hours);
-      row.tracker_amount = addMoney(row.tracker_amount, amount);
+      row.tracker_hours = addHours(row.tracker_hours, share.outstanding_hours);
+      row.tracker_amount = addMoney(row.tracker_amount, outstandingAmount);
       row.tracker_count += 1;
     }
   }
@@ -724,6 +854,10 @@ export function totalAcross(weeks: WeekSummary[]): WindowTotals {
   const trackers: TrackerHours = {
     count: 0,
     hours: 0,
+    invoiced_hours: 0,
+    invoiced_count: 0,
+    outstanding_hours: 0,
+    outstanding_count: 0,
     running_count: 0,
     running_hours: 0,
     unpriced_hours: 0,
@@ -737,6 +871,13 @@ export function totalAcross(weeks: WeekSummary[]): WindowTotals {
     entry_count += week.entry_count;
     trackers.count += week.trackers.count;
     trackers.hours = addHours(trackers.hours, week.trackers.hours);
+    trackers.invoiced_hours = addHours(trackers.invoiced_hours, week.trackers.invoiced_hours);
+    trackers.invoiced_count += week.trackers.invoiced_count;
+    trackers.outstanding_hours = addHours(
+      trackers.outstanding_hours,
+      week.trackers.outstanding_hours
+    );
+    trackers.outstanding_count += week.trackers.outstanding_count;
     trackers.running_count += week.trackers.running_count;
     trackers.running_hours = addHours(trackers.running_hours, week.trackers.running_hours);
     trackers.unpriced_hours = addHours(trackers.unpriced_hours, week.trackers.unpriced_hours);

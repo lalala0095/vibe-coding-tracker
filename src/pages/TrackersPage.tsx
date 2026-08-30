@@ -9,7 +9,7 @@ import WeeklySummaryPane from '../components/WeeklySummaryPane';
 import {
   getTrackers, createTracker, updateTracker, deleteTracker,
   addTasksToTracker, removeTaskFromTracker, billTracker,
-  getTasks, getClients, getProjects, createTasksBulk, getSessions,
+  getTasks, getClients, getProjects, createTasksBulk, getSessions, getInvoices,
   getTrackerSettings, getInvoiceSettings,
 } from '../api';
 import { parseTaskList } from '../lib/taskPaste';
@@ -20,7 +20,7 @@ import type {
   Tracker, Task, Client, Project, TrackerSettings,
   CreateTrackerPayload, UpdateTrackerPayload,
   TrackerTaskRef, TaskStatus, TaskPriority,
-  Session, InvoiceSettings,
+  Session, InvoiceSettings, Invoice,
 } from '../types';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1259,6 +1259,10 @@ export default function TrackersPage() {
   const [weekCount, setWeekCount] = useState(12);
   const [weeklySessions, setWeeklySessions] = useState<Session[]>([]);
   const [invoiceSettings, setInvoiceSettings] = useState<InvoiceSettings | null>(null);
+  // Read for one field only: `line.tracker_id`. A tracker can be billed
+  // straight onto an invoice line with no time entry in between, and without
+  // this list every such tracker reports its whole span as still owed.
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [weeklyLoading, setWeeklyLoading] = useState(false);
   const [weeklyError, setWeeklyError] = useState('');
   // Non-fatal: the rates fell back a level, but every figure still renders.
@@ -1318,6 +1322,18 @@ export default function TrackersPage() {
       return;
     }
 
+    // Not fatal, and not silent either. Losing this list does not change the
+    // hours — it changes which of them are called "not billed yet", and a
+    // tracker already invoiced would be reported as still owing.
+    try {
+      setInvoices(await getInvoices());
+    } catch {
+      setInvoices([]);
+      setRateNote(
+        'Invoices could not be loaded, so tracker time already billed straight onto an invoice is counted as not billed yet. The hours are unaffected.'
+      );
+    }
+
     // Invoice settings are the last link in the rate chain (project → client →
     // settings), so losing them is not the harmless miss that a failed
     // `getTrackerSettings()` is — that one costs a pre-filled name, this one
@@ -1363,10 +1379,11 @@ export default function TrackersPage() {
       projects,
       clients,
       tasks,
+      invoices,
       settings: invoiceSettings,
       weekStarts,
     }),
-    [weeklySessions, trackers, projects, clients, tasks, invoiceSettings, weekStarts]
+    [weeklySessions, trackers, projects, clients, tasks, invoices, invoiceSettings, weekStarts]
   );
 
   function openTracker(t: Tracker) {
