@@ -77,6 +77,7 @@ import {
   deleteTracker,
   getClients,
   getInvoiceSettings,
+  getInvoices,
   getProjects,
   getSessions,
   getTasks,
@@ -115,6 +116,7 @@ import WeeklySummaryView from '@/screens/trackers/WeeklySummaryView';
 import type {
   BillTrackerPayload,
   Client,
+  Invoice,
   InvoiceSettings,
   Project,
   Task,
@@ -214,6 +216,10 @@ export default function TrackersScreen() {
   // template). These are the invoice settings, the last link in the rate chain,
   // and the two must never be conflated.
   const [invoiceSettings, setInvoiceSettings] = useState<InvoiceSettings | null>(null);
+  // Read for one field only: `line.tracker_id`. A tracker can be billed
+  // straight onto an invoice line with no time entry in between, and without
+  // this list every such tracker reports its whole span as still owed.
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [entriesLoading, setEntriesLoading] = useState(false);
   const [ratesLoading, setRatesLoading] = useState(false);
   // Fatal for the summary: with no entries there are no hours to report.
@@ -309,6 +315,14 @@ export default function TrackersScreen() {
       setTasks([]);
       notes.push(
         'Tasks could not be loaded, so hours from trackers that are not billed yet are counted but not priced.',
+      );
+    }
+    try {
+      setInvoices(await getInvoices());
+    } catch {
+      setInvoices([]);
+      notes.push(
+        'Invoices could not be loaded, so tracker time already billed onto an invoice reads as not billed yet.',
       );
     }
     try {
@@ -435,10 +449,11 @@ export default function TrackersScreen() {
         projects,
         clients,
         tasks,
+        invoices,
         settings: invoiceSettings,
         weekStarts,
       }),
-    [entries, trackers, projects, clients, tasks, invoiceSettings, weekStarts],
+    [entries, trackers, projects, clients, tasks, invoices, invoiceSettings, weekStarts],
   );
 
   const applyTracker = useCallback((updated: Tracker) => {
