@@ -145,8 +145,11 @@ function zeroRateNote(row: ProjectTotal): string | null {
  * `@/lib/weeklySummary`; this only chooses words.
  */
 function trackerNoteLines(trackers: TrackerHours): string[] {
+  // `outstanding_hours`, never `hours`. Tracker time already billed straight
+  // onto an invoice line is inside `hours`, and calling that "not billed yet"
+  // was the defect this helper is named for.
   const lines = [
-    `${formatHours(trackers.hours)} of that is tracker time not billed into time entries yet — included above as a projection. Bill it from the Trackers tab to make it invoiceable.`,
+    `${formatHours(trackers.outstanding_hours)} of that is tracker time not billed or invoiced yet — included above as a projection. Bill it from the Trackers tab to make it invoiceable.`,
   ];
 
   if (trackers.running_count > 0) {
@@ -229,10 +232,22 @@ function WeekCard({
               Time entries{' '}
               <Text className="tabular-nums text-slate-200">{formatHours(week.entry_hours)}</Text>
             </Text>
-            <Text className="text-xs text-slate-400">
-              Not billed yet{' '}
-              <Text className="tabular-nums text-amber-300">{formatHours(week.trackers.hours)}</Text>
-            </Text>
+            {week.trackers.invoiced_hours > 0 ? (
+              <Text className="text-xs text-slate-400">
+                Invoiced{' '}
+                <Text className="tabular-nums text-slate-200">
+                  {formatHours(week.trackers.invoiced_hours)}
+                </Text>
+              </Text>
+            ) : null}
+            {week.trackers.outstanding_hours > 0 ? (
+              <Text className="text-xs text-slate-400">
+                Not billed yet{' '}
+                <Text className="tabular-nums text-amber-300">
+                  {formatHours(week.trackers.outstanding_hours)}
+                </Text>
+              </Text>
+            ) : null}
           </View>
         ) : null}
 
@@ -297,12 +312,12 @@ function WeekCard({
             every figure on this card. What they are not is billed, and until
             they are they cannot go on an invoice. Written as provenance and a
             next step — billing at month end is the normal way to work here. */}
-        {week.trackers.count > 0 ? (
+        {week.trackers.outstanding_count > 0 ? (
           <AmberNote
             title={
-              week.trackers.count === 1
+              week.trackers.outstanding_count === 1
                 ? '1 tracker this week is counted here but not billed yet.'
-                : `${week.trackers.count} trackers this week are counted here but not billed yet.`
+                : `${week.trackers.outstanding_count} trackers this week are counted here but not billed yet.`
             }
           >
             {trackerNoteLines(week.trackers).join('\n')}
@@ -499,9 +514,17 @@ export default function WeeklySummaryView({
                     // window keeps the bare figure it has always had.
                     hint={
                       totals.trackers.hours > 0
-                        ? `${formatHours(totals.entry_hours)} billed · ${formatHours(
-                            totals.trackers.hours
-                          )} not yet`
+                        ? [
+                            `${formatHours(totals.entry_hours)} time entries`,
+                            totals.trackers.invoiced_hours > 0
+                              ? `${formatHours(totals.trackers.invoiced_hours)} invoiced`
+                              : null,
+                            totals.trackers.outstanding_hours > 0
+                              ? `${formatHours(totals.trackers.outstanding_hours)} not billed yet`
+                              : null,
+                          ]
+                            .filter(Boolean)
+                            .join('\n')
                         : undefined
                     }
                   />
@@ -550,12 +573,12 @@ export default function WeeklySummaryView({
 
                 {/* The window's version of the card note: these hours are in
                     the figures above, they are simply not invoiceable yet. */}
-                {totals.trackers.count > 0 ? (
+                {totals.trackers.outstanding_count > 0 ? (
                   <AmberNote
                     title={
-                      totals.trackers.count === 1
+                      totals.trackers.outstanding_count === 1
                         ? '1 tracker in this window is counted here but not billed yet.'
-                        : `${totals.trackers.count} trackers in this window are counted here but not billed yet.`
+                        : `${totals.trackers.outstanding_count} trackers in this window are counted here but not billed yet.`
                     }
                   >
                     {trackerNoteLines(totals.trackers).join('\n')}
