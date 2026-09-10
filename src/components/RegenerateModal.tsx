@@ -121,7 +121,20 @@ export default function RegenerateModal({
 }: Props) {
   const [periodStart, setPeriodStart] = useState(invoice.period_start ?? '');
   const [periodEnd, setPeriodEnd] = useState(invoice.period_end ?? '');
-  const [projectIds, setProjectIds] = useState<string[]>(invoice.project_ids ?? []);
+  // Empty means "every project this client has", which is what the preview
+  // does with no `project_ids` filter.
+  //
+  // Deliberately NOT seeded from `invoice.project_ids`. Those are derived from
+  // the lines the invoice already carries, so seeding from them scopes the
+  // search to what the invoice already found — an invoice holding one project's
+  // work would filter the preview to that project and could never discover a
+  // sibling project under the same client. The narrowing was self-reinforcing:
+  // the more specific the invoice, the less a regenerate could ever add.
+  //
+  // Regenerate asks "what work exists for this client in this period", and the
+  // client is the scope the invoice is actually built around — `client_id` is a
+  // snapshot the server will not let change, while the project list is not.
+  const [projectIds, setProjectIds] = useState<string[]>([]);
   const [includeTrackers, setIncludeTrackers] = useState(true);
   const [includeInvoiced, setIncludeInvoiced] = useState(false);
 
@@ -392,9 +405,22 @@ export default function RegenerateModal({
           {clientProjects.length > 0 && (
             <div>
               <label className={LABEL}>
-                Projects <span className="text-slate-600">(all projects if none selected)</span>
+                Projects <span className="text-slate-600">— every project for this client unless you narrow it</span>
               </label>
               <div className="flex flex-wrap gap-1.5">
+                {/* An explicit resting state. Leaving every chip unselected and
+                    calling that "all" reads as "nothing selected", which is the
+                    opposite of what it does. */}
+                <button
+                  onClick={() => { setProjectIds([]); setPreview(null); }}
+                  className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
+                    projectIds.length === 0
+                      ? 'bg-violet-500/15 border-violet-500/40 text-violet-300'
+                      : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  All {clientProjects.length} projects
+                </button>
                 {clientProjects.map((p) => (
                   <button
                     key={p.id}
