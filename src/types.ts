@@ -432,7 +432,17 @@ export interface CreateInvoicePayload {
   show_payment_terms?: boolean;
 }
 
-export interface UpdateInvoicePayload extends Partial<CreateInvoicePayload> {}
+export interface UpdateInvoicePayload extends Partial<CreateInvoicePayload> {
+  // Ask the server to re-read the client and rebuild `client_name` and
+  // `bill_to` from it.
+  //
+  // A flag, not the two fields: `bill_to` is the Bill-To block printed on a
+  // client-facing document, and the server is its only author. Renaming a
+  // client writes only the client document — nothing propagates — so this is
+  // the sole route by which an existing invoice can show a corrected client
+  // name. Omitted or false leaves both snapshots exactly as they were.
+  refresh_client_snapshot?: boolean;
+}
 
 // How billable hours are rounded onto an increment. "nearest" is the usual
 // convention; "up" is the aggressive one and never lowers a figure.

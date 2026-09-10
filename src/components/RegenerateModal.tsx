@@ -38,7 +38,7 @@ const KIND_STYLE: Record<LineChangeKind, string> = {
 const KIND_BLURB: Record<LineChangeKind, string> = {
   added: 'New work found in this period.',
   updated:
-    'Hours, dates, or a tracker’s sub-tasks moved. Your rate and description are kept.',
+    'Hours, dates, a tracker’s sub-tasks, or a project name moved. Your rate and description are kept.',
   removed: 'No longer backed by any time entry in this period. Applying drops these lines.',
   unchanged: 'Nothing to do.',
   manual: 'Added by hand, so nothing regenerates them.',
@@ -56,6 +56,35 @@ function roundingLabel(increment: number, direction: HoursRoundingDirection): st
   return `${verb} ${increment} h`;
 }
 
+/** One rename, and how many lines on this invoice carry it. */
+interface RenameGroup {
+  key: string;
+  before: string;
+  after: string;
+  lines: number;
+}
+
+/**
+ * Collapse per-line renames into one row per distinct rename.
+ *
+ * Keyed on the project *and* the pair, not the project alone: a project
+ * renamed twice can leave two different stale names across an invoice's lines,
+ * and those are two separate facts the owner should see. Insertion order is
+ * kept, so the rows follow the lines they came from.
+ */
+function groupRenames(changes: LineChange[]): RenameGroup[] {
+  const groups = new Map<string, RenameGroup>();
+  for (const change of changes) {
+    const { projectNameBefore: before, projectNameAfter: after } = change;
+    if (before === null || after === null) continue;
+    const key = `${change.line.project_id ?? ''}|${before}\u0000${after}`;
+    const existing = groups.get(key);
+    if (existing) existing.lines += 1;
+    else groups.set(key, { key, before, after, lines: 1 });
+  }
+  return [...groups.values()];
+}
+
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
 interface Props {
@@ -68,18 +97,27 @@ interface Props {
   // configured, and the option is not offered at all.
   roundingIncrement?: number;
   roundingDirection?: HoursRoundingDirection;
+  /**
+   * The client was renamed since this invoice was raised: the name stored on
+   * the invoice against the one on the client document now. Absent or null
+   * when they agree — this component never works that out for itself, because
+   * the invoice's copy is a snapshot and only the caller holds the live one.
+   */
+  clientRename?: { before: string; after: string } | null;
   onApply: (
     lines: InvoiceLine[],
     periodStart: string,
     periodEnd: string,
     /** A bare `YYYY-MM-DD` to set as the issue date, or null to leave it alone. */
     issueDate: string | null,
+    /** The name toggle. False leaves every stored client/project name alone. */
+    refreshNames: boolean,
   ) => void;
   onClose: () => void;
 }
 
 export default function RegenerateModal({
-  invoice, projects, currentLines, roundingIncrement, roundingDirection, onApply, onClose,
+  invoice, projects, currentLines, roundingIncrement, roundingDirection, clientRename, onApply, onClose,
 }: Props) {
   const [periodStart, setPeriodStart] = useState(invoice.period_start ?? '');
   const [periodEnd, setPeriodEnd] = useState(invoice.period_end ?? '');
@@ -95,6 +133,22 @@ export default function RegenerateModal({
   // document should carry the day it was re-issued rather than the day it was
   // first raised. It stays a default — the field itself remains editable.
   const [updateIssueDate, setUpdateIssueDate] = useState(true);
+
+  // On by default: a stale project name on an invoice is a plain error — the
+  // project is *called* something else now — and leaving it is almost never
+  // what the owner wants. It is still a toggle, because the one case where it
+  // is wrong is a document the client already has, where the old wording is
+  // what they will match against their own records.
+  const [refreshNames, setRefreshNames] = useState(true);
+
+  // id → the name as it stands in Clients & Projects right now. This is the
+  // only copy in the system a rename actually updates; the names on lines,
+  // tasks and time entries are denormalised and stay stale. See the header of
+  // `lib/regenerate.ts`.
+  const projectNames = useMemo(
+    () => new Map(projects.map((p) => [p.id, p.name])),
+    [projects],
+  );
 
   const canRound =
     typeof roundingIncrement === 'number' && Number.isFinite(roundingIncrement) && roundingIncrement > 0;
@@ -116,8 +170,11 @@ export default function RegenerateModal({
       roundHours && typeof roundingIncrement === 'number' && roundingIncrement > 0
         ? { increment: roundingIncrement, direction }
         : null;
-    return mergeRegeneratedLines(currentLines, preview, rounding);
-  }, [preview, currentLines, roundHours, roundingIncrement, direction]);
+    // Null rather than an empty map when the toggle is off: the merge reads a
+    // missing entry as "not loaded, keep the stored name", which is exactly
+    // the behaviour the toggle is asking for.
+    return mergeRegeneratedLines(currentLines, preview, rounding, refreshNames ? projectNames : null);
+  }, [preview, currentLines, roundHours, roundingIncrement, direction, refreshNames, projectNames]);
 
   // The client is a snapshot on the invoice and the server will not accept a
   // different one, so it is shown rather than offered.
@@ -185,7 +242,20 @@ export default function RegenerateModal({
   // make the option unreachable in exactly the case someone regenerates a
   // settled invoice just to re-issue it today.
   const issueDateWouldMove = updateIssueDate && today !== (invoice.issue_date ?? '');
-  const canApply = result !== null && (result.hasChanges || issueDateWouldMove);
+
+  // The client rename is the one change that does not travel through the merge
+  // — it rewrites `bill_to` on the invoice itself, not a field on any line —
+  // so `result.hasChanges` cannot see it. Same shape of bug as the issue-date
+  // one above: without its own term, an invoice whose only staleness is the
+  // client's name would show the rename and offer no way to apply it.
+  const clientRenameWouldApply =
+    refreshNames && !!clientRename && clientRename.before !== clientRename.after;
+
+  // Project renames DO travel through the merge, and only when the toggle fed
+  // it a map — so `hasChanges` already collapses to false the moment names are
+  // switched off, and needs no term of its own here.
+  const canApply =
+    result !== null && (result.hasChanges || issueDateWouldMove || clientRenameWouldApply);
 
   const issueDateToggle = (
     <label className="flex items-center gap-2 cursor-pointer">
@@ -200,6 +270,32 @@ export default function RegenerateModal({
         <span className="text-slate-500"> · {today}</span>
       </span>
     </label>
+  );
+
+  // Rendered beside the other two, and worded the same way: what ticking it
+  // does, spelled out, rather than a bare noun the user has to guess at.
+  const namesToggle = (
+    <label className="flex items-center gap-2 cursor-pointer">
+      <input
+        type="checkbox"
+        checked={refreshNames}
+        onChange={(e) => setRefreshNames(e.target.checked)}
+        className={CHECKBOX}
+      />
+      <span className="text-xs text-slate-400">
+        Update client and project names
+        <span className="text-slate-500"> · take the names as they read in Clients &amp; Projects now</span>
+      </span>
+    </label>
+  );
+
+  // One row per rename, not one per line: a project renamed under twelve lines
+  // is a single fact about the invoice, and twelve identical rows would bury
+  // the other changes. Counted from the merge's own verdict, so nothing here
+  // decides for itself what a name should be.
+  const renameGroups = useMemo(
+    () => (result === null ? [] : groupRenames(result.changes)),
+    [result],
   );
 
   return (
@@ -241,6 +337,7 @@ export default function RegenerateModal({
                     onApply(
                       result.lines, periodStart, periodEnd,
                       updateIssueDate ? today : null,
+                      refreshNames,
                     );
                     onClose();
                   }}
@@ -338,6 +435,7 @@ export default function RegenerateModal({
             </label>
             {roundingToggle}
             {issueDateToggle}
+            {namesToggle}
           </div>
 
           <p className="text-xs text-slate-500 leading-relaxed">
@@ -353,8 +451,20 @@ export default function RegenerateModal({
           <div className="flex items-center gap-4 flex-wrap rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2">
             {roundingToggle}
             {issueDateToggle}
+            {namesToggle}
           </div>
-          <ChangeSummary result={result} issueDate={issueDateWouldMove ? today : null} />
+          {/* Above the line-by-line list, not inside it: a rename rewrites text
+              on a document the client may already hold, so it is stated once,
+              in full, before anything else is read. */}
+          <RenamePanel
+            groups={renameGroups}
+            clientRename={clientRenameWouldApply ? clientRename ?? null : null}
+          />
+          <ChangeSummary
+            result={result}
+            issueDate={issueDateWouldMove ? today : null}
+            namesWouldMove={renameGroups.length > 0 || clientRenameWouldApply}
+          />
         </div>
       )}
 
@@ -374,18 +484,99 @@ export default function RegenerateModal({
   );
 }
 
+// ── Renames ───────────────────────────────────────────────────────────────────
+
+/**
+ * Every name this apply would rewrite, stated once each as `before → after`.
+ *
+ * Advisory amber rather than a neutral box: this is the one part of a
+ * regenerate that changes *wording* on a document the client may already hold,
+ * and it must never happen quietly. Renders nothing when nothing is renamed —
+ * including whenever the names toggle is off, which is why the caller passes a
+ * null `clientRename` in that case rather than this component checking.
+ */
+function RenamePanel({ groups, clientRename }: {
+  groups: RenameGroup[];
+  clientRename: { before: string; after: string } | null;
+}) {
+  if (groups.length === 0 && clientRename === null) return null;
+
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-amber-400/30 bg-amber-400/5 px-3 py-2.5">
+      <p className="text-xs text-amber-300 leading-relaxed">
+        Renamed in Clients &amp; Projects since these lines were written. Applying rewrites the
+        names on this invoice — the figures are untouched.
+      </p>
+      <div className="flex flex-col gap-1">
+        {clientRename && (
+          <RenameRow
+            label="Client"
+            before={clientRename.before}
+            after={clientRename.after}
+            note="also updates the printed Bill To block"
+          />
+        )}
+        {groups.map((group) => (
+          <RenameRow
+            key={group.key}
+            label="Project"
+            before={group.before}
+            after={group.after}
+            note={`on ${group.lines} line${group.lines !== 1 ? 's' : ''}`}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RenameRow({ label, before, after, note }: {
+  label: string;
+  before: string;
+  after: string;
+  note: string;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-lg border border-amber-400/20 bg-slate-900/40 px-2.5 py-1.5">
+      <div className="flex items-center gap-2 min-w-0 flex-wrap">
+        <span className="shrink-0 text-[10px] uppercase tracking-wider text-slate-500 w-12">
+          {label}
+        </span>
+        <span className="text-sm text-slate-400 line-through decoration-slate-600 truncate">
+          {before || '—'}
+        </span>
+        <span className="shrink-0 text-slate-500">→</span>
+        <span className="text-sm text-slate-100 truncate">{after || '—'}</span>
+      </div>
+      <span className="shrink-0 text-xs text-slate-500">{note}</span>
+    </div>
+  );
+}
+
 // ── Change summary ────────────────────────────────────────────────────────────
 
-function ChangeSummary({ result, issueDate }: { result: MergeResult; issueDate: string | null }) {
+function ChangeSummary({ result, issueDate, namesWouldMove }: {
+  result: MergeResult;
+  issueDate: string | null;
+  /** Something above this panel is pending, so it is not a plain no-op. */
+  namesWouldMove: boolean;
+}) {
   const delta = result.hoursAfter - result.hoursBefore;
 
   if (!result.hasChanges) {
     return (
       <div className="flex flex-col gap-2">
         <p className="text-sm text-slate-300">
-          This invoice is already up to date — the current time entries produce exactly the lines
-          it already has.
+          The current time entries produce exactly the lines this invoice already has
+          {namesWouldMove || issueDate ? '. No line changes hours or dates.' : ' — it is already up to date.'}
         </p>
+        {/* The rename sits above this panel; without a word here the reader is
+            told "nothing changed" directly under a box that says otherwise. */}
+        {namesWouldMove && (
+          <p className="text-sm text-slate-300">
+            Applying would still make the name change shown above.
+          </p>
+        )}
         {/* Without this the panel reads as "nothing to do" while an Apply
             button sits below it offering to change the date. */}
         {issueDate && (
@@ -472,6 +663,14 @@ function ChangeRow({ change }: { change: LineChange }) {
           {change.isTracker && (
             <span className="shrink-0 text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-violet-500/40 bg-violet-500/10 text-violet-300">
               tracker
+            </span>
+          )}
+          {/* A marker, not a restatement: the before → after is stated once in
+              the panel above, and a line renamed but otherwise untouched would
+              otherwise sit under "Updated" with nothing to explain why. */}
+          {change.projectNameAfter !== null && (
+            <span className="shrink-0 text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-indigo-500/40 bg-indigo-500/10 text-indigo-300">
+              renamed
             </span>
           )}
         </div>

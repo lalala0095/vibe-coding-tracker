@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import type {
   Invoice, InvoiceStatus, InvoiceLine, InvoicePayment, Client, Project, InvoiceSettings,
@@ -83,6 +83,14 @@ export default function InvoicesPage() {
   // the printed period have to move together, so this rides along with `lines`
   // rather than being written when the modal closes.
   const [pendingPeriod, setPendingPeriod] = useState<{ start: string; end: string } | null>(null);
+  // A regenerate that refreshed the denormalised names, held until the next
+  // save in exactly the way `pendingPeriod` is. The merged lines already carry
+  // their refreshed `project_name`, so they persist by themselves; this flag
+  // exists for the two fields the lines cannot carry — the invoice's own
+  // `client_name` and the `bill_to` block — which only the server may rewrite.
+  // Regenerate stages, it never saves, so the flag has to survive until the
+  // owner presses Save and be dropped everywhere they back out instead.
+  const [pendingNameRefresh, setPendingNameRefresh] = useState(false);
   // The payment dialog. Null is closed; `{ payment: null }` records a new one,
   // `{ payment }` amends that one. Held here rather than inside PaymentsPanel
   // because marking an invoice paid opens it too — the panel is not the only
@@ -126,11 +134,17 @@ export default function InvoicesPage() {
     // Keyed on selectedId, so without this a period regenerated for one invoice
     // would be saved onto whichever invoice is selected next.
     setPendingPeriod(null);
+    // Same reasoning, and one more: `refresh_client_snapshot` rewrites the Bill
+    // To block of whatever invoice it is sent with, so a flag that outlived its
+    // invoice would rewrite a document nobody asked about.
+    setPendingNameRefresh(false);
   };
 
   useEffect(() => {
     if (!selected) {
-      setLines([]); setMeta(null); setDirty(false); setPendingPeriod(null); return;
+      setLines([]); setMeta(null); setDirty(false);
+      setPendingPeriod(null); setPendingNameRefresh(false);
+      return;
     }
     loadEditor(selected);
     setShowRegenerate(false);
@@ -145,21 +159,46 @@ export default function InvoicesPage() {
     setSelected(updated);
   };
 
+  // The client's name as Clients & Projects holds it now, against the snapshot
+  // this invoice carries. A rename writes only the client document — nothing
+  // propagates — so the two disagreeing IS the defect, and the modal cannot see
+  // it: only this page holds the live list.
+  //
+  // Null unless a rename can actually be substantiated. An unknown client, a
+  // blank live name, or two names that already agree all mean "nothing to
+  // report" — `clients` is empty until the first load resolves, and that must
+  // never be read as "the client was renamed to nothing".
+  const clientRename = useMemo(() => {
+    if (!selected) return null;
+    const live = clients.find((c) => c.id === selected.client_id);
+    if (!live) return null;
+    const after = (live.name ?? '').trim();
+    const before = selected.client_name ?? '';
+    if (after === '' || after === before.trim()) return null;
+    return { before, after };
+  }, [selected, clients]);
+
+  // A regenerate rebuilt the lines from a different period, so the period that
+  // prints has to follow them. Sent only when it actually moved — these are
+  // plain dates with no clearing sentinel, so an empty one is never sent at all.
+  const periodMoved =
+    selected !== null &&
+    pendingPeriod !== null &&
+    pendingPeriod.start !== '' && pendingPeriod.end !== '' &&
+    (pendingPeriod.start !== (selected.period_start ?? '') ||
+      pendingPeriod.end !== (selected.period_end ?? ''));
+
+  // Every kind of staged change, not just the hand-edited ones. A regenerate
+  // run purely to pick up a rename touches no field the owner typed into, and
+  // without this the save bar would report "All changes saved" over a pending
+  // rewrite of the Bill To block.
+  const unsaved = dirty || periodMoved || pendingNameRefresh;
+
   const handleSave = async () => {
     if (!selected || !meta) return;
     setSaving(true);
     setDetailError('');
     try {
-      // A regenerate rebuilt the lines from a different period, so the period
-      // that prints has to follow them. Sent only when it actually moved —
-      // these are plain dates with no clearing sentinel, so an empty one is
-      // never sent at all.
-      const periodMoved =
-        pendingPeriod !== null &&
-        pendingPeriod.start !== '' && pendingPeriod.end !== '' &&
-        (pendingPeriod.start !== (selected.period_start ?? '') ||
-          pendingPeriod.end !== (selected.period_end ?? ''));
-
       const payload: UpdateInvoicePayload = {
         // issue_date is not optional server-side and has no sentinel, so an
         // emptied field omits the key and keeps the stored date.
@@ -170,6 +209,12 @@ export default function InvoicesPage() {
         ...(periodMoved
           ? { period_start: pendingPeriod!.start, period_end: pendingPeriod!.end }
           : {}),
+        // Not the two fields themselves: `client_name` and `bill_to` are
+        // snapshots on a client-facing document and the server is their only
+        // author. Sent only when a regenerate actually asked for it, so an
+        // ordinary save never disturbs a Bill To block the owner edited on
+        // the client record for this invoice alone.
+        ...(pendingNameRefresh ? { refresh_client_snapshot: true } : {}),
         lines,
         // "null" clears; a real JSON null would be read as "field absent".
         discount_type: (meta.discount_type ?? CLEAR) as UpdateInvoicePayload['discount_type'],
@@ -336,6 +381,13 @@ export default function InvoicesPage() {
                           ? ` · ${formatDate(selected.period_start)} – ${formatDate(selected.period_end)}`
                           : ''}
                       {pendingPeriod && <span className="text-amber-300/80"> · period unsaved</span>}
+                      {/* The header still shows the OLD client name above —
+                          the server rewrites it, so the editor cannot preview
+                          it honestly. Saying so beats showing a name that is
+                          not yet stored anywhere. */}
+                      {pendingNameRefresh && (
+                        <span className="text-amber-300/80"> · names refresh on save</span>
+                      )}
                     </p>
                     <p className="text-xs text-slate-500 mt-0.5">
                       Issued {formatDate(selected.issue_date)} · Due {formatDate(selected.due_date)}
@@ -445,11 +497,13 @@ export default function InvoicesPage() {
               {/* Save bar */}
               <div className="flex items-center justify-between px-5 py-3 border-t border-slate-700 shrink-0 bg-slate-900">
                 <span className="text-xs text-slate-500">
-                  {dirty ? 'Unsaved changes — totals are recomputed by the server on save.' : 'All changes saved.'}
+                  {unsaved
+                    ? 'Unsaved changes — totals are recomputed by the server on save.'
+                    : 'All changes saved.'}
                 </span>
                 <button
                   onClick={handleSave}
-                  disabled={saving || !dirty}
+                  disabled={saving || !unsaved}
                   className="px-4 py-2 text-sm rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
                 >
                   {saving && (
@@ -488,7 +542,10 @@ export default function InvoicesPage() {
           // configured and the modal simply does not offer rounding.
           roundingIncrement={settings?.hours_rounding_increment}
           roundingDirection={settings?.hours_rounding_direction}
-          onApply={(merged, periodStart, periodEnd, issueDate) => {
+          // Computed here because only this page holds the live client list;
+          // the invoice's own copy is a snapshot and cannot reveal a rename.
+          clientRename={clientRename}
+          onApply={(merged, periodStart, periodEnd, issueDate, refreshNames) => {
             setLines(merged);
             setPendingPeriod({ start: periodStart, end: periodEnd });
             // Straight into the working meta rather than a pending value of its
@@ -501,6 +558,13 @@ export default function InvoicesPage() {
             if (issueDate !== null) {
               setMeta((prev) => (prev === null ? prev : { ...prev, issue_date: issueDate }));
             }
+            // The merged lines already carry their refreshed `project_name`,
+            // and the server rebuilds `project_ids`/`project_names` from the
+            // lines — so those need nothing here. This flag is only for the
+            // invoice's `client_name` and `bill_to`, which no line can carry.
+            // Latched, never unlatched: a second regenerate with the toggle off
+            // is not a request to undo a refresh already staged by the first.
+            if (refreshNames) setPendingNameRefresh(true);
             setDirty(true);   // nothing is written until the user saves
           }}
           onClose={() => setShowRegenerate(false)}
