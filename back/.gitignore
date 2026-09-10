@@ -1,0 +1,16 @@
+.env
+.env.deploy
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+serviceAccountKey.json
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.DS_Store
