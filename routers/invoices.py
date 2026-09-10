@@ -119,6 +119,22 @@ class InvoiceUpdate(BaseModel):
     payment_terms: Optional[str] = None
     show_due_date: Optional[bool] = None
     show_payment_terms: Optional[bool] = None
+    # Re-read the client and rebuild ``client_name`` and ``bill_to`` from it.
+    #
+    # A FLAG rather than the two fields themselves, deliberately.  ``bill_to``
+    # is a snapshot so a later rename never rewrites a historical invoice (see
+    # ``build_bill_to``), and accepting it as free-form input would let a
+    # caller put arbitrary text in the Bill-To block of a client-facing
+    # document.  This keeps the server the sole author of that text and makes
+    # the refresh explicit and auditable rather than a silent overwrite — the
+    # same call already made for every money field, recomputed and never
+    # trusted from the payload.
+    #
+    # Renaming a client writes only ``clients/{id}``; nothing propagates from
+    # it.  So this is the only route by which an existing invoice can show a
+    # corrected client name.  Off by default, and the frontend puts it behind
+    # an opt-out on Regenerate.
+    refresh_client_snapshot: bool = False
 
 
 class InvoiceStatusUpdate(BaseModel):
@@ -1482,6 +1498,9 @@ async def update_invoice(
       take the sentinel on create.  ``currency`` does not: it is non-nullable
       and has no "no currency" meaning.
     - Only fields present in the payload are updated.
+    - ``refresh_client_snapshot`` re-reads the client and rebuilds
+      ``client_name`` and ``bill_to``.  Off by default: both are snapshots and
+      only an explicit request may move them.
     """
     db = get_firestore_client()
     doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
@@ -1491,6 +1510,23 @@ async def update_invoice(
 
     if payload.status is not None:
         updates["status"] = _validate_status(payload.status)
+
+    # Rebuilt from the client document, never from the payload.
+    #
+    # Read directly rather than through ``_fetch_client``, which raises 404 on
+    # a missing client.  Deleting a client must not make its past invoices
+    # unsaveable — snapshots exist precisely so an invoice outlives the record
+    # it was built from.  A missing client therefore leaves both fields
+    # untouched and the edit goes through.
+    if payload.refresh_client_snapshot:
+        client_id = existing.get("client_id", "")
+        client_doc = (
+            db.collection("clients").document(client_id).get() if client_id else None
+        )
+        if client_doc is not None and client_doc.exists:
+            client_data = client_doc.to_dict() or {}
+            updates["client_name"] = client_data.get("name", "")
+            updates["bill_to"] = build_bill_to(client_data)
 
     if payload.issue_date is not None:
         updates["issue_date"] = payload.issue_date
