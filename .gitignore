@@ -1,0 +1,21 @@
+# ── Never commit ─────────────────────────────────────────────────────────────
+# This repository is PUBLIC. Anything below is either a live credential or a
+# build artefact, and a credential committed here is a credential leaked, even
+# if the commit is reverted afterwards. `.github/workflows/ci.yml` fails the
+# build if any of these ever appear in the tree — belt as well as braces.
+.env
+.env.*
+!.env.example
+!.env.deploy.example
+serviceAccountKey.json
+.vercel/
+
+# ── Build output and dependencies ────────────────────────────────────────────
+node_modules/
+dist/
+build/
+.expo/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
