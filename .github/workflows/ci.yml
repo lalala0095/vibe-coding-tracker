@@ -1,0 +1,158 @@
+# Checks that run on every push and pull request. Deploys live in deploy.yml
+# and are deliberately a separate file: nothing here can ship anything.
+#
+# Path filtering is computed with plain git rather than a marketplace action.
+# This repository is public and holds real deploy credentials as secrets; every
+# third-party action added here is another supply chain that can read the
+# workflow's context. Ten lines of `git diff` is a fair trade for one fewer.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One CI run per ref. A superseded push is cancelled — its result is about code
+# nobody is looking at any more.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── What changed ───────────────────────────────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      back: ${{ steps.f.outputs.back }}
+      front: ${{ steps.f.outputs.front }}
+      mobile: ${{ steps.f.outputs.mobile }}
+      base: ${{ steps.f.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # path filtering needs history, not just the tip
+
+      - id: f
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          # A new branch, a force-push, or a manual run has no usable base.
+          # Build everything rather than guess — a filter that silently matches
+          # nothing is a CI run that silently checks nothing.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "no usable base ref — running every project"
+            for p in back front mobile; do echo "$p=true" >> "$GITHUB_OUTPUT"; done
+            echo "base=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          CHANGED=$(git diff --name-only "$BASE" "${{ github.sha }}")
+          echo "$CHANGED" | sed 's/^/  /'
+          for p in back front mobile; do
+            if echo "$CHANGED" | grep -q "^$p/"; then echo "$p=true"; else echo "$p=false"; fi >> "$GITHUB_OUTPUT"
+          done
+
+  # ── Nothing sensitive is in the tree ───────────────────────────────────────
+  # First and blocking. A leaked credential is the one CI failure that a revert
+  # does not undo, and this repository is public.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No credential files tracked
+        shell: bash
+        run: |
+          set -euo pipefail
+          BAD=$(git ls-files | grep -iE '(^|/)\.env($|\.)|serviceAccountKey|(^|/)\.vercel/|\.pem$|id_rsa' \
+                | grep -vE '\.example$' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::Credential-shaped files are tracked in a public repository:"
+            echo "$BAD" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "no credential files tracked"
+      - name: No credential-shaped strings
+        shell: bash
+        run: |
+          set -euo pipefail
+          HITS=$(git grep -nIE '(-----BEGIN [A-Z ]*PRIVATE KEY|"private_key"[[:space:]]*:|AIza[0-9A-Za-z_-]{30,})' \
+                 -- . ':!*.example' ':!scripts/check_shared.py' ':!.github/**' || true)
+          if [ -n "$HITS" ]; then
+            echo "::error::Credential-shaped strings found:"; echo "$HITS"; exit 1
+          fi
+          echo "no credential-shaped strings"
+
+  # ── The cross-project invariants ───────────────────────────────────────────
+  # Unconditional. It exists to catch a commit that touches one half of a pair,
+  # so filtering it by path would remove the only case it is for.
+  invariants:
+    runs-on: ubuntu-latest
+    needs: changes
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: python3 scripts/check_shared.py "${{ needs.changes.outputs.base }}" "${{ github.sha }}"
+
+  back:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.back == 'true'
+    defaults: { run: { working-directory: back } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install -r requirements.txt
+      - name: Byte-compile
+        run: python -m compileall -q .
+      - name: Import the app
+        # Catches the failure a syntax check cannot: a bad import, a router
+        # that raises at module scope, a Pydantic model that will not build.
+        run: python -c "import main; print('FastAPI app imports cleanly')"
+        env:
+          GOOGLE_CLOUD_PROJECT: ci
+          SECRET_KEY: ci-not-a-real-key
+          GOOGLE_CLIENT_ID: ci
+          GCS_BUCKET_NAME: ci
+          CORS_ORIGINS: http://localhost
+
+  front:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.front == 'true'
+    defaults: { run: { working-directory: front } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: npm, cache-dependency-path: front/package-lock.json }
+      - run: npm ci
+      # `npm run build` is `tsc && vite build` — the only type check this
+      # project has, so the build IS the test suite.
+      - run: npm run build
+
+  mobile:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    defaults: { run: { working-directory: mobile } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: npm, cache-dependency-path: mobile/package-lock.json }
+      - run: npm ci
+      - run: npx tsc --noEmit
+      # Metro has to resolve the whole graph, which catches breakage tsc cannot
+      # see. No EAS credits are spent here — that is mobile-build.yml, on a tag.
+      - run: npx expo export --platform android
