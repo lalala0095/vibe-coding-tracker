@@ -7,9 +7,10 @@
 // field into one camp or the other and merges field by field:
 //
 //   refreshed  hours, session_ids, date_from, date_to,
-//              sub_items (tracker lines only)           — facts about the work
+//              sub_items (tracker lines only),          — facts about the work
+//              project_name (only when `projectNames` is supplied)
 //   preserved  rate, description, task_title,
-//              project_name, line_id,
+//              line_id,
 //              sub_items (task lines)                   — authored content
 //
 // `sub_items` sits in both camps, and the split is not arbitrary — it follows
@@ -28,6 +29,29 @@
 // So a tracker line's bullets refresh and a task line's are left alone. If
 // task lines are ever taught to carry their sub-tasks, this is the one line
 // that has to change with them.
+//
+// ── project_name, and why it needs a live lookup rather than the preview ─────
+//
+// Renaming a project writes ONE document: `projects/{id}`. It does not touch
+// the `project_name` denormalised onto every task and time entry
+// (`back/routers/projects.py:update_project`). The preview builds its lines
+// from exactly those denormalised copies — `session.project_name` for a task
+// line, `task.project_name` for a tracker line — so `match.project_name` is
+// just as stale as the stored one. Taking the fresh value would change
+// nothing.
+//
+// So the caller passes `projectNames`: id → the name as it stands in the
+// Clients & Projects view right now. That is the only source in the system
+// that a rename actually updates. When a line's `project_id` is absent from
+// the map — a manual line, a deleted project, or a caller that did not supply
+// one — the stored name is kept, because "not loaded" and "renamed to empty"
+// must not look the same.
+//
+// This is a deliberate exception to the snapshot rule in CLAUDE.md. Snapshots
+// exist so that time passing never rewrites a past invoice; regenerate is not
+// time passing, it is the owner explicitly asking to re-read the world. The
+// rate stays snapshotted regardless — a rename is a correction to a label, a
+// rate change is a change to what the work is worth.
 //
 // Lines are paired by *source key*, not by position or line_id: a stored line
 // and a fresh line describe the same work when they came from the same tracker,
@@ -59,6 +83,13 @@ export interface LineChange {
   datesChanged: boolean;
   /** The bullet list under the description moved. Tracker lines only. */
   subItemsChanged: boolean;
+  /**
+   * The project was renamed in Clients & Projects since this line was written.
+   * `null` on both when nothing moved, so a caller can render `before → after`
+   * without a second comparison.
+   */
+  projectNameBefore: string | null;
+  projectNameAfter: string | null;
   isTracker: boolean;
 }
 
@@ -186,7 +217,35 @@ export function mergeRegeneratedLines(
   current: InvoiceLine[],
   fresh: InvoicePreviewLine[],
   rounding?: RegenerateRounding | null,
+  /**
+   * Live project names by id. Omit to leave every `project_name` untouched,
+   * which is exactly what this function did before renames were handled.
+   */
+  projectNames?: Map<string, string> | null,
 ): MergeResult {
+  /**
+   * The name a line should carry, and whether that is a change.
+   *
+   * Returns the STORED name whenever the map cannot answer — a missing id
+   * means "not loaded" or "project deleted", neither of which is licence to
+   * blank a name that is printed on an invoice. An empty live name is treated
+   * the same way: a project cannot usefully be renamed to nothing, so it reads
+   * as an unloaded entry rather than as an instruction to clear the field.
+   */
+  function nameFor(line: { project_id: string | null; project_name: string }): {
+    name: string;
+    before: string | null;
+    after: string | null;
+  } {
+    const stored = line.project_name ?? '';
+    if (!projectNames || !line.project_id) return { name: stored, before: null, after: null };
+    const live = projectNames.get(line.project_id);
+    if (live === undefined || isBlank(live) || live === stored) {
+      return { name: stored, before: null, after: null };
+    }
+    return { name: live, before: stored, after: live };
+  }
+
   // Fresh lines bucketed by key, in arrival order. A bucket rather than a bare
   // value because a malformed preview could repeat a key; each stored line then
   // consumes at most one fresh line and the surplus falls through as 'added',
@@ -211,15 +270,23 @@ export function mergeRegeneratedLines(
     // Manual lines are authored from nothing, so no fresh line can speak for
     // them. They are kept verbatim and are never candidates for removal.
     if (key === null) {
-      lines.push(stored);
+      // A manual line is authored from nothing, but it can still carry a
+      // project_id, and a rename is a correction to a label rather than a
+      // rewrite of authored content. Its hours and text stay untouched.
+      const renamedManual = nameFor(stored);
+      const manualLine: InvoiceLine =
+        renamedManual.after === null ? stored : { ...stored, project_name: renamedManual.name };
+      lines.push(manualLine);
       changes.push({
         kind: 'manual',
-        title: lineTitle(stored),
-        line: stored,
-        hoursBefore: stored.hours,
-        hoursAfter: stored.hours,
+        title: lineTitle(manualLine),
+        line: manualLine,
+        hoursBefore: manualLine.hours,
+        hoursAfter: manualLine.hours,
         datesChanged: false,
         subItemsChanged: false,
+        projectNameBefore: renamedManual.before,
+        projectNameAfter: renamedManual.after,
         isTracker: false,
       });
       continue;
@@ -239,6 +306,10 @@ export function mergeRegeneratedLines(
         hoursAfter: null,
         datesChanged: false,
         subItemsChanged: false,
+        // A line on its way out is reported as it was stored. Renaming a
+        // project on something about to be deleted is noise.
+        projectNameBefore: null,
+        projectNameAfter: null,
         isTracker: !isBlank(stored.tracker_id),
       });
       continue;
@@ -267,6 +338,10 @@ export function mergeRegeneratedLines(
       : asArray(match.sub_items);
     const subItemsChanged = !sameItems(storedSubItems, subItems);
 
+    // Resolved from the STORED line: `match.project_name` is the same
+    // denormalised copy and is stale in exactly the same way. See the header.
+    const renamed = nameFor(stored);
+
     const merged: InvoiceLine = {
       ...stored,
       hours: freshHours,
@@ -274,24 +349,34 @@ export function mergeRegeneratedLines(
       date_from: match.date_from,
       date_to: match.date_to,
       sub_items: subItems,
+      project_name: renamed.name,
     };
 
     lines.push(merged);
     changes.push({
-      kind: hoursChanged || datesChanged || subItemsChanged ? 'updated' : 'unchanged',
+      kind:
+        hoursChanged || datesChanged || subItemsChanged || renamed.after !== null
+          ? 'updated'
+          : 'unchanged',
       title: lineTitle(merged),
       line: merged,
       hoursBefore: stored.hours,
       hoursAfter: merged.hours,
       datesChanged,
       subItemsChanged,
+      projectNameBefore: renamed.before,
+      projectNameAfter: renamed.after,
       isTracker: !isBlank(merged.tracker_id),
     });
   }
 
   fresh.forEach((line, index) => {
     if (consumed.has(index)) return;
-    const added = toStoredLine(line, rounding);
+    // An added line arrives with the same denormalised name as everything
+    // else, so it needs the same live lookup — otherwise regenerating an
+    // invoice would ADD a line already carrying the old project name.
+    const addedName = nameFor(line);
+    const added = { ...toStoredLine(line, rounding), project_name: addedName.name };
     lines.push(added);
     changes.push({
       kind: 'added',
@@ -301,6 +386,10 @@ export function mergeRegeneratedLines(
       hoursAfter: added.hours,
       datesChanged: false,
       subItemsChanged: false,
+      // The line is new, so its name is not a rename of anything the invoice
+      // was showing. Reported as clean.
+      projectNameBefore: null,
+      projectNameAfter: null,
       isTracker: !isBlank(added.tracker_id),
     });
   });
@@ -320,7 +409,17 @@ export function mergeRegeneratedLines(
   // surviving line still bills the same hours over the same dates. Hour totals
   // are not consulted: two lines could shift hours between them and still sum
   // to the same figure, and that is a real change.
-  const hasChanges = counts.added > 0 || counts.removed > 0 || counts.updated > 0;
+  //
+  // The `manual` term is not redundant. A renamed project on a manual line is
+  // a real change, but a manual line keeps `kind: 'manual'` rather than
+  // becoming 'updated' — that kind says where the line came from, and losing
+  // it would tell the reader the line had been rebuilt from time entries when
+  // it had not. Without this term an invoice whose ONLY stale name sits on a
+  // manual line would report "nothing to apply" and the rename could never be
+  // applied at all.
+  const renamed = changes.some((change) => change.projectNameAfter !== null);
+  const hasChanges =
+    counts.added > 0 || counts.removed > 0 || counts.updated > 0 || renamed;
 
   return {
     lines,

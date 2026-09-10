@@ -7,6 +7,7 @@ import Modal from '../components/Modal';
 import TaskPanel from '../components/TaskPanel';
 import GoalPanel from '../components/GoalPanel';
 import TaskForm from '../components/TaskForm';
+import BulkMoveTasksModal from '../components/BulkMoveTasksModal';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -47,7 +48,7 @@ function dueDateColor(dateStr: string | null): string {
 type FilterStatus = 'all' | TaskStatus;
 type FilterPriority = 'all' | TaskPriority;
 
-type ModalState = { kind: 'none' } | { kind: 'create' };
+type ModalState = { kind: 'none' } | { kind: 'create' } | { kind: 'bulk_move' };
 
 // ── Task Row ─────────────────────────────────────────────────────────────────
 
@@ -61,6 +62,8 @@ interface TaskRowProps {
   onStatusCycle: (task: Task) => void;
   onOpen: (task: Task) => void;
   togglingId: string | null;
+  selected: boolean;
+  onToggleSelect: (task: Task) => void;
 }
 
 function TaskRow({
@@ -73,14 +76,39 @@ function TaskRow({
   onStatusCycle,
   onOpen,
   togglingId,
+  selected,
+  onToggleSelect,
 }: TaskRowProps) {
   const isDone = task.status === 'done';
 
   return (
     <div
-      className="flex items-center gap-3 py-2.5 group hover:bg-slate-800/50 transition-colors border-b border-slate-800/50"
+      className={`flex items-center gap-3 py-2.5 group transition-colors border-b border-slate-800/50
+        ${selected ? 'bg-violet-500/10 hover:bg-violet-500/15' : 'hover:bg-slate-800/50'}`}
       style={{ paddingLeft: `${16 + depth * 20}px`, paddingRight: '16px' }}
     >
+      {/* Selection checkbox — square and violet, deliberately unlike the round-
+          cornered status checkbox two slots to the right. This one picks the
+          task for a bulk action; that one marks it done. */}
+      <button
+        onClick={() => onToggleSelect(task)}
+        role="checkbox"
+        aria-checked={selected}
+        aria-label={`Select "${task.title}" for bulk actions`}
+        className={`w-3.5 h-3.5 rounded-sm shrink-0 border flex items-center justify-center transition-colors
+          ${selected
+            ? 'bg-violet-500 border-violet-500'
+            : 'border-slate-600 bg-transparent hover:border-violet-400'
+          }`}
+        title="Select for bulk actions"
+      >
+        {selected && (
+          <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+          </svg>
+        )}
+      </button>
+
       {/* Expand/collapse chevron */}
       {subtaskCount > 0 ? (
         <button
@@ -216,6 +244,9 @@ export default function TasksPage() {
   // Status cycling
   const [togglingId, setTogglingId] = useState<string | null>(null);
 
+  // Bulk selection — task ids picked for a bulk action, not a status.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
   // Refreshing indicator (separate from initial load)
   const [refreshing, setRefreshing] = useState(false);
 
@@ -339,6 +370,14 @@ export default function TasksPage() {
     }
   }, [clients]);
 
+  // Narrowing the view drops the selection. A task selected under one filter
+  // and then hidden by another would still be moved by a bulk action, which is
+  // a change to data the owner can no longer see — so the selection never
+  // outlives the view it was made in.
+  useEffect(() => {
+    setSelectedIds(new Set());
+  }, [selectedProjectId, filterStatus, filterPriority]);
+
   // Load subtasks for a task when expanding
   const loadSubtasks = useCallback(async (taskId: string) => {
     if (subtasksMap[taskId]) return; // already loaded
@@ -436,6 +475,49 @@ export default function TasksPage() {
       }
       return sortDir === 'asc' ? cmp : -cmp;
     });
+
+  // ── Bulk selection ──────────────────────────────────────────────────────────
+  // A selected id can name a top-level task or an expanded sub-task, so the
+  // lookup spans both the main list and every loaded subtask branch.
+  const selectedTasks: Task[] = (() => {
+    if (selectedIds.size === 0) return [];
+    const byId = new Map<string, Task>();
+    for (const t of tasks) byId.set(t.id, t);
+    for (const branch of Object.values(subtasksMap)) {
+      for (const t of branch) byId.set(t.id, t);
+    }
+    return Array.from(selectedIds)
+      .map((id) => byId.get(id))
+      .filter((t): t is Task => t !== undefined);
+  })();
+
+  const toggleSelect = (task: Task) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(task.id)) next.delete(task.id);
+      else next.add(task.id);
+      return next;
+    });
+  };
+
+  // Select-all covers the rows the current filters actually show. Sub-tasks are
+  // left out on purpose: they travel with their parent anyway.
+  const allFilteredSelected =
+    filteredTasks.length > 0 && filteredTasks.every((t) => selectedIds.has(t.id));
+  const someFilteredSelected =
+    !allFilteredSelected && filteredTasks.some((t) => selectedIds.has(t.id));
+
+  const toggleSelectAll = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allFilteredSelected) {
+        for (const t of filteredTasks) next.delete(t.id);
+      } else {
+        for (const t of filteredTasks) next.add(t.id);
+      }
+      return next;
+    });
+  };
 
   const toggleSort = (field: 'title' | 'due_date') => {
     if (sortField === field) {
@@ -634,6 +716,36 @@ export default function TasksPage() {
                 ))}
               </div>
             </div>
+
+            {/* Bulk action bar — only while something is selected */}
+            {/* Counted from `selectedTasks`, not `selectedIds`. An id whose task
+                cannot be resolved — deleted from under us, or in a branch that
+                never loaded — is dropped before the move, so counting ids would
+                promise a task the move would not touch. */}
+            {selectedTasks.length > 0 && (
+              <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-violet-500/30 bg-violet-500/10 px-3 py-2">
+                <span className="text-sm font-medium text-violet-200">
+                  {selectedTasks.length} selected
+                </span>
+                <button
+                  onClick={() => setModal({ kind: 'bulk_move' })}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-white
+                             bg-violet-600 rounded-lg hover:bg-violet-500 transition-colors"
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round"
+                      d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 00-1.883 2.542l.857 6a2.25 2.25 0 002.227 1.932H19.05a2.25 2.25 0 002.227-1.932l.857-6a2.25 2.25 0 00-1.883-2.542m-16.5 0V6A2.25 2.25 0 016 3.75h3.879a1.5 1.5 0 011.06.44l2.122 2.12a1.5 1.5 0 001.06.44H18A2.25 2.25 0 0120.25 6v3.776" />
+                  </svg>
+                  Move to project…
+                </button>
+                <button
+                  onClick={() => setSelectedIds(new Set())}
+                  className="text-sm text-slate-400 hover:text-slate-200 transition-colors ml-auto"
+                >
+                  Clear selection
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Task list body */}
@@ -704,6 +816,27 @@ export default function TasksPage() {
               <div>
                 {/* Column headers */}
                 <div className="flex items-center gap-3 px-4 py-2 border-b border-slate-800 text-xs font-medium uppercase tracking-wider sticky top-0 bg-slate-950/90 backdrop-blur-sm">
+                  {/* Select all of the current filtered view */}
+                  <button
+                    onClick={toggleSelectAll}
+                    role="checkbox"
+                    aria-checked={allFilteredSelected ? true : someFilteredSelected ? 'mixed' : false}
+                    aria-label={allFilteredSelected ? 'Clear selection' : 'Select all shown tasks'}
+                    className={`w-3.5 h-3.5 rounded-sm shrink-0 border flex items-center justify-center transition-colors
+                      ${allFilteredSelected || someFilteredSelected
+                        ? 'bg-violet-500 border-violet-500'
+                        : 'border-slate-600 bg-transparent hover:border-violet-400'
+                      }`}
+                    title={allFilteredSelected ? 'Clear selection' : 'Select all shown tasks'}
+                  >
+                    {allFilteredSelected ? (
+                      <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                      </svg>
+                    ) : someFilteredSelected ? (
+                      <span className="w-1.5 h-0.5 bg-white rounded-full" />
+                    ) : null}
+                  </button>
                   <div className="w-4 shrink-0" />
                   <div className="w-4 shrink-0" />
                   <button
@@ -758,6 +891,8 @@ export default function TasksPage() {
                           onStatusCycle={cycleStatus}
                           onOpen={(t) => { setSelectedTask(t); setSelectedGoal(null); }}
                           togglingId={togglingId}
+                          selected={selectedIds.has(task.id)}
+                          onToggleSelect={toggleSelect}
                         />
                         {isExpanded && (
                           <>
@@ -847,6 +982,23 @@ export default function TasksPage() {
             />
           )}
         </Modal>
+      )}
+
+      {/* ── Bulk move Modal ── */}
+      {/* `onMoved` refreshes and drops the selection but does not close: the
+          dialog keeps itself open to report a partial failure, and snapshots
+          its own copy of the selection so the refresh cannot pull it away. */}
+      {modal.kind === 'bulk_move' && (
+        <BulkMoveTasksModal
+          tasks={selectedTasks}
+          clients={clients}
+          projects={projects}
+          onMoved={() => {
+            setSelectedIds(new Set());
+            refreshAll();
+          }}
+          onClose={() => setModal({ kind: 'none' })}
+        />
       )}
 
     </div>
