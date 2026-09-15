@@ -286,6 +286,15 @@ jobs:
       # So: submit --async, poll the build's status (cloudbuild.builds.get,
       # which builds.editor has), fail unless SUCCESS, and link the console
       # for the logs.
+      #
+      # The source staging dir is explicit for a similar reason. Left to its
+      # default bucket, gcloud first runs an ownership check: a project-wide
+      # buckets.list, needing storage.buckets.list. The deployer holds storage
+      # rights on the _cloudbuild bucket only, so that check 403s and surfaces
+      # as a misleading "forbidden ... serviceusage.services.use" error. Naming
+      # the dir skips the check, which is safe here: it guards against someone
+      # else squatting the bucket name, but this bucket already exists in this
+      # project and the name is fixed, so there is nothing left to squat.
       - name: Build image with Cloud Build
         if: steps.gate.outputs.ready == 'true'
         working-directory: .
@@ -293,7 +302,7 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE="gcr.io/$GCP_PROJECT_ID/$SERVICE:$GITHUB_SHA"
-          if ! BUILD_ID=$(gcloud builds submit back --tag "$IMAGE" --async --format='value(id)' --quiet) \
+          if ! BUILD_ID=$(gcloud builds submit back --tag "$IMAGE" --gcs-source-staging-dir="gs://${GCP_PROJECT_ID}_cloudbuild/source" --async --format='value(id)' --quiet) \
              || [ -z "$BUILD_ID" ]; then
             echo "::error::Cloud Build submission failed — https://console.cloud.google.com/cloud-build/builds?project=$GCP_PROJECT_ID"
             exit 1
