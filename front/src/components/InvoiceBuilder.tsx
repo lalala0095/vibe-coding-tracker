@@ -1,10 +1,12 @@
 import { useState } from 'react';
 import type {
   Client, Project, Invoice, InvoiceLine, InvoiceSettings, CreateInvoicePayload,
-  InvoiceLineSource,
+  InvoiceLineSource, InvoicePreviewLine,
 } from '../types';
-import { previewInvoice, createInvoice } from '../api';
+import { previewInvoice, createInvoice, getSessions } from '../api';
 import { computeMoney, formatHours, formatMoney, type DiscountType } from '../lib/money';
+import { expandToDailyLines, rememberLayout, rememberedLayout } from '../lib/invoiceLayout';
+import type { InvoiceLineLayout } from '../lib/regenerate';
 import InvoiceLineTable from './InvoiceLineTable';
 import Modal, { MODAL_CANCEL_BUTTON, MODAL_PRIMARY_BUTTON, ButtonSpinner } from './Modal';
 
@@ -245,6 +247,49 @@ export function InvoiceMetaFields({
   );
 }
 
+// ── Line layout ───────────────────────────────────────────────────────────────
+// How time entries are cut into lines — see lib/invoiceLayout.ts. Shared by the
+// builder and RegenerateModal so both offer the same choice in the same words.
+
+export function LineLayoutField({
+  value, onChange,
+}: {
+  value: InvoiceLineLayout;
+  onChange: (layout: InvoiceLineLayout) => void;
+}) {
+  return (
+    <div>
+      <label className={LABEL}>Time entry lines</label>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value as InvoiceLineLayout)}
+        className={FIELD}
+      >
+        <option value="task">One line per task · hours summed across the period</option>
+        <option value="daily">One line per day · time entry notes as sub-tasks</option>
+      </select>
+    </div>
+  );
+}
+
+// Re-cut a preview's time-entry lines to the chosen layout. 'task' is the
+// preview exactly as the server built it. 'daily' needs each entry's date and
+// notes, which preview lines do not carry, so it reads the period's entries in
+// one request — the same client and start-date window the preview filtered on.
+export async function applyLineLayout(
+  lines: InvoicePreviewLine[],
+  layout: InvoiceLineLayout,
+  source: { client_id: string; period_start: string; period_end: string; for_invoice_id?: string },
+): Promise<InvoicePreviewLine[]> {
+  if (layout !== 'daily' || !lines.some((l) => (l.session_ids ?? []).length > 0)) return lines;
+  const sessions = await getSessions({
+    client_id: source.client_id,
+    date_from: source.period_start,
+    date_to: source.period_end,
+  });
+  return expandToDailyLines(lines, new Map(sessions.map((s) => [s.id, s])), source.for_invoice_id);
+}
+
 // ── Builder ───────────────────────────────────────────────────────────────────
 
 // Build-time facts about a previewed line that the stored shape cannot hold.
@@ -271,6 +316,8 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
   const [periodEnd, setPeriodEnd] = useState(todaySGT());
   const [includeInvoiced, setIncludeInvoiced] = useState(false);
   const [includeTrackers, setIncludeTrackers] = useState(true);
+  // Remembered per browser: whoever bills day by day does it on every invoice.
+  const [layout, setLayout] = useState<InvoiceLineLayout>(() => rememberedLayout());
 
   const [lines, setLines] = useState<InvoiceLine[]>([]);
   const [currency, setCurrency] = useState(settings?.default_currency ?? 'USD');
@@ -345,7 +392,13 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
         include_trackers: includeTrackers,
       });
 
-      const previewLines = preview.lines ?? [];
+      // Re-cut before anything below reads it, so the counts, claims and
+      // exclusions all describe the lines actually shown.
+      const previewLines = await applyLineLayout(preview.lines ?? [], layout, {
+        client_id: clientId,
+        period_start: periodStart,
+        period_end: periodEnd,
+      });
 
       setLines(previewLines);
       setCurrency(preview.currency || selectedClient?.currency || 'USD');
@@ -522,6 +575,13 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
             </div>
           </div>
         )}
+
+        <div className="sm:w-1/2">
+          <LineLayoutField
+            value={layout}
+            onChange={(next) => { setLayout(next); rememberLayout(next); invalidatePreview(); }}
+          />
+        </div>
 
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-4 flex-wrap">

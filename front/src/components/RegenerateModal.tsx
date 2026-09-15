@@ -1,7 +1,10 @@
 import { useMemo, useState } from 'react';
 import type { HoursRoundingDirection, Invoice, InvoiceLine, InvoicePreviewLine, Project } from '../types';
 import { previewInvoice } from '../api';
-import { mergeRegeneratedLines, type LineChange, type LineChangeKind, type MergeResult } from '../lib/regenerate';
+import {
+  mergeRegeneratedLines, type InvoiceLineLayout, type LineChange, type LineChangeKind, type MergeResult,
+} from '../lib/regenerate';
+import { inferLayout, rememberLayout, rememberedLayout } from '../lib/invoiceLayout';
 // `todaySgt()` and not `new Date().toISOString()`: the latter is UTC, so
 // between midnight and 08:00 in Singapore it names yesterday — and the whole
 // point of this option is to stamp the day the invoice was actually re-issued.
@@ -9,7 +12,7 @@ import { todaySgt } from '../lib/week';
 import Modal, { MODAL_CANCEL_BUTTON, MODAL_PRIMARY_BUTTON, ButtonSpinner } from './Modal';
 // The form classes live with the other shared invoice-UI pieces rather than
 // being restated here, which is what let the three dialogs drift.
-import { FIELD, LABEL, CHECKBOX } from './InvoiceBuilder';
+import { FIELD, LABEL, CHECKBOX, LineLayoutField, applyLineLayout } from './InvoiceBuilder';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -38,7 +41,7 @@ const KIND_STYLE: Record<LineChangeKind, string> = {
 const KIND_BLURB: Record<LineChangeKind, string> = {
   added: 'New work found in this period.',
   updated:
-    'Hours, dates, a tracker’s sub-tasks, or a project name moved. Your rate and description are kept.',
+    'Hours, dates, sub-tasks, or a project name moved. Your rate and description are kept.',
   removed: 'No longer backed by any time entry in this period. Applying drops these lines.',
   unchanged: 'Nothing to do.',
   manual: 'Added by hand, so nothing regenerates them.',
@@ -137,6 +140,12 @@ export default function RegenerateModal({
   const [projectIds, setProjectIds] = useState<string[]>([]);
   const [includeTrackers, setIncludeTrackers] = useState(true);
   const [includeInvoiced, setIncludeInvoiced] = useState(false);
+  // Read off the invoice's own lines first, so regenerating a daily invoice
+  // stays daily and a per-task one is not quietly restructured. The browser's
+  // last choice only speaks when the lines cannot.
+  const [layout, setLayout] = useState<InvoiceLineLayout>(
+    () => inferLayout(currentLines) ?? rememberedLayout(),
+  );
 
   // Pinned once for the life of the dialog, so the date shown on the checkbox
   // is exactly the date Apply hands back even if the modal is left open across
@@ -186,8 +195,10 @@ export default function RegenerateModal({
     // Null rather than an empty map when the toggle is off: the merge reads a
     // missing entry as "not loaded, keep the stored name", which is exactly
     // the behaviour the toggle is asking for.
-    return mergeRegeneratedLines(currentLines, preview, rounding, refreshNames ? projectNames : null);
-  }, [preview, currentLines, roundHours, roundingIncrement, direction, refreshNames, projectNames]);
+    return mergeRegeneratedLines(
+      currentLines, preview, rounding, refreshNames ? projectNames : null, layout,
+    );
+  }, [preview, currentLines, roundHours, roundingIncrement, direction, refreshNames, projectNames, layout]);
 
   // The client is a snapshot on the invoice and the server will not accept a
   // different one, so it is shown rather than offered.
@@ -217,7 +228,12 @@ export default function RegenerateModal({
         // the preview would come back all but empty.
         for_invoice_id: invoice.id,
       });
-      setPreview(fresh.lines ?? []);
+      setPreview(await applyLineLayout(fresh.lines ?? [], layout, {
+        client_id: invoice.client_id,
+        period_start: periodStart,
+        period_end: periodEnd,
+        for_invoice_id: invoice.id,
+      }));
     } catch {
       setError('Failed to load time entries for that period.');
     } finally {
@@ -310,6 +326,14 @@ export default function RegenerateModal({
     () => (result === null ? [] : groupRenames(result.changes)),
     [result],
   );
+
+  // What survives an apply, in the terms of the chosen layout. Daily lines are
+  // the one kind of time-entry line whose task list is refreshed, not kept.
+  const keptNote =
+    (layout === 'daily'
+      ? 'Your rates and descriptions are kept. Daily lines take their task lists from the time entry notes, and keep yours when a day has no notes.'
+      : 'Your rates, descriptions and task lists are kept.') +
+    ' Only hours, dates and which lines exist are refreshed. Nothing is saved until you press Save changes on the invoice.';
 
   return (
     <Modal
@@ -438,6 +462,13 @@ export default function RegenerateModal({
             </div>
           )}
 
+          <div className="sm:w-1/2">
+            <LineLayoutField
+              value={layout}
+              onChange={(next) => { setLayout(next); rememberLayout(next); }}
+            />
+          </div>
+
           <div className="flex items-center gap-4 flex-wrap">
             <label className="flex items-center gap-2 cursor-pointer">
               <input
@@ -464,10 +495,7 @@ export default function RegenerateModal({
             {namesToggle}
           </div>
 
-          <p className="text-xs text-slate-500 leading-relaxed">
-            Your rates, descriptions and task lists are kept. Only hours, dates and which lines
-            exist are refreshed. Nothing is saved until you press Save changes on the invoice.
-          </p>
+          <p className="text-xs text-slate-500 leading-relaxed">{keptNote}</p>
         </div>
       ) : (
         /* ── Step 2: what applying would do ── */
@@ -490,6 +518,7 @@ export default function RegenerateModal({
             result={result}
             issueDate={issueDateWouldMove ? today : null}
             namesWouldMove={renameGroups.length > 0 || clientRenameWouldApply}
+            keptNote={keptNote}
           />
         </div>
       )}
@@ -581,8 +610,9 @@ function RenameRow({ label, before, after, note }: {
 
 // ── Change summary ────────────────────────────────────────────────────────────
 
-function ChangeSummary({ result, issueDate, namesWouldMove }: {
+function ChangeSummary({ result, issueDate, namesWouldMove, keptNote }: {
   result: MergeResult;
+  keptNote: string;
   issueDate: string | null;
   /** Something above this panel is pending, so it is not a plain no-op. */
   namesWouldMove: boolean;
@@ -637,10 +667,7 @@ function ChangeSummary({ result, issueDate, namesWouldMove }: {
         )}
       </div>
 
-      <p className="text-xs text-slate-500 leading-relaxed">
-        Your rates, descriptions and task lists are kept. Only hours, dates and which lines exist
-        are refreshed. Nothing is saved until you press Save changes on the invoice.
-      </p>
+      <p className="text-xs text-slate-500 leading-relaxed">{keptNote}</p>
 
       {/* Dropping lines is the one irreversible-feeling outcome here, so it is
           called out above the list as well as coloured inside it. */}
@@ -705,8 +732,8 @@ function ChangeRow({ change }: { change: LineChange }) {
             Dates change to {change.line.date_from ?? '—'} – {change.line.date_to ?? '—'}
           </p>
         )}
-        {/* Only tracker lines can reach this — the merge leaves a task line's
-            bullets alone. Spelled out rather than counted: the whole point of
+        {/* Tracker lines and daily lines reach this — the merge leaves a
+            per-task line's bullets alone. Spelled out rather than counted: the whole point of
             the change is *which* sub-tasks the client will see listed. */}
         {change.subItemsChanged && (
           <p className="text-xs opacity-80 mt-0.5">

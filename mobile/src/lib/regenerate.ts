@@ -17,7 +17,7 @@
 // field into one camp or the other and merges field by field:
 //
 //   refreshed  hours, session_ids, date_from, date_to,
-//              sub_items (tracker lines only),          — facts about the work
+//              sub_items (tracker lines, daily lines),  — facts about the work
 //              project_name (only when `projectNames` is supplied)
 //   preserved  rate, description, task_title,
 //              line_id,
@@ -36,9 +36,31 @@
 //                 always `[]`. Taking the fresh value here would replace a
 //                 hand-written bullet list with nothing.
 //
-// So a tracker line's bullets refresh and a task line's are left alone. If
-// task lines are ever taught to carry their sub-tasks, this is the one line
-// that has to change with them.
+// So a tracker line's bullets refresh and a task line's are left alone.
+//
+// ── The daily layout ─────────────────────────────────────────────────────────
+//
+// Task lines DO carry bullets when the owner picks the daily layout
+// (`front/src/lib/invoiceLayout.ts`): the preview's per-task lines are re-cut
+// one per day, and each day's time entry notes become its `sub_items`. Two
+// things change with it, and only when `layout` is 'daily':
+//
+//   key        A single-day task line is keyed by (task, project, DATE), so
+//              each day pairs with the same day. A multi-day line keeps the
+//              task key and matches nothing — switching an invoice from
+//              per-task to daily reports the old line removed and the days
+//              added, which is exactly the restructure being asked for.
+//   sub_items  A daily line's bullets refresh from the notes, like a
+//              tracker's — but only when the notes produce some. Empty notes
+//              keep the stored bullets, so a list typed onto the invoice by
+//              hand is never wiped by entries that simply have no notes.
+//
+// Editing a daily line's date by hand re-keys it, so the next regenerate reads
+// it as removed and its day as added. Visible in the summary, never silent.
+//
+// The layout is a parameter rather than something read off each line, because
+// a one-day line from the per-task layout is indistinguishable from a daily
+// one. The default, 'task', is exactly the behaviour before this existed.
 //
 // ── project_name, and why it needs a live lookup rather than the preview ─────
 //
@@ -84,6 +106,13 @@ import { roundHoursToIncrement } from './money';
 
 export type LineChangeKind = 'added' | 'updated' | 'unchanged' | 'removed' | 'manual';
 
+/**
+ * How time-entry lines are cut. 'task' is one line per (task, project) across
+ * the period — what the preview returns. 'daily' is one per task per day; see
+ * the header.
+ */
+export type InvoiceLineLayout = 'task' | 'daily';
+
 export interface LineChange {
   kind: LineChangeKind;
   title: string;              // description || task_title, for display
@@ -91,7 +120,7 @@ export interface LineChange {
   hoursBefore: number | null; // null for 'added'
   hoursAfter: number | null;  // null for 'removed'
   datesChanged: boolean;
-  /** The bullet list under the description moved. Tracker lines only. */
+  /** The bullet list under the description moved. Tracker and daily lines only. */
   subItemsChanged: boolean;
   /**
    * The project was renamed in Clients & Projects since this line was written.
@@ -167,11 +196,17 @@ function applyRounding(hours: number, rounding?: RegenerateRounding | null): num
  *
  * Derived from the ids alone, never from `source`, so the same function keys a
  * stored `InvoiceLine` (which has no `source`) and a fresh preview line alike.
+ *
+ * Under the 'daily' layout a single-day task line also carries its date, so
+ * one task's days pair up day by day instead of all sharing one key.
  */
-export function lineSourceKey(line: InvoiceLine): string | null {
+export function lineSourceKey(line: InvoiceLine, layout: InvoiceLineLayout = 'task'): string | null {
   if (!isBlank(line.tracker_id)) return `tracker:${line.tracker_id}`;
-  if (!isBlank(line.task_id)) return `task:${line.task_id}|${line.project_id ?? ''}`;
-  return null;
+  if (isBlank(line.task_id)) return null;
+  if (layout === 'daily' && !isBlank(line.date_from) && line.date_from === line.date_to) {
+    return `day:${line.task_id}|${line.project_id ?? ''}|${line.date_from}`;
+  }
+  return `task:${line.task_id}|${line.project_id ?? ''}`;
 }
 
 /** What the user should see this line called. */
@@ -232,6 +267,8 @@ export function mergeRegeneratedLines(
    * which is exactly what this function did before renames were handled.
    */
   projectNames?: Map<string, string> | null,
+  /** 'daily' pairs and refreshes time-entry lines day by day. See the header. */
+  layout: InvoiceLineLayout = 'task',
 ): MergeResult {
   /**
    * The name a line should carry, and whether that is a change.
@@ -262,7 +299,7 @@ export function mergeRegeneratedLines(
   // instead of two stored lines silently sharing one refresh.
   const freshByKey = new Map<string, number[]>();
   fresh.forEach((line, index) => {
-    const key = lineSourceKey(line);
+    const key = lineSourceKey(line, layout);
     if (key === null) return; // a keyless preview line can only ever be 'added'
     const bucket = freshByKey.get(key);
     if (bucket) bucket.push(index);
@@ -275,7 +312,7 @@ export function mergeRegeneratedLines(
   const removals: LineChange[] = [];
 
   for (const stored of current) {
-    const key = lineSourceKey(stored);
+    const key = lineSourceKey(stored, layout);
 
     // Manual lines are authored from nothing, so no fresh line can speak for
     // them. They are kept verbatim and are never candidates for removal.
@@ -343,9 +380,12 @@ export function mergeRegeneratedLines(
     // See the header for why this is split by line kind rather than simply
     // refreshed or simply preserved.
     const storedSubItems = asArray(stored.sub_items);
-    const subItems = isBlank(stored.tracker_id)
-      ? storedSubItems
-      : asArray(match.sub_items);
+    const freshSubItems = asArray(match.sub_items);
+    const subItems = !isBlank(stored.tracker_id)
+      ? freshSubItems
+      : key.startsWith('day:') && freshSubItems.length > 0
+        ? freshSubItems
+        : storedSubItems;
     const subItemsChanged = !sameItems(storedSubItems, subItems);
 
     // Resolved from the STORED line: `match.project_name` is the same
