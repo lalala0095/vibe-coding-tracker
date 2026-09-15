@@ -1,0 +1,295 @@
+# Ships the web frontend (front/ → Vercel) and the API (back/ → Cloud Run).
+# This is the only file in the repository that can deploy anything; ci.yml
+# checks, this ships. Mobile is deliberately out of scope here.
+#
+# ── Why `push`, not `workflow_run` after CI ────────────────────────────────
+# The obvious design is "deploy when CI goes green on main" via workflow_run.
+# It does not work here: the GitHub repository's default branch is `front`
+# (legacy), and workflow_run only fires for workflow files that exist on the
+# default branch. A workflow_run trigger in this file would be valid YAML, pass
+# review, and silently never fire. So this runs on push, and each deploy job
+# gates itself with the checks that matter before anything ships.
+#
+# ── Why no marketplace actions ─────────────────────────────────────────────
+# Same rule as ci.yml. This repository is public and holds production deploy
+# credentials; every third-party action is another supply chain that can read
+# the workflow's context. The Vercel CLI comes from npm at an exact version,
+# and Google Cloud auth is done with the gcloud already on the runner rather
+# than google-github-actions/*.
+#
+# Targets:
+#   front → Vercel project vibe-coding-tracker (track.supportrules.com). Not
+#           connected to Git, so this workflow is its only path to production.
+#   back  → Cloud Run service vibe-coding-tracker-api (asia-southeast1).
+name: Deploy
+
+# No workflow-level `paths` filter: it cannot say "deploy front only when
+# front changed". The `changes` job decides per project instead.
+on:
+  push:
+    branches: [main]
+  # Note: GitHub only offers the "Run workflow" button for workflows present on
+  # the default branch (`front`), for the same reason as above. A manual run has
+  # no base commit, so it deploys both projects — intended.
+  workflow_dispatch:
+
+# Concurrency is per deploy job (deploy-front / deploy-back), not per workflow,
+# and never cancels in progress. ci.yml cancels superseded runs because a stale
+# check result is worthless; a deploy killed half-way is worse than a queued
+# one. The groups are separate so a slow Cloud Build never holds up a Vercel
+# deploy, and so that a queued run touching only one project cannot displace a
+# queued run carrying the other project's change (GitHub keeps only the newest
+# pending entry per group).
+
+permissions:
+  contents: read
+
+jobs:
+  # ── What changed ───────────────────────────────────────────────────────────
+  # Same computation as ci.yml's `changes` job, restricted to what deploys.
+  changes:
+    runs-on: ubuntu-latest
+    # A manual run from another branch must not put that branch in production.
+    # Every deploy job needs this one, so skipping it skips them all.
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      back: ${{ steps.f.outputs.back }}
+      front: ${{ steps.f.outputs.front }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # path filtering needs history, not just the tip
+
+      - id: f
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.before }}"
+          # A new branch, a force-push, or a manual run has no usable base.
+          # Deploy everything rather than guess — a filter that silently matches
+          # nothing is a push that silently never ships.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "no usable base ref — deploying every project"
+            for p in back front; do echo "$p=true" >> "$GITHUB_OUTPUT"; done
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BASE" "${{ github.sha }}")
+          echo "$CHANGED" | sed 's/^/  /'
+          for p in back front; do
+            if echo "$CHANGED" | grep -q "^$p/"; then echo "$p=true"; else echo "$p=false"; fi >> "$GITHUB_OUTPUT"
+          done
+
+  # ── Web frontend → Vercel production ───────────────────────────────────────
+  front:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.front == 'true'
+    timeout-minutes: 15
+    concurrency:
+      group: deploy-front
+      cancel-in-progress: false
+    defaults: { run: { working-directory: front } }
+    env:
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      VERCEL_CLI_VERSION: 59.17.0
+    steps:
+      - uses: actions/checkout@v4
+
+      # Gate: cross-project invariants. No base ref is passed, so the git-range
+      # check is skipped, but every shared front/mobile copy is still verified
+      # verbatim. This does not wait for CI, so it repeats what matters.
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Shared files still agree
+        working-directory: .
+        run: python3 scripts/check_shared.py
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: npm, cache-dependency-path: front/package-lock.json }
+      - run: npm ci
+
+      - name: Install Vercel CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global "vercel@${VERCEL_CLI_VERSION}"
+          vercel --version
+
+      # Writes front/.vercel/ (project settings + production env vars) inside
+      # the runner only. Nothing is committed from CI.
+      - name: Pull Vercel project settings
+        shell: bash
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      # Runs `npm run build`, which is `tsc && vite build` — the only type
+      # check this project has. A type error fails this step and nothing ships.
+      - name: Build (type check included)
+        shell: bash
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          vercel build --prod --token="$VERCEL_TOKEN"
+
+      # Uploads exactly what the previous step built. The CLI prints progress
+      # on stderr (left in the log) and the deployment URL on stdout.
+      - name: Deploy to production
+        shell: bash
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          URL=$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN")
+          echo "deployed: $URL"
+          {
+            echo "### Frontend deployed to Vercel production"
+            echo ""
+            echo "- Deployment: $URL"
+            echo "- Commit: \`$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── API → Cloud Run ────────────────────────────────────────────────────────
+  back:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.back == 'true'
+    timeout-minutes: 20
+    concurrency:
+      group: deploy-back
+      cancel-in-progress: false
+    # id-token: write is what makes ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN exist,
+    # which the keyless auth below exchanges for Google credentials.
+    permissions:
+      contents: read
+      id-token: write
+    defaults: { run: { working-directory: back } }
+    env:
+      SERVICE: vibe-coding-tracker-api
+      REGION: asia-southeast1
+      # Identifiers, not credentials: auth is keyless (Workload Identity
+      # Federation), so there is no service-account key anywhere in GitHub.
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Gate: the app builds and imports ───────────────────────────────────
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install -r requirements.txt
+      - name: Byte-compile
+        run: python -m compileall -q .
+      - name: Import the app
+        # Catches the failure a syntax check cannot: a bad import, a router
+        # that raises at module scope, a Pydantic model that will not build.
+        run: python -c "import main; print('FastAPI app imports cleanly')"
+        env:
+          GOOGLE_CLOUD_PROJECT: ci
+          SECRET_KEY: ci-not-a-real-key
+          GOOGLE_CLIENT_ID: ci
+          GCS_BUCKET_NAME: ci
+          CORS_ORIGINS: http://localhost
+
+      # ── Configured? ────────────────────────────────────────────────────────
+      # Until the GCP secrets exist, skip the deploy loudly: a warning on the
+      # run, a line in the summary, and a green job so front is unaffected.
+      # Every later step keys off this output — never a silent skip.
+      - name: GCP deploy secrets present
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$GCP_PROJECT_ID" ] || [ -z "$GCP_WORKLOAD_IDENTITY_PROVIDER" ] || [ -z "$GCP_SERVICE_ACCOUNT" ]; then
+            echo "::warning::Backend deploy skipped — GCP_PROJECT_ID / GCP_WORKLOAD_IDENTITY_PROVIDER / GCP_SERVICE_ACCOUNT not set"
+            echo "### Backend deploy skipped — GCP secrets not set" >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: gcloud available
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$(command -v gcloud || true)" ]; then
+            echo "::error::gcloud is not on this runner image; the backend deploy relies on the preinstalled Google Cloud CLI."
+            exit 1
+          fi
+          gcloud --version
+
+      # ── Auth (keyless) ─────────────────────────────────────────────────────
+      # This is what google-github-actions/auth does, done by hand to keep that
+      # supply chain out of a workflow holding production access. GitHub mints
+      # an OIDC token for this job; the credential config tells gcloud to fetch
+      # it and exchange it with Google STS for a short-lived token impersonating
+      # GCP_SERVICE_ACCOUNT. The config file holds no long-lived secret and
+      # lives in RUNNER_TEMP, which is wiped with the runner.
+      - name: Authenticate to Google Cloud
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud iam workload-identity-pools create-cred-config "$GCP_WORKLOAD_IDENTITY_PROVIDER" \
+            --service-account="$GCP_SERVICE_ACCOUNT" \
+            --output-file="$RUNNER_TEMP/gcp-cred.json" \
+            --credential-source-url="$ACTIONS_ID_TOKEN_REQUEST_URL&audience=//iam.googleapis.com/$GCP_WORKLOAD_IDENTITY_PROVIDER" \
+            --credential-source-headers="Authorization=Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            --credential-source-type=json \
+            --credential-source-field-name=value
+          gcloud auth login --cred-file="$RUNNER_TEMP/gcp-cred.json" --quiet
+          gcloud config set project "$GCP_PROJECT_ID" --quiet
+
+      # ── Build ──────────────────────────────────────────────────────────────
+      # Tagged with the commit SHA rather than :latest, so every Cloud Run
+      # revision names the exact commit it runs and a rollback target is a tag.
+      - name: Build image with Cloud Build
+        if: steps.gate.outputs.ready == 'true'
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="gcr.io/$GCP_PROJECT_ID/$SERVICE:$GITHUB_SHA"
+          gcloud builds submit back --tag "$IMAGE" --quiet
+
+      # ── Ship ───────────────────────────────────────────────────────────────
+      # DELIBERATELY NO --set-env-vars, --memory, --cpu, --allow-unauthenticated
+      # or scaling flags. When they are omitted, Cloud Run carries the previous
+      # revision's environment variables and settings forward, so the app's
+      # secrets (SECRET_KEY, GOOGLE_CLIENT_ID, …) never enter GitHub at all.
+      # Adding any of those flags here would either wipe them or force them
+      # into repository secrets. back/deploy.sh remains the one place runtime
+      # configuration is changed; this job only swaps the image.
+      - name: Deploy to Cloud Run
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run deploy "$SERVICE" \
+            --image "gcr.io/$GCP_PROJECT_ID/$SERVICE:$GITHUB_SHA" \
+            --region "$REGION" \
+            --platform managed \
+            --quiet
+
+      # A revision that deploys but boots broken must fail the run, not pass it.
+      - name: Health check
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format 'value(status.url)')
+          curl -fsS --retry 5 --retry-delay 3 "$URL/health"
+          echo ""
+          {
+            echo "### API deployed to Cloud Run"
+            echo ""
+            echo "- Service: $URL"
+            echo "- Image: \`gcr.io/$GCP_PROJECT_ID/$SERVICE:$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
