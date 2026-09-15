@@ -275,6 +275,17 @@ jobs:
       # ── Build ──────────────────────────────────────────────────────────────
       # Tagged with the commit SHA rather than :latest, so every Cloud Run
       # revision names the exact commit it runs and a rollback target is a tag.
+      #
+      # Build logs are NOT streamed here. `gcloud builds submit` tails them from
+      # Cloud Build's default logs bucket, which only project Viewer/Owner can
+      # read; without it the command exits non-zero even when the build passes.
+      # The deployer deliberately lacks Viewer: this project hosts other Cloud
+      # Run services, and Viewer would let this public repo's workflow read
+      # their configuration, env-var secrets included. `--suppress-logs` is no
+      # fix: it hides the output but still polls the bucket, and still fails.
+      # So: submit --async, poll the build's status (cloudbuild.builds.get,
+      # which builds.editor has), fail unless SUCCESS, and link the console
+      # for the logs.
       - name: Build image with Cloud Build
         if: steps.gate.outputs.ready == 'true'
         working-directory: .
@@ -282,7 +293,35 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE="gcr.io/$GCP_PROJECT_ID/$SERVICE:$GITHUB_SHA"
-          gcloud builds submit back --tag "$IMAGE" --quiet
+          if ! BUILD_ID=$(gcloud builds submit back --tag "$IMAGE" --async --format='value(id)' --quiet) \
+             || [ -z "$BUILD_ID" ]; then
+            echo "::error::Cloud Build submission failed — https://console.cloud.google.com/cloud-build/builds?project=$GCP_PROJECT_ID"
+            exit 1
+          fi
+          LINK="https://console.cloud.google.com/cloud-build/builds;region=global/$BUILD_ID?project=$GCP_PROJECT_ID"
+          echo "build $BUILD_ID submitted — logs: $LINK"
+          ERRORS=0
+          while :; do
+            if ! STATUS=$(gcloud builds describe "$BUILD_ID" --format='value(status)'); then
+              # Tolerate a transient API error; give up after a few in a row.
+              ERRORS=$((ERRORS + 1))
+              if [ "$ERRORS" -ge 5 ]; then
+                echo "::error::Could not read status of build $BUILD_ID — $LINK"
+                exit 1
+              fi
+              sleep 10
+              continue
+            fi
+            ERRORS=0
+            case "$STATUS" in
+              SUCCESS) echo "build $BUILD_ID: SUCCESS"; break ;;
+              STATUS_UNKNOWN|PENDING|QUEUED|WORKING) echo "build $BUILD_ID: $STATUS"; sleep 10 ;;
+              *) # FAILURE, INTERNAL_ERROR, TIMEOUT, CANCELLED, EXPIRED, or anything unrecognised
+                DETAIL=$(gcloud builds describe "$BUILD_ID" --format='value(failureInfo.detail)' || true)
+                echo "::error::Cloud Build $BUILD_ID finished with status $STATUS${DETAIL:+: $DETAIL} — $LINK"
+                exit 1 ;;
+            esac
+          done
 
       # ── Ship ───────────────────────────────────────────────────────────────
       # DELIBERATELY NO --set-env-vars, --memory, --cpu, --allow-unauthenticated
