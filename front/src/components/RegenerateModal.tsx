@@ -4,7 +4,9 @@ import { previewInvoice } from '../api';
 import {
   mergeRegeneratedLines, type InvoiceLineLayout, type LineChange, type LineChangeKind, type MergeResult,
 } from '../lib/regenerate';
-import { inferLayout, rememberLayout, rememberedLayout } from '../lib/invoiceLayout';
+import {
+  inferLayout, rememberLayout, rememberedLayout, setAsideLeftOffLines,
+} from '../lib/invoiceLayout';
 // `todaySgt()` and not `new Date().toISOString()`: the latter is UTC, so
 // between midnight and 08:00 in Singapore it names yesterday — and the whole
 // point of this option is to stamp the day the invoice was actually re-issued.
@@ -41,7 +43,7 @@ const KIND_STYLE: Record<LineChangeKind, string> = {
 const KIND_BLURB: Record<LineChangeKind, string> = {
   added: 'New work found in this period.',
   updated:
-    'Hours, dates, sub-tasks, or a project name moved. Your rate and description are kept.',
+    'Hours, dates, sub-tasks (tracker tasks or time entry notes), or a project name moved. Your rate and description are kept.',
   removed: 'No longer backed by any time entry in this period. Applying drops these lines.',
   unchanged: 'Nothing to do.',
   manual: 'Added by hand, so nothing regenerates them.',
@@ -186,8 +188,17 @@ export default function RegenerateModal({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  // Lines the preview left unticked — chiefly a tracker whose day its time
+  // entries already bill — are set aside before merging, since the merge adds
+  // every unmatched line and has no notion of a tick. A line this invoice
+  // already carries still goes through. See `setAsideLeftOffLines`.
+  const split = useMemo(
+    () => (preview === null ? null : setAsideLeftOffLines(currentLines, preview, layout)),
+    [preview, currentLines, layout],
+  );
+
   const result: MergeResult | null = useMemo(() => {
-    if (preview === null) return null;
+    if (split === null) return null;
     const rounding =
       roundHours && typeof roundingIncrement === 'number' && roundingIncrement > 0
         ? { increment: roundingIncrement, direction }
@@ -196,9 +207,9 @@ export default function RegenerateModal({
     // missing entry as "not loaded, keep the stored name", which is exactly
     // the behaviour the toggle is asking for.
     return mergeRegeneratedLines(
-      currentLines, preview, rounding, refreshNames ? projectNames : null, layout,
+      currentLines, split.lines, rounding, refreshNames ? projectNames : null, layout,
     );
-  }, [preview, currentLines, roundHours, roundingIncrement, direction, refreshNames, projectNames, layout]);
+  }, [split, currentLines, roundHours, roundingIncrement, direction, refreshNames, projectNames, layout]);
 
   // The client is a snapshot on the invoice and the server will not accept a
   // different one, so it is shown rather than offered.
@@ -327,13 +338,14 @@ export default function RegenerateModal({
     [result],
   );
 
-  // What survives an apply, in the terms of the chosen layout. Daily lines are
-  // the one kind of time-entry line whose task list is refreshed, not kept.
+  // What survives an apply. Task lines — per-task and daily alike — take their
+  // sub-task lists from the time entry notes, and keep the stored list when the
+  // entries have no notes.
   const keptNote =
     (layout === 'daily'
-      ? 'Your rates and descriptions are kept. Daily lines take their task lists from the time entry notes, and keep yours when a day has no notes.'
-      : 'Your rates, descriptions and task lists are kept.') +
-    ' Only hours, dates and which lines exist are refreshed. Nothing is saved until you press Save changes on the invoice.';
+      ? 'Your rates and descriptions are kept. Daily lines take their sub-tasks from that day\'s time entry notes, and keep yours when a day has no notes.'
+      : 'Your rates and descriptions are kept. Task lines take their sub-tasks from their time entry notes, and keep yours when the entries have no notes.') +
+    ' Only hours, dates, sub-tasks and which lines exist are refreshed. Nothing is saved until you press Save changes on the invoice.';
 
   return (
     <Modal
@@ -520,6 +532,7 @@ export default function RegenerateModal({
             namesWouldMove={renameGroups.length > 0 || clientRenameWouldApply}
             keptNote={keptNote}
           />
+          <LeftOffPanel lines={split?.leftOff ?? []} />
         </div>
       )}
 
@@ -604,6 +617,45 @@ function RenameRow({ label, before, after, note }: {
         <span className="text-sm text-slate-100 truncate">{after || '—'}</span>
       </div>
       <span className="shrink-0 text-xs text-slate-500">{note}</span>
+    </div>
+  );
+}
+
+// ── Left off ──────────────────────────────────────────────────────────────────
+
+/**
+ * Fresh lines the preview left unticked and this invoice does not carry, so the
+ * merge never saw them.
+ *
+ * Amber and small: nothing is wrong and nothing is blocked. It is here so a
+ * tracker that stopped appearing is explained rather than silently missing —
+ * and so the owner knows the way back in if they disagree.
+ */
+function LeftOffPanel({ lines }: { lines: InvoicePreviewLine[] }) {
+  if (lines.length === 0) return null;
+
+  return (
+    <div className="flex flex-col gap-1.5 rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 py-2.5">
+      <div className="flex items-baseline gap-2">
+        <span className="text-xs font-semibold uppercase tracking-wider text-amber-300/90">
+          Left off — already billed another way
+        </span>
+        <span className="text-xs text-slate-600">{lines.length}</span>
+      </div>
+      <ul className="flex flex-col gap-1">
+        {lines.map((line) => (
+          <li key={line.line_id} className="text-xs leading-snug">
+            <span className="text-slate-300">{line.description || line.task_title || 'Untitled line'}</span>
+            {line.date_from && <span className="text-slate-500"> · {line.date_from}</span>}
+            {line.duplicate_reason && (
+              <span className="block text-slate-500">{line.duplicate_reason}</span>
+            )}
+          </li>
+        ))}
+      </ul>
+      <p className="text-xs text-slate-500 leading-snug">
+        Not added to this invoice. If you do want one billed, add it to the invoice by hand after applying.
+      </p>
     </div>
   );
 }
@@ -732,14 +784,17 @@ function ChangeRow({ change }: { change: LineChange }) {
             Dates change to {change.line.date_from ?? '—'} – {change.line.date_to ?? '—'}
           </p>
         )}
-        {/* Tracker lines and daily lines reach this — the merge leaves a
-            per-task line's bullets alone. Spelled out rather than counted: the whole point of
-            the change is *which* sub-tasks the client will see listed. */}
+        {/* A tracker's task list, or a task line's time entry notes. Spelled
+            out rather than counted: the whole point of the change is *which*
+            sub-tasks the client will see listed. Only a tracker can reach the
+            cleared branch — a task line with no notes keeps its stored list. */}
         {change.subItemsChanged && (
           <p className="text-xs opacity-80 mt-0.5">
             {change.line.sub_items.length > 0
               ? `Sub-tasks change to: ${change.line.sub_items.join(', ')}`
-              : 'Sub-tasks cleared — the tracker no longer lists any.'}
+              : change.isTracker
+                ? 'Sub-tasks cleared — the tracker no longer lists any.'
+                : 'Sub-tasks cleared.'}
           </p>
         )}
       </div>

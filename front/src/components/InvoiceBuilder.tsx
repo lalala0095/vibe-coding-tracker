@@ -3,9 +3,11 @@ import type {
   Client, Project, Invoice, InvoiceLine, InvoiceSettings, CreateInvoicePayload,
   InvoiceLineSource, InvoicePreviewLine,
 } from '../types';
-import { previewInvoice, createInvoice, getSessions } from '../api';
+import { previewInvoice, createInvoice, getSessions, getTrackers } from '../api';
 import { computeMoney, formatHours, formatMoney, type DiscountType } from '../lib/money';
-import { expandToDailyLines, rememberLayout, rememberedLayout } from '../lib/invoiceLayout';
+import {
+  attachNotesToTaskLines, expandToDailyLines, markTrackersCoveredByEntries, rememberLayout, rememberedLayout,
+} from '../lib/invoiceLayout';
 import type { InvoiceLineLayout } from '../lib/regenerate';
 import InvoiceLineTable from './InvoiceLineTable';
 import Modal, { MODAL_CANCEL_BUTTON, MODAL_PRIMARY_BUTTON, ButtonSpinner } from './Modal';
@@ -265,29 +267,54 @@ export function LineLayoutField({
         onChange={(e) => onChange(e.target.value as InvoiceLineLayout)}
         className={FIELD}
       >
-        <option value="task">One line per task · hours summed across the period</option>
+        <option value="task">One line per task · hours summed, time entry notes as sub-tasks</option>
         <option value="daily">One line per day · time entry notes as sub-tasks</option>
       </select>
     </div>
   );
 }
 
-// Re-cut a preview's time-entry lines to the chosen layout. 'task' is the
-// preview exactly as the server built it. 'daily' needs each entry's date and
-// notes, which preview lines do not carry, so it reads the period's entries in
-// one request — the same client and start-date window the preview filtered on.
+// Re-cut a preview's time-entry lines to the chosen layout, then untick the
+// trackers those lines already bill. See lib/invoiceLayout.ts for both.
+//
+// Preview lines carry neither an entry's date nor its notes, and both layouts
+// now need them — 'task' for the bullets, 'daily' for the cut as well — so the
+// period's entries are read in one request, the same client and start-date
+// window the preview filtered on.
+//
+// Trackers are read only when there is something to pair: at least one tracker
+// line and at least one entry-billed line. The endpoint has no period filter,
+// so it is one read of the list, narrowed here to the trackers on the preview.
+// If that read fails the lines are returned unmarked rather than failing the
+// load — the server's own duplicate check still stands, and the owner can
+// untick a tracker by hand.
 export async function applyLineLayout(
   lines: InvoicePreviewLine[],
   layout: InvoiceLineLayout,
   source: { client_id: string; period_start: string; period_end: string; for_invoice_id?: string },
 ): Promise<InvoicePreviewLine[]> {
-  if (layout !== 'daily' || !lines.some((l) => (l.session_ids ?? []).length > 0)) return lines;
+  if (!lines.some((l) => (l.session_ids ?? []).length > 0)) return lines;
   const sessions = await getSessions({
     client_id: source.client_id,
     date_from: source.period_start,
     date_to: source.period_end,
   });
-  return expandToDailyLines(lines, new Map(sessions.map((s) => [s.id, s])), source.for_invoice_id);
+  const sessionsById = new Map(sessions.map((s) => [s.id, s]));
+  const laidOut = layout === 'daily'
+    ? expandToDailyLines(lines, sessionsById, source.for_invoice_id)
+    : attachNotesToTaskLines(lines, sessionsById);
+
+  const trackerIds = new Set(laidOut.flatMap((l) => (l.tracker_id ? [l.tracker_id] : [])));
+  if (trackerIds.size === 0) return laidOut;
+  let trackers;
+  try {
+    trackers = await getTrackers();
+  } catch {
+    return laidOut;
+  }
+  const trackersById = new Map(trackers.filter((t) => trackerIds.has(t.id)).map((t) => [t.id, t]));
+  // After the layout, so a daily line counts as the entry-billed line it is.
+  return markTrackersCoveredByEntries(laidOut, sessionsById, trackersById);
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -405,7 +432,12 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
       setRunningCount(preview.running_entry_count ?? 0);
       setClaimedCount(preview.claimed_entry_count ?? 0);
       setTrackerLineCount(preview.tracker_line_count ?? 0);
-      setDuplicateTrackerCount(preview.duplicate_tracker_count ?? 0);
+      // Counted off the final lines, not the server's `duplicate_tracker_count`:
+      // `applyLineLayout` can untick trackers the server never flagged (their
+      // entries carry no `tracker_id`), and those need explaining just the same.
+      setDuplicateTrackerCount(
+        previewLines.filter((l) => l.tracker_id && l.include_by_default === false).length
+      );
       // Distinct invoice numbers across every claimed line, first-seen order.
       setClaimedInvoices([
         ...new Set(previewLines.flatMap((l) => l.claimed_by ?? [])),
@@ -651,9 +683,9 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
         </div>
       )}
 
-      {/* Tracker lines whose hours are already on the invoice as task
-          lines. They arrive unticked, but stay tickable — warn, never
-          block (§ no locking). */}
+      {/* Tracker lines left unticked: their day is already billed by time
+          entry lines, or they are still running. Each line states its own
+          reason. They stay tickable — warn, never block (§ no locking). */}
       {duplicateTrackerCount > 0 && (
         <div className="flex items-start gap-2.5 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2.5">
           <svg className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -661,9 +693,9 @@ export default function InvoiceBuilder({ clients, projects, settings, onCreated,
           </svg>
           <p className="text-xs text-amber-300 leading-relaxed">
             {duplicateTrackerCount} tracker {duplicateTrackerCount === 1 ? 'line' : 'lines'} arrived
-            unticked because {duplicateTrackerCount === 1 ? 'its' : 'their'} time entries are
-            already listed as {duplicateTrackerCount === 1 ? 'a line of its own' : 'lines of their own'}.
-            Ticking {duplicateTrackerCount === 1 ? 'it' : 'one'} would bill the same hours twice.
+            unticked, mostly because the same work is already listed as time entry lines,
+            with their notes. Each line says why.
+            Ticking {duplicateTrackerCount === 1 ? 'it' : 'one'} can bill the same day twice.
           </p>
         </div>
       )}

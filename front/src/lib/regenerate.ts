@@ -7,11 +7,13 @@
 // field into one camp or the other and merges field by field:
 //
 //   refreshed  hours, session_ids, date_from, date_to,
-//              sub_items (tracker lines, daily lines),  — facts about the work
+//              sub_items (tracker lines; task lines        — facts about the work
+//                         when the fresh list has items),
 //              project_name (only when `projectNames` is supplied)
 //   preserved  rate, description, task_title,
 //              line_id,
-//              sub_items (task lines)                   — authored content
+//              sub_items (task lines when the fresh        — authored content
+//                         list is empty)
 //
 // `sub_items` sits in both camps, and the split is not arbitrary — it follows
 // who actually knows the answer:
@@ -20,30 +22,33 @@
 //                 task list on every preview (`invoices.py:1296`). That makes
 //                 it derived data, and keeping the stored copy is what made a
 //                 task added to a tracker never appear on a regenerate.
-//   task line     The preview never populates `sub_items` for these at all —
+//   task line     The preview itself never populates `sub_items` for these —
 //                 the `(task_id, project_id)` grouping reads time entries and
-//                 never opens the task document, so `match.sub_items` is
-//                 always `[]`. Taking the fresh value here would replace a
-//                 hand-written bullet list with nothing.
+//                 never opens their notes, so the server always sends `[]`.
+//                 The web frontend fills them in before merging: the owner
+//                 bills Task → time entries → notes, so each entry's note
+//                 lines become the task line's bullets
+//                 (`front/src/lib/invoiceLayout.ts`). The mobile app does not,
+//                 so there the fresh list is always `[]`.
 //
-// So a tracker line's bullets refresh and a task line's are left alone.
+// So a tracker line's bullets always refresh, and a task line's refresh only
+// when the fresh list has items. Empty keeps the stored bullets: a list typed
+// onto the invoice by hand is never wiped by entries that simply have no notes
+// — and on mobile, where fresh task bullets are always empty, stored bullets
+// are kept exactly as they were before notes were attached anywhere.
 //
 // ── The daily layout ─────────────────────────────────────────────────────────
 //
-// Task lines DO carry bullets when the owner picks the daily layout
-// (`front/src/lib/invoiceLayout.ts`): the preview's per-task lines are re-cut
-// one per day, and each day's time entry notes become its `sub_items`. Two
-// things change with it, and only when `layout` is 'daily':
+// The owner can also pick the daily layout (`front/src/lib/invoiceLayout.ts`):
+// the preview's per-task lines are re-cut one per day, each carrying that day's
+// time entry notes as its `sub_items`. The bullets follow the same rule as a
+// per-task line's; only the key changes, and only when `layout` is 'daily':
 //
 //   key        A single-day task line is keyed by (task, project, DATE), so
 //              each day pairs with the same day. A multi-day line keeps the
 //              task key and matches nothing — switching an invoice from
 //              per-task to daily reports the old line removed and the days
 //              added, which is exactly the restructure being asked for.
-//   sub_items  A daily line's bullets refresh from the notes, like a
-//              tracker's — but only when the notes produce some. Empty notes
-//              keep the stored bullets, so a list typed onto the invoice by
-//              hand is never wiped by entries that simply have no notes.
 //
 // Editing a daily line's date by hand re-keys it, so the next regenerate reads
 // it as removed and its day as added. Visible in the summary, never silent.
@@ -110,7 +115,11 @@ export interface LineChange {
   hoursBefore: number | null; // null for 'added'
   hoursAfter: number | null;  // null for 'removed'
   datesChanged: boolean;
-  /** The bullet list under the description moved. Tracker and daily lines only. */
+  /**
+   * The bullet list under the description moved: a tracker's task list, or a
+   * task line's time entry notes. Never set when the fresh list is empty on a
+   * task line — those keep their stored bullets.
+   */
   subItemsChanged: boolean;
   /**
    * The project was renamed in Clients & Projects since this line was written.
@@ -257,7 +266,7 @@ export function mergeRegeneratedLines(
    * which is exactly what this function did before renames were handled.
    */
   projectNames?: Map<string, string> | null,
-  /** 'daily' pairs and refreshes time-entry lines day by day. See the header. */
+  /** 'daily' pairs time-entry lines day by day. See the header. */
   layout: InvoiceLineLayout = 'task',
 ): MergeResult {
   /**
@@ -371,11 +380,9 @@ export function mergeRegeneratedLines(
     // refreshed or simply preserved.
     const storedSubItems = asArray(stored.sub_items);
     const freshSubItems = asArray(match.sub_items);
-    const subItems = !isBlank(stored.tracker_id)
+    const subItems = !isBlank(stored.tracker_id) || freshSubItems.length > 0
       ? freshSubItems
-      : key.startsWith('day:') && freshSubItems.length > 0
-        ? freshSubItems
-        : storedSubItems;
+      : storedSubItems;
     const subItemsChanged = !sameItems(storedSubItems, subItems);
 
     // Resolved from the STORED line: `match.project_name` is the same
