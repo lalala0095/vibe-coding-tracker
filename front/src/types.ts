@@ -255,6 +255,17 @@ export interface InvoiceLine {
   // re-read from the tasks afterwards, so a renamed task cannot rewrite a
   // past invoice.
   sub_items: string[];
+  // "Regenerate leaves this row as it is." A locked line keeps its hours,
+  // dates, session_ids and bullets verbatim through a regenerate and is never
+  // removed by one (`lib/regenerate.ts`). Set by hand with the row's lock
+  // button, or automatically when hours, dates or bullets are edited on a line
+  // regenerate could otherwise overwrite (`lib/lineLock.ts`).
+  //
+  // NOT an editing lock: every field on a locked row stays editable (CLAUDE.md
+  // § no locking). The server stores it verbatim and defaults it to false for
+  // preview lines and for invoices written before it existed — an older
+  // server may still omit it, so read it as `line.locked === true`.
+  locked: boolean;
 }
 
 // ── Payments ──────────────────────────────────────────────────────────────────

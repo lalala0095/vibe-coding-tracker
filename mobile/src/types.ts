@@ -265,6 +265,8 @@ export interface InvoiceLine {
   // re-read from the tasks afterwards, so a renamed task cannot rewrite a
   // past invoice.
   sub_items: string[];
+  // Web-only for now: "Regenerate leaves this row as it is" (see front/src/types.ts); optional because mobile never sets it.
+  locked?: boolean;
 }
 
 // ── Payments ──────────────────────────────────────────────────────────────────

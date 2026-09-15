@@ -49,6 +49,17 @@ const KIND_BLURB: Record<LineChangeKind, string> = {
   manual: 'Added by hand, so nothing regenerates them.',
 };
 
+// Locked rows are not a kind of their own — the merge reports them as
+// 'unchanged' (or 'manual') with `locked: true`, so the kind maps above, which
+// mobile shares the shape of, stay exhaustive. They get their own group here,
+// rendered just before Unchanged, and are left out of Unchanged and Manual so
+// no row is listed twice.
+const LOCKED_LABEL = 'Locked rows (kept as they are)';
+const LOCKED_BLURB =
+  'You edited these, so Regenerate leaves their hours, dates and task lists alone. ' +
+  'Unlock a row in the editor to let Regenerate refresh it.';
+const LOCKED_STYLE = 'border-violet-500/30 bg-violet-500/5 text-violet-200';
+
 function hoursText(value: number | null): string {
   return value === null ? '—' : `${value.toFixed(2)}h`;
 }
@@ -165,6 +176,12 @@ export default function RegenerateModal({
   // what they will match against their own records.
   const [refreshNames, setRefreshNames] = useState(true);
 
+  // Keep locked rows (the default) or a fresh reset that refreshes and unlocks
+  // them. Held beside the preview rather than sent back to Load, so flipping it
+  // re-merges in place like the rounding toggle. See `lib/regenerate.ts`,
+  // "Two modes".
+  const [keepLocked, setKeepLocked] = useState(true);
+
   // id → the name as it stands in Clients & Projects right now. This is the
   // only copy in the system a rename actually updates; the names on lines,
   // tasks and time entries are denormalised and stay stale. See the header of
@@ -207,9 +224,9 @@ export default function RegenerateModal({
     // missing entry as "not loaded, keep the stored name", which is exactly
     // the behaviour the toggle is asking for.
     return mergeRegeneratedLines(
-      currentLines, split.lines, rounding, refreshNames ? projectNames : null, layout,
+      currentLines, split.lines, rounding, refreshNames ? projectNames : null, layout, keepLocked,
     );
-  }, [split, currentLines, roundHours, roundingIncrement, direction, refreshNames, projectNames, layout]);
+  }, [split, currentLines, roundHours, roundingIncrement, direction, refreshNames, projectNames, layout, keepLocked]);
 
   // The client is a snapshot on the invoice and the server will not accept a
   // different one, so it is shown rather than offered.
@@ -341,11 +358,60 @@ export default function RegenerateModal({
   // What survives an apply. Task lines — per-task and daily alike — take their
   // sub-task lists from the time entry notes, and keep the stored list when the
   // entries have no notes.
+  // Counted off the working lines, so a row locked by an unsaved edit counts.
+  const lockedCount = currentLines.filter((line) => line.locked === true).length;
+
   const keptNote =
     (layout === 'daily'
       ? 'Your rates and descriptions are kept. Daily lines take their sub-tasks from that day\'s time entry notes, and keep yours when a day has no notes.'
       : 'Your rates and descriptions are kept. Task lines take their sub-tasks from their time entry notes, and keep yours when the entries have no notes.') +
+    (keepLocked
+      ? ' Locked rows are kept exactly as they are — hours, dates and sub-tasks included.'
+      : ' Fresh reset: locked rows are refreshed like every other row and unlocked; their rates and descriptions are still kept.') +
     ' Only hours, dates, sub-tasks and which lines exist are refreshed. Nothing is saved until you press Save changes on the invoice.';
+
+  // Rendered in both steps, like the rounding toggle: flipping it re-merges the
+  // summary in place. Radios, not a checkbox, because both choices deserve to
+  // be spelled out. Nothing is disabled — with no locked rows the two simply
+  // agree, and the note says so.
+  const lockModeControl = (
+    <fieldset className="flex flex-col gap-1.5">
+      <legend className={LABEL}>Locked rows</legend>
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input
+          type="radio"
+          name="regenerate-lock-mode"
+          checked={keepLocked}
+          onChange={() => setKeepLocked(true)}
+          className={CHECKBOX}
+        />
+        <span className="text-xs text-slate-400">Keep locked rows as they are</span>
+      </label>
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input
+          type="radio"
+          name="regenerate-lock-mode"
+          checked={!keepLocked}
+          onChange={() => setKeepLocked(false)}
+          className={CHECKBOX}
+        />
+        <span className="text-xs text-slate-400">
+          Fresh reset
+          <span className="text-slate-500"> — refresh every row, including locked ones, and unlock them</span>
+        </span>
+      </label>
+      {!keepLocked && lockedCount > 0 && (
+        <p className="text-xs text-amber-300 bg-amber-400/10 border border-amber-400/20 rounded-lg px-3 py-2 leading-relaxed">
+          {lockedCount} locked row{lockedCount !== 1 ? 's' : ''} will be refreshed from your time entries and
+          unlocked — the hours, dates and task lists you edited on {lockedCount !== 1 ? 'them' : 'it'} will be
+          replaced. Rates and descriptions are kept.
+        </p>
+      )}
+      {lockedCount === 0 && (
+        <p className="text-xs text-slate-500">No rows are locked, so both options give the same result.</p>
+      )}
+    </fieldset>
+  );
 
   return (
     <Modal
@@ -508,6 +574,14 @@ export default function RegenerateModal({
           </div>
 
           <p className="text-xs text-slate-500 leading-relaxed">{keptNote}</p>
+          {/* Locking is only explained here, not offered: the toggle lives on
+              each row in the editor, which is where the edits it protects are
+              made. */}
+          <p className="text-xs text-slate-500 leading-relaxed">
+            Editing a row's hours, dates or sub-tasks locks it, so Regenerate leaves that row as it is;
+            the lock button on each row in the editor switches it on or off. Locked rows stay fully editable.
+          </p>
+          {lockModeControl}
         </div>
       ) : (
         /* ── Step 2: what applying would do ── */
@@ -518,6 +592,9 @@ export default function RegenerateModal({
             {roundingToggle}
             {issueDateToggle}
             {namesToggle}
+          </div>
+          <div className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2">
+            {lockModeControl}
           </div>
           {/* Above the line-by-line list, not inside it: a rename rewrites text
               on a document the client may already hold, so it is stated once,
@@ -670,13 +747,38 @@ function ChangeSummary({ result, issueDate, namesWouldMove, keptNote }: {
   namesWouldMove: boolean;
 }) {
   const delta = result.hoursAfter - result.hoursBefore;
+  const lockedChanges = result.changes.filter((c) => c.locked);
+
+  const lockedGroup = lockedChanges.length > 0 && (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-baseline gap-2">
+        <span className="text-xs font-semibold uppercase tracking-wider text-violet-300/90">
+          {LOCKED_LABEL}
+        </span>
+        <span className="text-xs text-slate-600">{lockedChanges.length}</span>
+      </div>
+      <p className="text-xs text-slate-600 leading-snug">{LOCKED_BLURB}</p>
+      <div className="flex flex-col gap-1">
+        {lockedChanges.map((change) => (
+          <ChangeRow key={change.line.line_id} change={change} />
+        ))}
+      </div>
+    </div>
+  );
 
   if (!result.hasChanges) {
     return (
       <div className="flex flex-col gap-2">
+        {/* With locked rows the lines are not literally what the time entries
+            produce — the locked ones were kept instead — so the wording says
+            that rather than claiming a perfect match. */}
         <p className="text-sm text-slate-300">
-          The current time entries produce exactly the lines this invoice already has
-          {namesWouldMove || issueDate ? '. No line changes hours or dates.' : ' — it is already up to date.'}
+          {lockedChanges.length > 0
+            ? 'Nothing to refresh: the unlocked lines already match the current time entries, and locked rows are kept as they are'
+            : 'The current time entries produce exactly the lines this invoice already has'}
+          {namesWouldMove || issueDate
+            ? '. No line changes hours or dates.'
+            : lockedChanges.length > 0 ? '.' : ' — it is already up to date.'}
         </p>
         {/* The rename sits above this panel; without a word here the reader is
             told "nothing changed" directly under a box that says otherwise. */}
@@ -696,6 +798,7 @@ function ChangeSummary({ result, issueDate, namesWouldMove, keptNote }: {
           {hoursText(result.hoursBefore)} across {result.lines.length} line
           {result.lines.length !== 1 ? 's' : ''}.
         </p>
+        {lockedGroup}
       </div>
     );
   }
@@ -736,10 +839,15 @@ function ChangeSummary({ result, issueDate, namesWouldMove, keptNote }: {
       )}
 
       {KIND_ORDER.map((kind) => {
-        const group = result.changes.filter((c) => c.kind === kind);
-        if (group.length === 0) return null;
+        // Locked rows are only ever 'unchanged' or 'manual', and are listed in
+        // their own group instead.
+        const group = result.changes.filter((c) => c.kind === kind && !c.locked);
+        const locked = kind === 'unchanged' ? lockedGroup : null;
+        if (group.length === 0) return locked ? <div key={kind}>{locked}</div> : null;
         return (
-          <div key={kind} className="flex flex-col gap-1.5">
+          <div key={kind} className="flex flex-col gap-4">
+          {locked}
+          <div className="flex flex-col gap-1.5">
             <div className="flex items-baseline gap-2">
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
                 {KIND_LABEL[kind]}
@@ -753,6 +861,7 @@ function ChangeSummary({ result, issueDate, namesWouldMove, keptNote }: {
               ))}
             </div>
           </div>
+          </div>
         );
       })}
     </div>
@@ -761,7 +870,9 @@ function ChangeSummary({ result, issueDate, namesWouldMove, keptNote }: {
 
 function ChangeRow({ change }: { change: LineChange }) {
   return (
-    <div className={`flex items-start justify-between gap-3 rounded-lg border px-3 py-2 ${KIND_STYLE[change.kind]}`}>
+    <div className={`flex items-start justify-between gap-3 rounded-lg border px-3 py-2 ${
+      change.locked ? LOCKED_STYLE : KIND_STYLE[change.kind]
+    }`}>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5 min-w-0">
           <span className="text-sm truncate">{change.title || 'Untitled line'}</span>
@@ -778,7 +889,32 @@ function ChangeRow({ change }: { change: LineChange }) {
               renamed
             </span>
           )}
+          {change.locked && (
+            <span
+              className="shrink-0 text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-violet-500/40 bg-violet-500/10 text-violet-300"
+              title="Regenerate leaves this row as it is"
+            >
+              locked
+            </span>
+          )}
+          {/* Fresh reset only. A removed row was protected and is going; any
+              other row is refreshed and loses its lock. */}
+          {change.wasLocked && (
+            <span
+              className="shrink-0 text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-amber-400/40 bg-amber-400/10 text-amber-300"
+              title="This row was locked; the fresh reset refreshes it and clears the lock"
+            >
+              {change.kind === 'removed' ? 'was locked' : 'unlocked'}
+            </span>
+          )}
         </div>
+        {/* Kept rather than removed — say why, so a row with nothing behind it
+            is a visible decision and not a missed removal. */}
+        {change.sourceMissing && (
+          <p className="text-xs opacity-80 mt-0.5">
+            Its time entries are no longer in this period — kept because it is locked.
+          </p>
+        )}
         {change.datesChanged && (
           <p className="text-xs opacity-80 mt-0.5">
             Dates change to {change.line.date_from ?? '—'} – {change.line.date_to ?? '—'}

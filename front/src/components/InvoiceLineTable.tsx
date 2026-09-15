@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { InvoiceLine, HoursRoundingDirection } from '../types';
 import { computeMoney, formatHours, formatMoney, type DiscountType } from '../lib/money';
 import { moveLine, moveSubItem, moveSubItemToLine, moveItem } from '../lib/reorder';
+import { isLineLocked, lockLines, withAutoLock } from '../lib/lineLock';
 import RoundHoursModal from './RoundHoursModal';
 
 interface Props {
@@ -93,6 +94,7 @@ function newLine(): InvoiceLine {
     session_ids: [],        // …and no time-entry provenance
     tracker_id: null,       // …and no tracker behind it
     sub_items: [],          // but it may still be given a task list by hand
+    locked: false,          // nothing regenerates a manual line; the toggle still works
   };
 }
 
@@ -128,8 +130,19 @@ export default function InvoiceLineTable({
   const money = computeMoney(billed, discountType, discountValue, taxPercent);
   const overDiscounted = money.discount_amount > money.subtotal;
 
+  // Every per-row edit goes through `withAutoLock`: editing hours, a date or the
+  // bullets of a line Regenerate could overwrite locks it in the same update,
+  // so the next Regenerate leaves the edit alone. Rate and description pass
+  // through unlocked — Regenerate keeps those anyway. See `lib/lineLock.ts`.
   const patch = (lineId: string, changes: Partial<InvoiceLine>) => {
-    onChange(lines.map((l) => (l.line_id === lineId ? { ...l, ...changes } : l)));
+    onChange(lines.map((l) => (l.line_id === lineId ? withAutoLock(l, changes) : l)));
+  };
+
+  // The row's lock button. An explicit `locked` always wins over the auto rule.
+  // Locking only tells Regenerate to leave the row as it is; nothing on the row
+  // becomes read-only (CLAUDE.md § no locking).
+  const toggleLock = (lineId: string, locked: boolean) => {
+    patch(lineId, { locked: !locked });
   };
 
   // Sub-items are read off the source lines, not off `rows`, and always through
@@ -190,6 +203,15 @@ export default function InvoiceLineTable({
     if (next !== lines) onChange(next);
   };
 
+  // A bullet move edits the bullets of every line it touches — the one it left
+  // and the one it joined — so both lock, exactly as typing in them would.
+  // Only when the move actually happened: `lib/reorder` returns `lines` by
+  // identity for a no-op, and a drop that changed nothing must not lock.
+  // Whole-line moves go through `commit` directly and never lock.
+  const commitSubMove = (next: InvoiceLine[], lineIds: string[]) => {
+    if (next !== lines) onChange(lockLines(next, lineIds));
+  };
+
   // dragover fires continuously; without this the table re-renders on every
   // mouse tick while a drag is in the air.
   const aimAt = (target: DropTarget) => {
@@ -219,7 +241,10 @@ export default function InvoiceLineTable({
     if (dragging.kind === 'line') {
       commit(moveLine(lines, dragging.lineId, lineId));
     } else {
-      commit(moveSubItemToLine(lines, { lineId: dragging.lineId, index: dragging.index }, lineId));
+      commitSubMove(
+        moveSubItemToLine(lines, { lineId: dragging.lineId, index: dragging.index }, lineId),
+        [dragging.lineId, lineId],
+      );
     }
   };
 
@@ -230,7 +255,10 @@ export default function InvoiceLineTable({
     if (dragging.kind === 'line') {
       commit(moveLine(lines, dragging.lineId, lineId));
     } else {
-      commit(moveSubItem(lines, { lineId: dragging.lineId, index: dragging.index }, { lineId, index }));
+      commitSubMove(
+        moveSubItem(lines, { lineId: dragging.lineId, index: dragging.index }, { lineId, index }),
+        [dragging.lineId, lineId],
+      );
     }
   };
 
@@ -298,7 +326,7 @@ export default function InvoiceLineTable({
     const next = moveSubItem(lines, { lineId, index }, { lineId, index: to });
     if (next === lines) return;
     pendingFocus.current = `sub:${lineId}:${to}`;
-    onChange(next);
+    onChange(lockLines(next, [lineId]));
   };
 
   // Where a dragged line would land relative to a row, so the target row can
@@ -336,6 +364,8 @@ export default function InvoiceLineTable({
                 const excluded = isExcluded(line.line_id);
                 const reason = reasonForLine?.(line.line_id) ?? null;
                 const subItems = line.sub_items ?? [];
+                // Read defensively: an invoice from an older server has no flag.
+                const locked = isLineLocked(line);
 
                 // Keyed by line_id rather than by row index: `rows` is
                 // re-derived on every keystroke, so an index would follow the
@@ -375,7 +405,16 @@ export default function InvoiceLineTable({
                     clearDrag();
                   }}
                 >
-                  <td className="py-2 pt-4">
+                  {/* A locked row carries a violet edge down its left side — a
+                      marker only. It is neither dimmed nor disabled: locked
+                      means "Regenerate leaves this row as it is", and every
+                      input on it stays editable. Inset shadow rather than a
+                      border so toggling it never shifts the column. */}
+                  <td
+                    className={`py-2 pt-4 ${
+                      locked ? 'shadow-[inset_2px_0_0_0_rgba(139,92,246,0.7)]' : ''
+                    }`}
+                  >
                     {/* A real button, so the keyboard can reach it; `draggable`
                         on the handle alone keeps the row's text, date and
                         number inputs selectable (dragging a whole draggable row
@@ -429,6 +468,17 @@ export default function InvoiceLineTable({
 
                     {reason && (
                       <p className="text-xs text-amber-300/90 mt-1 leading-snug">{reason}</p>
+                    )}
+
+                    {/* Says what the lock does, in place, so "Locked" is never
+                        read as "can't edit". */}
+                    {locked && (
+                      <p className="mt-1">
+                        <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border border-violet-500/40 bg-violet-500/10 text-violet-300">
+                          <span className="uppercase tracking-wider">Locked</span>
+                          <span className="text-violet-300/70">· Regenerate leaves this row as it is</span>
+                        </span>
+                      </p>
                     )}
 
                     {/* Task bullets printed under the description.
@@ -569,6 +619,36 @@ export default function InvoiceLineTable({
                     {formatMoney(line.amount, currency)}
                   </td>
                   <td className="py-2 pt-4">
+                    <div className="flex flex-col items-center gap-1">
+                    {/* Lock toggle, stacked above Remove so the column count is
+                        unchanged. Offered on every row — manual and unticked
+                        rows included — and never disabled. */}
+                    <button
+                      type="button"
+                      onClick={() => toggleLock(line.line_id, locked)}
+                      aria-pressed={locked}
+                      aria-label={locked ? 'Unlock row' : 'Lock row'}
+                      title={
+                        locked
+                          ? 'Locked — Regenerate leaves this row as it is. Click to unlock.'
+                          : 'Lock this row so Regenerate leaves it as it is'
+                      }
+                      className={`p-1 rounded transition-colors focus:outline-none focus:ring-1 focus:ring-violet-500 ${
+                        locked ? 'text-violet-400 hover:text-violet-300' : 'text-slate-600 hover:text-violet-400'
+                      }`}
+                    >
+                      {locked ? (
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round"
+                            d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
+                        </svg>
+                      ) : (
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round"
+                            d="M13.5 10.5V6.75a4.5 4.5 0 119 0v3.75M3.75 21.75h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H3.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
+                        </svg>
+                      )}
+                    </button>
                     <button
                       onClick={() => onChange(lines.filter((l) => l.line_id !== line.line_id))}
                       className="p-1 text-slate-600 hover:text-red-400 transition-colors"
@@ -578,6 +658,7 @@ export default function InvoiceLineTable({
                         <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
                       </svg>
                     </button>
+                    </div>
                   </td>
                 </tr>
                 );

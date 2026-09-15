@@ -80,6 +80,58 @@
 // rate stays snapshotted regardless — a rename is a correction to a label, a
 // rate change is a change to what the work is worth.
 //
+// ── Locked lines ─────────────────────────────────────────────────────────────
+//
+// A stored line with `locked === true` is kept VERBATIM: hours, dates,
+// session_ids, sub_items, description, rate, task_title and amount are the
+// stored line's, and rounding is not applied to it.
+//
+// Why: the owner edits a line by hand — trims 8.75h to 7h, deletes two of the
+// bullets the time entry notes produced — and those are exactly the refreshed
+// fields above. Without a lock, the next regenerate put the old hours and the
+// deleted bullets straight back. The web editor sets the flag automatically on
+// such edits (`front/src/lib/lineLock.ts`), and the owner can toggle it.
+//
+//   rename     `project_name` still follows the rename map, as on a manual
+//              line: a rename corrects a label, and the owner opted into it
+//              with the names toggle. It is the only field that can move.
+//   pairing    A keyed locked line still consumes at most one fresh line with
+//              its key, through the same buckets, so the work it bills is not
+//              added back as a second line beside it.
+//   no source  When nothing matches — its entries were deleted or moved out of
+//              the period — it is still kept, never 'removed', and reported
+//              with `sourceMissing` so the owner can see why it stayed.
+//   reporting  No new kind: it is 'unchanged' (or 'manual' when keyless) with
+//              `locked: true`, so existing Record<LineChangeKind, …> maps keep
+//              compiling. It counts toward `hasChanges` only through a rename.
+//
+// Its key is read off the stored line like any other, so under the daily
+// layout a locked line whose date was edited pairs with the day it now names;
+// the day it left comes back as 'added'. Visible in the summary, never silent.
+//
+// ── Two modes: keep locked rows, or a fresh reset ───────────────────────────
+//
+// `keepLocked` (default true) is everything above. The owner can instead ask
+// for a FRESH RESET (`keepLocked: false`): the lock is ignored, so every stored
+// line merges exactly as an unlocked one does — hours, dates, session_ids and
+// bullets refreshed, rounding applied, 'removed' when its work is gone — and
+// every resulting line comes back with `locked: false`. Only the lock is
+// ignored: rates, descriptions, task_title, line_id and manual lines are
+// preserved exactly as for any unlocked line.
+//
+// A cleared lock is a real change even when nothing else moved, because
+// applying writes `locked: false`. Such a line reports `wasLocked: true`, reads
+// 'updated' where it would otherwise be 'unchanged', and forces `hasChanges`.
+// A locked line that is removed by the reset also carries `wasLocked`, so the
+// summary can say a row the owner protected is going. A locked manual line
+// keeps kind 'manual' (nothing refreshes it) and loses only its lock.
+//
+// The default keeps every existing caller — mobile included — unchanged.
+//
+// Locked is a regenerate-only instruction, NEVER an editing lock — every field
+// stays editable (CLAUDE.md § no locking). Mobile never sets it, so on mobile
+// no line is locked and this behaves exactly as it did before.
+//
 // Lines are paired by *source key*, not by position or line_id: a stored line
 // and a fresh line describe the same work when they came from the same tracker,
 // or from the same (task, project) pair. Position is meaningless because the
@@ -129,6 +181,22 @@ export interface LineChange {
   projectNameBefore: string | null;
   projectNameAfter: string | null;
   isTracker: boolean;
+  /**
+   * The stored line is locked, so it was kept verbatim (bar a rename). Its
+   * kind is still 'unchanged' or 'manual'; see the header, "Locked lines".
+   */
+  locked: boolean;
+  /**
+   * A keyed locked line found no fresh line: its time entries are no longer in
+   * the period. Kept because it is locked. Always false on unlocked lines.
+   */
+  sourceMissing: boolean;
+  /**
+   * Fresh reset only: the stored line was locked and this reset clears the
+   * lock (or, for 'removed', drops a line that was locked). Always false in the
+   * default keep-locked mode. See the header, "Two modes".
+   */
+  wasLocked: boolean;
 }
 
 /** The billing increment a regenerate should snap refreshed hours onto. */
@@ -233,6 +301,8 @@ function toStoredLine(line: InvoicePreviewLine, rounding?: RegenerateRounding | 
     session_ids: asArray(line.session_ids),
     tracker_id: line.tracker_id,
     sub_items: asArray(line.sub_items),
+    // A line new to the invoice has no hand edits to protect.
+    locked: false,
   };
 }
 
@@ -253,7 +323,9 @@ function totalHours(lines: InvoiceLine[]): number {
  * that rounded value. Without it a line the user had already rounded to 9.50
  * would be reported as changed and reverted to the raw 9.47 the preview
  * carries, undoing their work; with it, a second regenerate is a true no-op.
- * Manual lines are never refreshed, so they are never rounded either.
+ * Manual and locked lines are never refreshed, so they are never rounded either
+ * — unless `keepLocked` is false, when a locked line is refreshed and rounded
+ * like any other.
  *
  * Total: empty inputs yield an empty, coherent result with `hasChanges` false.
  */
@@ -268,6 +340,11 @@ export function mergeRegeneratedLines(
   projectNames?: Map<string, string> | null,
   /** 'daily' pairs time-entry lines day by day. See the header. */
   layout: InvoiceLineLayout = 'task',
+  /**
+   * True (the default) keeps locked lines verbatim. False is a fresh reset:
+   * locks are ignored and cleared. See the header, "Two modes".
+   */
+  keepLocked: boolean = true,
 ): MergeResult {
   /**
    * The name a line should carry, and whether that is a change.
@@ -305,6 +382,11 @@ export function mergeRegeneratedLines(
     else freshByKey.set(key, [index]);
   });
 
+  // In a fresh reset every resulting line is unlocked. The same object back
+  // when there is no lock to clear, so an unlocked line is not churned.
+  const unlock = (line: InvoiceLine): InvoiceLine =>
+    keepLocked || line.locked === false ? line : { ...line, locked: false };
+
   const consumed = new Set<number>();
   const lines: InvoiceLine[] = [];
   const changes: LineChange[] = [];
@@ -320,8 +402,9 @@ export function mergeRegeneratedLines(
       // project_id, and a rename is a correction to a label rather than a
       // rewrite of authored content. Its hours and text stay untouched.
       const renamedManual = nameFor(stored);
-      const manualLine: InvoiceLine =
-        renamedManual.after === null ? stored : { ...stored, project_name: renamedManual.name };
+      const manualLine: InvoiceLine = unlock(
+        renamedManual.after === null ? stored : { ...stored, project_name: renamedManual.name },
+      );
       lines.push(manualLine);
       changes.push({
         kind: 'manual',
@@ -334,12 +417,45 @@ export function mergeRegeneratedLines(
         projectNameBefore: renamedManual.before,
         projectNameAfter: renamedManual.after,
         isTracker: false,
+        // A manual line can carry the flag too; nothing regenerates it either
+        // way, but the summary lists it with the other locked rows. A reset
+        // clears it instead, and that is reported.
+        locked: keepLocked && stored.locked === true,
+        sourceMissing: false,
+        wasLocked: !keepLocked && stored.locked === true,
       });
       continue;
     }
 
     const bucket = freshByKey.get(key);
     const matchIndex = bucket?.shift();
+
+    // Locked: the owner's hand edits win over the time entries. Kept verbatim
+    // but for a rename, and the matching fresh line (if any) is consumed so the
+    // same work is not added back beside it. Never removed. See the header.
+    if (keepLocked && stored.locked === true) {
+      if (matchIndex !== undefined) consumed.add(matchIndex);
+      const renamedLocked = nameFor(stored);
+      const lockedLine: InvoiceLine =
+        renamedLocked.after === null ? stored : { ...stored, project_name: renamedLocked.name };
+      lines.push(lockedLine);
+      changes.push({
+        kind: 'unchanged',
+        title: lineTitle(lockedLine),
+        line: lockedLine,
+        hoursBefore: lockedLine.hours,
+        hoursAfter: lockedLine.hours,
+        datesChanged: false,
+        subItemsChanged: false,
+        projectNameBefore: renamedLocked.before,
+        projectNameAfter: renamedLocked.after,
+        isTracker: !isBlank(lockedLine.tracker_id),
+        locked: true,
+        sourceMissing: matchIndex === undefined,
+        wasLocked: false,
+      });
+      continue;
+    }
 
     if (matchIndex === undefined) {
       // The work this line billed no longer turns up in the period — the entry
@@ -357,6 +473,11 @@ export function mergeRegeneratedLines(
         projectNameBefore: null,
         projectNameAfter: null,
         isTracker: !isBlank(stored.tracker_id),
+        locked: false,
+        sourceMissing: false,
+        // Only reachable for a locked line in a fresh reset. The line reported
+        // is the stored one, lock and all.
+        wasLocked: stored.locked === true,
       });
       continue;
     }
@@ -389,6 +510,9 @@ export function mergeRegeneratedLines(
     // denormalised copy and is stale in exactly the same way. See the header.
     const renamed = nameFor(stored);
 
+    // Reaching here with a lock means a fresh reset is clearing it.
+    const wasLocked = stored.locked === true;
+
     const merged: InvoiceLine = {
       ...stored,
       hours: freshHours,
@@ -397,12 +521,15 @@ export function mergeRegeneratedLines(
       date_to: match.date_to,
       sub_items: subItems,
       project_name: renamed.name,
+      // Left as stored when there is no lock to clear, so an invoice from
+      // before the flag existed does not gain a field it never had.
+      ...(wasLocked ? { locked: false } : {}),
     };
 
     lines.push(merged);
     changes.push({
       kind:
-        hoursChanged || datesChanged || subItemsChanged || renamed.after !== null
+        hoursChanged || datesChanged || subItemsChanged || renamed.after !== null || wasLocked
           ? 'updated'
           : 'unchanged',
       title: lineTitle(merged),
@@ -414,6 +541,9 @@ export function mergeRegeneratedLines(
       projectNameBefore: renamed.before,
       projectNameAfter: renamed.after,
       isTracker: !isBlank(merged.tracker_id),
+      locked: false,
+      sourceMissing: false,
+      wasLocked,
     });
   }
 
@@ -438,6 +568,9 @@ export function mergeRegeneratedLines(
       projectNameBefore: null,
       projectNameAfter: null,
       isTracker: !isBlank(added.tracker_id),
+      locked: false,
+      sourceMissing: false,
+      wasLocked: false,
     });
   });
 
@@ -463,10 +596,15 @@ export function mergeRegeneratedLines(
   // it would tell the reader the line had been rebuilt from time entries when
   // it had not. Without this term an invoice whose ONLY stale name sits on a
   // manual line would report "nothing to apply" and the rename could never be
-  // applied at all.
+  // applied at all. Locked lines are in the same position: they stay
+  // 'unchanged' (or 'manual'), so a rename is the only way they register here.
+  //
+  // `unlocked` is the same shape of term for a fresh reset: clearing a lock on
+  // a manual line leaves its kind 'manual', yet applying writes a real change.
   const renamed = changes.some((change) => change.projectNameAfter !== null);
+  const unlocked = changes.some((change) => change.wasLocked);
   const hasChanges =
-    counts.added > 0 || counts.removed > 0 || counts.updated > 0 || renamed;
+    counts.added > 0 || counts.removed > 0 || counts.updated > 0 || renamed || unlocked;
 
   return {
     lines,
