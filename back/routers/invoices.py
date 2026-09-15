@@ -61,6 +61,14 @@ class InvoiceLineInput(BaseModel):
     # rebuild them, so renaming or deleting it never rewrites a past invoice.
     tracker_id: Optional[str] = None
     sub_items: list[str] = []
+    # The owner has hand-edited this row, so the frontend's Regenerate keeps it
+    # exactly as saved.  NOT an editing lock — every field stays editable here.
+    # Stored and returned verbatim; the server never derives or changes it.
+    #
+    # Optional, and None means "not sent" rather than False: on update the
+    # stored value is kept, so a client that does not know the field (the
+    # mobile app) cannot silently unlock every row by saving.  False on create.
+    locked: Optional[bool] = None
     # ``amount`` is deliberately absent — the server always recomputes it.
 
 
@@ -79,6 +87,7 @@ class InvoiceLineResponse(BaseModel):
     session_ids: list[str]
     tracker_id: Optional[str] = None
     sub_items: list[str] = []
+    locked: bool = False
 
 
 class InvoiceCreate(BaseModel):
@@ -655,7 +664,7 @@ def _line_tracker_ids(lines) -> list:
     return [line.get("tracker_id") for line in lines if line.get("tracker_id")]
 
 
-def _build_lines(line_inputs) -> list:
+def _build_lines(line_inputs, existing_lines=None) -> list:
     """
     Normalise incoming lines into stored line dicts.
 
@@ -665,9 +674,25 @@ def _build_lines(line_inputs) -> list:
     ``tracker_id`` and ``sub_items`` are copied verbatim, never re-derived from
     the tracker: they are snapshots, so a tracker that later gains, loses or
     renames a task does not rewrite an invoice already sent.
+
+    ``locked`` is taken as sent when it is a bool, so an explicit false still
+    unlocks.  When it is omitted, the stored line with the same ``line_id`` in
+    ``existing_lines`` supplies it, and a line with no stored match is
+    unlocked.  Create passes no existing lines, so an omitted flag is False.
     """
+    stored_by_id = {
+        stored.get("line_id"): stored
+        for stored in (existing_lines or [])
+        if isinstance(stored, dict) and stored.get("line_id")
+    }
     lines = []
     for line in line_inputs:
+        if line.locked is not None:
+            locked = bool(line.locked)
+        elif line.line_id and line.line_id in stored_by_id:
+            locked = bool(_value_or(stored_by_id[line.line_id], "locked", False))
+        else:
+            locked = False
         lines.append(
             {
                 "line_id": line.line_id or str(uuid.uuid4()),
@@ -683,6 +708,7 @@ def _build_lines(line_inputs) -> list:
                 "session_ids": list(line.session_ids or []),
                 "tracker_id": line.tracker_id,
                 "sub_items": [str(item) for item in (line.sub_items or [])],
+                "locked": locked,
             }
         )
     return lines
@@ -728,6 +754,9 @@ def _doc_to_line(data: dict) -> InvoiceLineResponse:
         session_ids=_value_or(data, "session_ids", []),
         tracker_id=data.get("tracker_id"),
         sub_items=_value_or(data, "sub_items", []),
+        # A line stored before ``locked`` existed reads as unlocked, and a preview
+        # line never carries the key — a freshly built line is never locked.
+        locked=_value_or(data, "locked", False),
     )
 
 
@@ -1576,8 +1605,10 @@ async def update_invoice(
 
     # Money always gets recomputed, using whichever of lines/discount/tax the
     # payload changed and the stored values for the rest.
+    # The stored lines are passed so a line sent without ``locked`` keeps its
+    # stored flag — see ``_build_lines``.
     lines = (
-        _build_lines(payload.lines)
+        _build_lines(payload.lines, existing.get("lines", []) or [])
         if payload.lines is not None
         else existing.get("lines", []) or []
     )

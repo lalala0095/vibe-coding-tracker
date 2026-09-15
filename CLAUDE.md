@@ -13,7 +13,7 @@ Client → Project → Task (self-nesting via parent_task_id)
 Tracker → groups tasks and time entries into a work block
 ```
 
-Not a git repository. There is no test suite and no linter configured.
+A git monorepo (`back/`, `front/`, `mobile/`) with CI (`.github/workflows/ci.yml`) and a deploy workflow (`.github/workflows/deploy.yml`: front → Vercel, back → Cloud Run on pushes to `main`). There is still no test suite and no linter configured.
 
 ## Stack
 
@@ -100,6 +100,7 @@ Design decisions (do not re-litigate):
 - Rate precedence: **client default → project rate → invoice-line override**, resolved once and **snapshotted onto the line**, so changing a rate later never rewrites a past invoice. `bill_to`, `issued_by` and per-line `task_title` are snapshots for the same reason.
 - Editable hours at **both** the time-entry level and the invoice-line level.
 - Status + auto numbering, print/PDF via CSS, tax + discount, notes + payment terms.
+- A line's `locked` flag (default `false`) marks a row the owner has hand-edited. The owner sets it, and the frontend also sets it automatically when hours, dates or bullets are edited by hand. Regenerate keeps a locked line verbatim and never removes it. It is **not** an editing lock: per the no-locking principle it must never make any field read-only — it only tells Regenerate to leave the row alone. The server stores and returns it verbatim and never derives it; an update that omits `locked` on a line keeps its stored value (matched by `line_id`), so older clients (the mobile app) cannot clear locks.
 
 ### Money rules — easy to break, hard to notice
 
