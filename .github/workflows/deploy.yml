@@ -20,6 +20,8 @@
 # Targets:
 #   front → Vercel project vibe-coding-tracker (track.supportrules.com). Not
 #           connected to Git, so this workflow is its only path to production.
+#           The project's Root Directory setting is `front`, so the Vercel CLI
+#           steps run from the repository root, not from front/ (see the job).
 #   back  → Cloud Run service vibe-coding-tracker-api (asia-southeast1).
 name: Deploy
 
@@ -81,6 +83,13 @@ jobs:
           done
 
   # ── Web frontend → Vercel production ───────────────────────────────────────
+  # No job-level working-directory. The npm steps run in front/ (set per
+  # step); the Vercel CLI steps run from the repository root. Why the root:
+  # the Vercel project's Root Directory is `front`, and the CLI applies it on
+  # top of wherever it is run. Run inside front/, it resolves the app at
+  # front/front, finds no node_modules, and fails with `vite: not found`.
+  # The two settings must agree: if Root Directory is ever cleared in the
+  # Vercel dashboard, the Vercel steps below must move back into front/.
   front:
     runs-on: ubuntu-latest
     needs: changes
@@ -89,7 +98,6 @@ jobs:
     concurrency:
       group: deploy-front
       cancel-in-progress: false
-    defaults: { run: { working-directory: front } }
     env:
       VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
       VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
@@ -109,7 +117,21 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '22', cache: npm, cache-dependency-path: front/package-lock.json }
       - run: npm ci
+        working-directory: front
 
+      # Gate: `npm run build` is `tsc && vite build`, the only type check this
+      # project has. Vercel's Vite preset runs plain `vite build`, so without
+      # this step nothing type-checks. A type error fails here and nothing
+      # ships. The front/dist/ it writes is a gate only; the deployed artifact
+      # is what `vercel build` produces below.
+      - name: Type check and build
+        working-directory: front
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build
+
+      # ── Vercel steps: repository root (see the note above the job) ─────────
       - name: Install Vercel CLI
         shell: bash
         run: |
@@ -117,8 +139,9 @@ jobs:
           npm install --global "vercel@${VERCEL_CLI_VERSION}"
           vercel --version
 
-      # Writes front/.vercel/ (project settings + production env vars) inside
-      # the runner only. Nothing is committed from CI.
+      # Writes .vercel/ at the repository root (project settings, including
+      # Root Directory, + production env vars) inside the runner only.
+      # Nothing is committed from CI.
       - name: Pull Vercel project settings
         shell: bash
         env:
@@ -127,9 +150,11 @@ jobs:
           set -euo pipefail
           vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
 
-      # Runs `npm run build`, which is `tsc && vite build` — the only type
-      # check this project has. A type error fails this step and nothing ships.
-      - name: Build (type check included)
+      # Runs the project's framework preset (`vite build`, no type check)
+      # against the Root Directory configured in Vercel (`front`), with the
+      # Production env vars pulled above (VITE_API_URL, VITE_GOOGLE_CLIENT_ID)
+      # baked into the bundle. Writes .vercel/output at the repository root.
+      - name: Build deployment output
         shell: bash
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
