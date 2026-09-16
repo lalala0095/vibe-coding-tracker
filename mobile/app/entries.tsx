@@ -29,6 +29,7 @@ import {
 import { Button, ConfirmSheet, EmptyState, ErrorNote, LoadingBlock, Screen } from '@/components';
 import { formatHoursLabel } from '@/lib/hours';
 import { sgtDayKey } from '@/lib/sgt';
+import { taskHasClient, taskHasProject } from '@/lib/taskProjects';
 import DayGroup from '@/screens/entries/DayGroup';
 import EntryFilters from '@/screens/entries/EntryFilters';
 import EntryForm, { type EntryFormValues } from '@/screens/entries/EntryForm';
@@ -144,8 +145,9 @@ export default function EntriesScreen() {
   // picker matches what is on screen. Editing is never narrowed — the entry's
   // own task must always be reachable.
   const selectableTasks = useMemo(() => {
-    if (projectId) return tasks.filter((task) => task.project_id === projectId);
-    if (clientId) return tasks.filter((task) => task.client_id === clientId);
+    // By membership — a task on several projects is offered under any of them.
+    if (projectId) return tasks.filter((task) => taskHasProject(task, projectId));
+    if (clientId) return tasks.filter((task) => taskHasClient(task, clientId));
     return tasks;
   }, [tasks, clientId, projectId]);
 
@@ -168,6 +170,9 @@ export default function EntriesScreen() {
     if (editing?.mode === 'edit') {
       const payload: UpdateTimeEntryPayload = {
         task_id: values.task_id,
+        // Only when the form offered a choice; otherwise the server keeps the
+        // entry's project (or takes the new task's primary).
+        ...(values.project_id ? { project_id: values.project_id } : {}),
         start_time: values.start_time,
         end_time: values.end_time ?? 'null',
         notes: values.notes ?? 'null',
@@ -180,6 +185,8 @@ export default function EntriesScreen() {
     } else {
       const payload: CreateTimeEntryPayload = {
         task_id: values.task_id,
+        // Omitted → the task's primary project.
+        ...(values.project_id ? { project_id: values.project_id } : {}),
         start_time: values.start_time,
         billable: values.billable,
         ...(values.end_time !== null ? { end_time: values.end_time } : {}),

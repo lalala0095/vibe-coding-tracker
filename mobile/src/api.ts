@@ -258,6 +258,21 @@ export async function deleteProject(id: string): Promise<void> {
 // setting the header by hand overwrites it with a boundary-less value and the
 // server then fails to parse a body that looks perfectly fine on the wire.
 
+/**
+ * A task's projects on a multipart form.
+ *
+ * `project_ids` goes as one JSON-encoded string field (`'["p1","p2"]'`) — the
+ * multipart shape `back/routers/tasks.py` reads. The legacy `project_id` is
+ * sent alongside it, always equal to `project_ids[0]`, so a server that
+ * predates multi-project tasks still files the task under its primary; the
+ * two can never disagree.
+ */
+function appendProjectIds(form: FormData, projectIds: string[]): void {
+  form.append('project_ids', JSON.stringify(projectIds));
+  if (projectIds[0]) form.append('project_id', projectIds[0]);
+}
+
+/** `project_id` matches any task whose `project_ids` contains it. */
 export async function getTasks(params?: {
   project_id?: string;
   parent_task_id?: string;
@@ -277,7 +292,7 @@ export async function createTask(payload: CreateTaskPayload): Promise<Task> {
   const form = new FormData();
   form.append('title', payload.title);
   if (payload.description) form.append('description', payload.description);
-  form.append('project_id', payload.project_id);
+  appendProjectIds(form, payload.project_ids);
   if (payload.parent_task_id) form.append('parent_task_id', payload.parent_task_id);
   form.append('status', payload.status);
   form.append('priority', payload.priority);
@@ -299,7 +314,7 @@ export async function updateTask(id: string, payload: UpdateTaskPayload): Promis
   // optional field, per the convention in MyTrackerFormat.md.
   if (payload.title !== undefined) form.append('title', payload.title);
   if (payload.description !== undefined) form.append('description', payload.description);
-  if (payload.project_id !== undefined) form.append('project_id', payload.project_id);
+  if (payload.project_ids !== undefined) appendProjectIds(form, payload.project_ids);
   if (payload.parent_task_id !== undefined) form.append('parent_task_id', payload.parent_task_id);
   if (payload.status !== undefined) form.append('status', payload.status);
   if (payload.priority !== undefined) form.append('priority', payload.priority);

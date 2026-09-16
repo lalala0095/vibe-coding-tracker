@@ -109,6 +109,7 @@ import {
   invoiceDeletionDetail,
   invoiceDeletionMessage,
 } from '@/screens/invoices/detail/deletion';
+import { groupLines } from '@/screens/invoices/detail/lineGroups';
 import { periodLabel } from '@/screens/invoices/invoiceMeta';
 import PaymentsPanel from '@/screens/invoices/payments/PaymentsPanel';
 import type { HoursRoundingDirection, Invoice, InvoiceStatus, Project } from '@/types';
@@ -524,17 +525,50 @@ export default function InvoiceDetailScreen() {
               No lines. This invoice totals nothing until one is added.
             </Text>
           ) : (
-            draft.lines.map((line) => (
-              <LineCard
-                key={line.key}
-                line={line}
-                onChange={(patch) => patchLine(line.key, patch)}
-                onRemove={() => removeLine(line.key)}
-                amount={amountFor(line)}
-                preview={dirty}
-                currency={currency}
-              />
-            ))
+            // A task billed across several projects arrives as adjacent
+            // (task, project) lines; they render under one task heading. See
+            // `lineGroups.ts` — display only, amounts stay per line.
+            groupLines(draft.lines).map((group) =>
+              group.grouped ? (
+                <View key={group.key} className="gap-2">
+                  <View className="flex-row items-baseline justify-between gap-2 px-1">
+                    <Text
+                      className="min-w-0 flex-1 text-sm font-semibold text-slate-100"
+                      numberOfLines={2}
+                    >
+                      {group.task_title || 'Task'}
+                    </Text>
+                    <Text className="text-xs tabular-nums text-slate-400">
+                      {periodLabel(group.date_from, group.date_to)} · {group.hours.toFixed(2)} h
+                    </Text>
+                  </View>
+                  <View className="gap-2 border-l border-slate-800 pl-3">
+                    {group.lines.map((line) => (
+                      <LineCard
+                        key={line.key}
+                        line={line}
+                        onChange={(patch) => patchLine(line.key, patch)}
+                        onRemove={() => removeLine(line.key)}
+                        amount={amountFor(line)}
+                        preview={dirty}
+                        currency={currency}
+                        subRow
+                      />
+                    ))}
+                  </View>
+                </View>
+              ) : (
+                <LineCard
+                  key={group.key}
+                  line={group.lines[0]}
+                  onChange={(patch) => patchLine(group.lines[0].key, patch)}
+                  onRemove={() => removeLine(group.lines[0].key)}
+                  amount={amountFor(group.lines[0])}
+                  preview={dirty}
+                  currency={currency}
+                />
+              ),
+            )
           )}
 
           <Button label="+ Add a line" onPress={addLine} variant="secondary" testID="add-line" />

@@ -16,6 +16,9 @@ import { parseTaskList } from '../lib/taskPaste';
 import { renderTrackerName } from '../lib/trackerName';
 import { recentWeekStarts } from '../lib/week';
 import { summariseWeeks } from '../lib/weeklySummary';
+import { formatElapsed } from '../lib/datetime';
+import { useNow } from '../lib/useNow';
+import { taskHasProject, taskProjectsLabel } from '../lib/taskProjectRefs';
 import type {
   Tracker, Task, Client, Project, TrackerSettings,
   CreateTrackerPayload, UpdateTrackerPayload,
@@ -546,7 +549,7 @@ function AddTasksModal({ tracker, allTasks, clients, projects, onAdd, onCreateTa
   // Top-level tasks, filtered by selected project
   const topLevelTasks = allTasks.filter(t =>
     !t.parent_task_id &&
-    (selectedProjectId ? t.project_id === selectedProjectId : true)
+    (selectedProjectId ? taskHasProject(t, selectedProjectId) : true)
   );
 
   const clientProjectGroups = clients.map(c => ({
@@ -866,10 +869,16 @@ interface TrackerPanelProps {
   // is how it hears about it. Fire-and-forget: the billing result is already
   // shown here and must not depend on whatever the page does next.
   onBilled: () => void;
+  // The page's task list, when loaded. Only used to name every project of a
+  // multi-project task; the stored TrackerTaskRef carries the primary's names.
+  tasks?: Task[];
 }
 
-function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveTask, onBilled }: TrackerPanelProps) {
+function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveTask, onBilled, tasks }: TrackerPanelProps) {
   const isActive = !tracker.end_time;
+  // A running tracker's total ticks against the clock.
+  const now = useNow(isActive);
+  const elapsed = formatElapsed(tracker.start_time, tracker.end_time, now);
   const navigate = useNavigate();
 
   // One dialog for the whole list — the row being removed is the state, so the
@@ -962,6 +971,7 @@ function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveT
             <p className="text-xs text-slate-400 mt-1">
               {formatDateTime(tracker.start_time)}
               {tracker.end_time ? ` → ${formatDateTime(tracker.end_time)}` : ' → now'}
+              {elapsed && ` · ${elapsed}`}
             </p>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
@@ -1139,7 +1149,12 @@ function TrackerPanel({ tracker, onEdit, onDelete, onStop, onAddTasks, onRemoveT
                 >
                   <div className="flex-1 min-w-0">
                     <p className="text-sm text-slate-200 truncate">{t.task_title}</p>
-                    <p className="text-xs text-slate-500 truncate">{t.client_name} / {t.project_name}</p>
+                    <p className="text-xs text-slate-500 truncate">
+                      {(() => {
+                        const full = tasks?.find(x => x.id === t.task_id);
+                        return full ? taskProjectsLabel(full) : `${t.client_name} / ${t.project_name}`;
+                      })()}
+                    </p>
                   </div>
                   <button
                     onClick={() => navigate('/tasks', { state: { openTaskId: t.task_id } })}
@@ -1396,6 +1411,9 @@ export default function TrackersPage() {
     return true;
   });
 
+  // Ticks the list's running totals while any tracker is still running.
+  const now = useNow(trackers.some(t => !t.end_time));
+
   // ── Tracker actions ──
   //
   // Only billing invalidates the weekly summary, and it does so through
@@ -1608,6 +1626,10 @@ export default function TrackersPage() {
                     {t.end_time
                       ? ` → ${formatDateTime(t.end_time)}`
                       : ' → now'}
+                    {(() => {
+                      const elapsed = formatElapsed(t.start_time, t.end_time, now);
+                      return elapsed ? ` · ${elapsed}` : '';
+                    })()}
                   </p>
                 </div>
               );
@@ -1628,6 +1650,7 @@ export default function TrackersPage() {
             onAddTasks={() => setModal({ kind: 'add_tasks', tracker: selectedTracker })}
             onRemoveTask={handleRemoveTask}
             onBilled={bumpWeekly}
+            tasks={tasks}
           />
         ) : (
           <div className="flex items-center justify-center h-full text-slate-500 text-sm">

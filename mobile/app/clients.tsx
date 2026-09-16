@@ -63,6 +63,7 @@ import {
   LoadingBlock,
   Screen,
 } from '@/components';
+import { taskClientIds, taskProjectIds } from '@/lib/taskProjects';
 import ClientCard from '@/screens/clients/ClientCard';
 import ClientForm, { type ClientFormValues } from '@/screens/clients/ClientForm';
 import { clientDeletionDetail, projectDeletionDetail } from '@/screens/clients/deletion';
@@ -125,8 +126,9 @@ export default function ClientsScreen() {
       const byClient: Record<string, number> = {};
       const byProject: Record<string, number> = {};
       for (const task of tasks) {
-        byClient[task.client_id] = (byClient[task.client_id] ?? 0) + 1;
-        byProject[task.project_id] = (byProject[task.project_id] ?? 0) + 1;
+        // A task counts once under every project and client it links to.
+        for (const id of taskClientIds(task)) byClient[id] = (byClient[id] ?? 0) + 1;
+        for (const id of taskProjectIds(task)) byProject[id] = (byProject[id] ?? 0) + 1;
       }
       setTaskCounts({ byClient, byProject });
     } catch {

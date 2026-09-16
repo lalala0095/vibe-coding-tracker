@@ -9,6 +9,12 @@
 // change."* Where something is worth flagging, the field carries a `warning`
 // and the user decides.
 //
+// ── Sub-rows ─────────────────────────────────────────────────────────────────
+//
+// Under a task heading (`lineGroups.ts`: one task, several projects) the card
+// is a project sub-row: the project name leads instead of the repeated task
+// title. Every field stays exactly as editable.
+//
 // ── Snapshots ────────────────────────────────────────────────────────────────
 //
 // `task_title`, `project_name` and `sub_items` are printed from the line, not
@@ -37,6 +43,8 @@ export interface LineCardProps {
   /** True when `amount` is the unsaved preview rather than the stored value. */
   preview: boolean;
   currency: string;
+  /** Rendered under a task heading, as one project's sub-row. */
+  subRow?: boolean;
 }
 
 export default function LineCard({
@@ -46,8 +54,11 @@ export default function LineCard({
   amount,
   preview,
   currency,
+  subRow = false,
 }: LineCardProps) {
-  const title = line.task_title.trim() || line.description.trim() || 'Manual line';
+  const title = subRow
+    ? line.project_name.trim() || 'No project'
+    : line.task_title.trim() || line.description.trim() || 'Manual line';
 
   // String comparison is exact for `YYYY-MM-DD`, and no `Date` is constructed —
   // so there is no timezone in this check at all.
@@ -69,7 +80,7 @@ export default function LineCard({
             {title}
           </Text>
           <Text className="mt-0.5 text-xs text-slate-500" numberOfLines={1}>
-            {line.project_name ? `${line.project_name} · ` : ''}
+            {!subRow && line.project_name ? `${line.project_name} · ` : ''}
             {provenance}
           </Text>
         </View>

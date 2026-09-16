@@ -13,6 +13,7 @@
 import { Pressable, Text, View } from 'react-native';
 
 import { Card, Chip } from '@/components';
+import { formatSpanTotal } from '@/lib/sgt';
 import type { Tracker, TrackerTaskRef } from '@/types';
 
 import { durationLabel, endsBeforeStart, isRunning, spanLabel, taskCountLabel } from './trackerRows';
@@ -76,6 +77,7 @@ export default function TrackerRow({
   const running = isRunning(tracker);
   const billed = tracker.invoice_numbers.length > 0;
   const backwards = endsBeforeStart(tracker);
+  const spanTotal = formatSpanTotal(tracker.start_time, tracker.end_time, now);
 
   return (
     <Card padded={false} highlight={running}>
@@ -101,8 +103,11 @@ export default function TrackerRow({
             {tracker.title}
           </Text>
 
-          <Text className="text-xs text-slate-500" numberOfLines={1}>
+          {/* The span, then its running total (` · 8h 51m (8.85 h)`), which ticks
+              with `now` while the tracker runs. */}
+          <Text className="text-xs text-slate-500" numberOfLines={2}>
             {spanLabel(tracker)}
+            {spanTotal ? ` · ${spanTotal}` : ''}
           </Text>
 
           <View className="flex-row items-baseline gap-2">

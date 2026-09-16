@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { TimeEntry, CreateTimeEntryPayload, UpdateTimeEntryPayload } from '../types';
+import type { TaskProjectRef, TimeEntry, CreateTimeEntryPayload, UpdateTimeEntryPayload } from '../types';
 import { getSessions, createSession, updateSession, deleteSession } from '../api';
 import TimeEntryForm from './TimeEntryForm';
 import type { TimeEntryFormValues } from './TimeEntryForm';
@@ -7,6 +7,9 @@ import ConfirmDialog from './ConfirmDialog';
 
 interface Props {
   taskId: string;
+  // The task's projects, primary first. With more than one, each entry picks
+  // one of them and the list shows which.
+  taskProjects?: TaskProjectRef[];
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -38,7 +41,8 @@ function round2(n: number): number {
 // Backed by the `sessions` API. This is NOT the "Sessions" section above it —
 // that one is `goals` (AI prompt/output). See InvoicingPlan.md §2.2.
 
-export default function TimeEntryList({ taskId }: Props) {
+export default function TimeEntryList({ taskId, taskProjects }: Props) {
+  const multiProject = (taskProjects?.length ?? 0) > 1;
   const [entries, setEntries] = useState<TimeEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');        // load failure — replaces the list
@@ -82,6 +86,7 @@ export default function TimeEntryList({ taskId }: Props) {
       ...(v.end_time !== null ? { end_time: v.end_time } : {}),
       ...(v.hours !== null ? { hours: v.hours } : {}),
       ...(v.notes !== null ? { notes: v.notes } : {}),
+      ...(v.project_id !== null ? { project_id: v.project_id } : {}),
     };
     const created = await createSession(payload);
     setEntries((prev) => newestFirst([created, ...prev]));
@@ -98,6 +103,8 @@ export default function TimeEntryList({ taskId }: Props) {
       // to the timer; 0 is a real value and must survive as 0.
       hours: v.hours,
       billable: v.billable,
+      // Only when it actually changed — an unchanged entry need not restate it.
+      ...(v.project_id !== null && v.project_id !== entry.project_id ? { project_id: v.project_id } : {}),
     };
     const updated = await updateSession(entry.id, payload);
     setEntries((prev) => newestFirst(prev.map((e) => (e.id === updated.id ? updated : e))));
@@ -138,6 +145,7 @@ export default function TimeEntryList({ taskId }: Props) {
       {showForm && (
         <div className="bg-slate-800 border border-slate-700 rounded-xl p-4 mb-3">
           <TimeEntryForm
+            taskProjects={taskProjects}
             onSubmit={handleCreate}
             onCancel={() => setShowForm(false)}
             submitLabel="Add Time Entry"
@@ -194,6 +202,7 @@ export default function TimeEntryList({ taskId }: Props) {
                   </div>
                   <TimeEntryForm
                     initial={e}
+                    taskProjects={taskProjects}
                     onSubmit={(v) => handleUpdate(e, v)}
                     onCancel={() => setEditingId(null)}
                     submitLabel="Save Changes"
@@ -240,6 +249,11 @@ export default function TimeEntryList({ taskId }: Props) {
                     }`}>
                       {e.billable ? 'Billable' : 'Non-billable'}
                     </span>
+                    {multiProject && e.project_name && (
+                      <span className="text-xs font-medium text-indigo-300 bg-indigo-400/10 px-1.5 py-0.5 rounded-full">
+                        {e.project_name}
+                      </span>
+                    )}
                     {!e.end_time && (
                       <span className="inline-flex items-center gap-1 text-xs font-medium text-green-400 bg-green-400/10 px-1.5 py-0.5 rounded-full">
                         <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />

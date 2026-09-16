@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from auth import get_current_user
 from routers.sessions import SessionResponse, _doc_to_session
-from routers.tasks import _fetch_project
+from routers.tasks import build_project_fields, task_primary_project
 from services.firestore_service import get_firestore_client
 
 router = APIRouter(prefix="/trackers", tags=["trackers"])
@@ -235,12 +235,15 @@ def _fetch_task_ref(db, task_id: str) -> dict:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Task '{task_id}' not found.",
         )
-    data = doc.to_dict()
+    data = doc.to_dict() or {}
+    # A TaskRef has room for one project; it shows the task's primary, the
+    # same project ``bill_tracker`` bills the span under.
+    primary = task_primary_project(data)
     return {
         "task_id": task_id,
         "task_title": data.get("title", ""),
-        "project_name": data.get("project_name", ""),
-        "client_name": data.get("client_name", ""),
+        "project_name": primary["project_name"],
+        "client_name": primary["client_name"],
     }
 
 
@@ -342,7 +345,7 @@ async def create_tracker(
     # leave a half-created task/tracker pair behind.
     new_task_project: Optional[dict] = None
     if payload.new_task is not None:
-        new_task_project = _fetch_project(db, payload.new_task.project_id)
+        new_task_project = build_project_fields(db, [payload.new_task.project_id])
         _validate_task_status(payload.new_task.status)
         _validate_task_priority(payload.new_task.priority)
 
@@ -364,10 +367,7 @@ async def create_tracker(
             {
                 "title": new_task_title,
                 "description": payload.notes or "",
-                "project_id": payload.new_task.project_id,
-                "project_name": new_task_project["project_name"],
-                "client_id": new_task_project["client_id"],
-                "client_name": new_task_project["client_name"],
+                **new_task_project,
                 "parent_task_id": None,
                 "status": payload.new_task.status,
                 "priority": payload.new_task.priority,
@@ -513,7 +513,8 @@ async def bill_tracker(
 
     This is the bridge from a tracker to an invoice.  A tracker on its own is a
     grouping and carries no billable time; only the ``sessions`` collection
-    feeds the invoice preview.  One time entry is created per linked task,
+    feeds the invoice preview.  One time entry is created per linked task
+    (under that task's primary project),
     spanning the tracker's start and end, with the hours written as a manual
     override so they stay editable afterwards.
 
@@ -583,7 +584,9 @@ async def bill_tracker(
     # tracker with a deleted task silently billed less than the total.  Read the
     # tasks fresh rather than trusting the denormalised copy on the tracker: a
     # time entry needs project_id and client_id, which the TaskRef does not
-    # carry.  Do not move the split back above this call.
+    # carry.  Do not move the split back above this call.  A task linked to
+    # several projects bills the span under its PRIMARY project (index 0 of
+    # ``project_ids``) — the same choice the weekly summary prices with.
     resolved = _resolve_tracker_tasks(db, pending)
     if not resolved:
         return []
@@ -593,14 +596,15 @@ async def bill_tracker(
     now = _now_sgt()
     created = []
     for (task_id, task_data), hours in zip(resolved, shares):
+        primary = task_primary_project(task_data)
         _, session_ref = db.collection("sessions").add(
             {
                 "task_id": task_id,
                 "task_title": task_data.get("title", ""),
-                "project_id": task_data.get("project_id", ""),
-                "project_name": task_data.get("project_name", ""),
-                "client_id": task_data.get("client_id", ""),
-                "client_name": task_data.get("client_name", ""),
+                "project_id": primary["project_id"],
+                "project_name": primary["project_name"],
+                "client_id": primary["client_id"],
+                "client_name": primary["client_name"],
                 "tracker_id": tracker_id,
                 "start_time": data.get("start_time", ""),
                 "end_time": data.get("end_time"),

@@ -1,5 +1,6 @@
 import { useState, useRef } from 'react';
 import type { Model, Goal, Task } from '../types';
+import { taskProjectsLabel } from '../lib/taskProjectRefs';
 import ModelSelector from './ModelSelector';
 
 interface Props {
@@ -98,7 +99,7 @@ export default function GoalForm({
             <option value="">None</option>
             {tasks.map((t) => (
               <option key={t.id} value={t.id}>
-                {t.client_name} / {t.project_name} / {t.title}
+                {taskProjectsLabel(t)} / {t.title}
               </option>
             ))}
           </select>

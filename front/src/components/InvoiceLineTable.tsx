@@ -459,10 +459,14 @@ export default function InvoiceLineTable({
                       placeholder={line.task_title || 'Description'}
                       className={CELL_INPUT}
                     />
-                    {line.task_title && line.task_title !== line.description && (
+                    {/* The project is always named: one multi-project task
+                        yields a line per project, identical but for this. */}
+                    {((line.task_title && line.task_title !== line.description) || line.project_name) && (
                       <p className="text-xs text-slate-600 mt-1 truncate">
-                        {line.task_title}
-                        {line.project_name ? ` · ${line.project_name}` : ''}
+                        {[
+                          line.task_title && line.task_title !== line.description ? line.task_title : '',
+                          line.project_name,
+                        ].filter(Boolean).join(' · ')}
                       </p>
                     )}
 

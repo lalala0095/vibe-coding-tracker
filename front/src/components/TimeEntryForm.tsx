@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import type { TimeEntry } from '../types';
+import type { TaskProjectRef, TimeEntry } from '../types';
+import { errorDetail } from '../lib/apiError';
 import DateTimeInput from './DateTimeInput';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -45,16 +46,41 @@ export interface TimeEntryFormValues {
   hours: number | null;     // null = cleared, fall back to the timer. 0 is a real value.
   billable: boolean;
   notes: string | null;     // null = cleared
+  // The task project this entry is assigned to. null = no choice was offered
+  // (the caller did not pass the task's projects) — omit it on the wire and
+  // let the server keep / default it.
+  project_id: string | null;
 }
 
 interface Props {
   initial?: TimeEntry;
+  // The chosen task's projects, primary first. With more than one, the form
+  // shows a project picker defaulting to the entry's current project (or the
+  // primary for a new entry). With one or none, no picker: the server assigns
+  // the task's primary project.
+  taskProjects?: TaskProjectRef[];
   onSubmit: (values: TimeEntryFormValues) => Promise<void>;
   onCancel: () => void;
   submitLabel?: string;
 }
 
-export default function TimeEntryForm({ initial, onSubmit, onCancel, submitLabel = 'Save' }: Props) {
+export default function TimeEntryForm({ initial, taskProjects, onSubmit, onCancel, submitLabel = 'Save' }: Props) {
+  // Options: the task's projects, plus the entry's own project if the task no
+  // longer lists it, so opening such an entry never silently re-assigns it.
+  const projectOptions: { id: string; label: string }[] = (taskProjects ?? []).map((p) => ({
+    id: p.project_id,
+    label: `${p.client_name} / ${p.project_name}`,
+  }));
+  if (initial?.project_id && projectOptions.length > 0 && !projectOptions.some((o) => o.id === initial.project_id)) {
+    projectOptions.push({
+      id: initial.project_id,
+      label: `${initial.client_name} / ${initial.project_name} (not linked to this task)`,
+    });
+  }
+  const showProjectPicker = projectOptions.length > 1;
+  const [projectId, setProjectId] = useState<string>(
+    initial?.project_id ?? taskProjects?.[0]?.project_id ?? ''
+  );
   const [start, setStart] = useState(
     initial ? toLocalInputValue(initial.start_time) : nowLocalInputValue()
   );
@@ -122,10 +148,12 @@ export default function TimeEntryForm({ initial, onSubmit, onCancel, submitLabel
         hours: hoursValue,
         billable,
         notes: notes.trim() ? notes.trim() : null,
+        project_id: showProjectPicker && projectId ? projectId : null,
       });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Something went wrong.';
-      setError(message);
+      // 400 (project not linked to the task) and 409 arrive with a readable
+      // `detail` — show it rather than "Request failed with status code 400".
+      setError(errorDetail(err, 'Something went wrong.'));
     } finally {
       setSubmitting(false);
     }
@@ -139,6 +167,27 @@ export default function TimeEntryForm({ initial, onSubmit, onCancel, submitLabel
           This entry is on invoice {initial.invoice_number}. You can still edit it — the invoice will
           not update by itself.
         </p>
+      )}
+
+      {showProjectPicker && (
+        <div className="flex flex-col gap-1.5">
+          <label className="text-sm font-medium text-slate-300">Project</label>
+          <select
+            value={projectId}
+            onChange={(e) => setProjectId(e.target.value)}
+            className="w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-3 py-2 text-sm
+                       focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent"
+          >
+            {projectOptions.map((o, i) => (
+              <option key={o.id} value={o.id}>
+                {o.label}{i === 0 && taskProjects?.[0]?.project_id === o.id ? ' (primary)' : ''}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-slate-500">
+            This task spans several projects — pick the one these hours bill to.
+          </p>
+        </div>
       )}
 
       <div className="grid grid-cols-2 gap-3">

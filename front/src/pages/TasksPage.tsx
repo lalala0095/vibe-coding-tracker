@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { getTasks, getTask, getClients, getProjects, getModels, createTask, updateTask } from '../api';
+import { taskHasProject, taskProjectIds, taskProjectsLabel } from '../lib/taskProjectRefs';
 import type { Task, Client, Project, Model, Goal, TaskStatus, TaskPriority, CreateTaskPayload } from '../types';
 import AppNav from '../components/AppNav';
 import Modal from '../components/Modal';
@@ -171,7 +172,7 @@ function TaskRow({
         </span>
         {showBreadcrumb && (
           <span className="text-xs text-slate-500 truncate block">
-            {task.client_name} / {task.project_name}
+            {taskProjectsLabel(task)}
           </span>
         )}
       </button>
@@ -457,7 +458,7 @@ export default function TasksPage() {
   // Filter + sort tasks
   const filteredTasks = tasks
     .filter((t) => {
-      if (selectedProjectId && t.project_id !== selectedProjectId) return false;
+      if (selectedProjectId && !taskHasProject(t, selectedProjectId)) return false;
       if (filterStatus !== 'all' && t.status !== filterStatus) return false;
       if (filterPriority !== 'all' && t.priority !== filterPriority) return false;
       return true;
@@ -885,7 +886,7 @@ export default function TasksPage() {
                           task={task}
                           depth={depth}
                           subtaskCount={count}
-                          showBreadcrumb={depth === 0 && selectedProjectId === null}
+                          showBreadcrumb={depth === 0 && (selectedProjectId === null || taskProjectIds(task).length > 1)}
                           expanded={isExpanded}
                           onToggleExpand={() => toggleExpandTask(task.id)}
                           onStatusCycle={cycleStatus}

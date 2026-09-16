@@ -16,6 +16,7 @@ import { Modal, Pressable, ScrollView, Text, useWindowDimensions, View } from 'r
 
 import { Button, Chip } from '@/components';
 import { formatSgtDateTime } from '@/lib/sgt';
+import { taskProjectsLabel } from '@/lib/taskProjects';
 import type { Task } from '@/types';
 
 import { directChildren } from './rows';
@@ -100,7 +101,7 @@ export default function TaskDetailSheet({
               </Text>
 
               <Text className="text-xs text-slate-500">
-                {task.client_name} / {task.project_name}
+                {taskProjectsLabel(task)}
               </Text>
 
               <View className="flex-row flex-wrap items-center gap-2">

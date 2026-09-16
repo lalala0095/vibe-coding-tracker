@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { Task, Project, Model, Goal, TaskStatus, TaskPriority, CreateTaskPayload } from '../types';
 import { getTasks, updateTask, deleteTask, createTask, getGoals, createGoal, updateGoal, deleteGoal } from '../api';
+import { taskProjectIds, taskProjectRefs, taskProjectsLabel } from '../lib/taskProjectRefs';
 import TaskForm from './TaskForm';
 import GoalForm from './GoalForm';
 import TimeEntryList from './TimeEntryList';
@@ -258,7 +259,7 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
           }`}>
             {task.title}
           </h2>
-          <p className="text-xs text-slate-500 mt-1">{task.client_name} / {task.project_name}</p>
+          <p className="text-xs text-slate-500 mt-1">{taskProjectsLabel(task)}</p>
         </div>
 
         {/* Status + Priority */}
@@ -366,7 +367,7 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
             <div className="bg-slate-800 border border-slate-700 rounded-xl p-4 mb-3">
               <TaskForm
                 projects={projects}
-                defaultProjectId={task.project_id}
+                defaultProjectIds={taskProjectIds(task)}
                 defaultParentTaskId={task.id}
                 onSubmit={handleSubtaskCreate}
                 onCancel={() => setShowSubtaskForm(false)}
@@ -444,7 +445,7 @@ function TaskView({ task, projects, models, onNavigate, onUpdated, onDeleted, on
         </div>
 
         {/* Time Entries — the `sessions` API. Not the "Sessions" block below. */}
-        <TimeEntryList taskId={task.id} />
+        <TimeEntryList taskId={task.id} taskProjects={taskProjectRefs(task)} />
 
         {/* Sessions */}
         <div>

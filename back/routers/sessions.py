@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from auth import get_current_user
+from routers.tasks import task_projects
 from services.firestore_service import get_firestore_client
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -25,10 +26,12 @@ class SessionCreate(BaseModel):
     billable: bool = True
     notes: Optional[str] = None
     tracker_id: Optional[str] = None
+    project_id: Optional[str] = None  # one of the task's projects; None = primary
 
 
 class SessionUpdate(BaseModel):
     task_id: Optional[str] = None
+    project_id: Optional[str] = None  # must be one of the (new) task's projects
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     hours: Optional[float] = None  # omit to keep, null to clear the override
@@ -189,22 +192,65 @@ def _doc_to_session(doc) -> SessionResponse:
     )
 
 
-def _fetch_task_fields(db, task_id: str) -> dict:
-    """Fetch task and return denormalised fields. Raises 404 if not found."""
+def _fetch_task_fields(
+    db,
+    task_id: str,
+    project_id: Optional[str] = None,
+    keep_project_id: Optional[str] = None,
+) -> dict:
+    """
+    Fetch a task and return the denormalised fields a time entry stores.
+
+    A task may link several projects; the entry belongs to exactly one of them
+    and stores that project's chain (not the task's primary):
+
+    - ``project_id`` given → it must be one of the task's projects, else 400;
+    - else ``keep_project_id`` (the entry's current project) when the task has it;
+    - else the task's primary project.
+
+    Raises 404 if the task does not exist.
+    """
     doc = db.collection("tasks").document(task_id).get()
     if not doc.exists:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Task '{task_id}' not found.",
         )
-    data = doc.to_dict()
+    data = doc.to_dict() or {}
+    projects = task_projects(data)
+    by_id = {p["project_id"]: p for p in projects}
+
+    if project_id:
+        chosen = by_id.get(project_id)
+        if chosen is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Project '{project_id}' is not linked to task '{task_id}'.",
+            )
+    elif keep_project_id and keep_project_id in by_id:
+        chosen = by_id[keep_project_id]
+    elif projects:
+        chosen = projects[0]
+    else:
+        chosen = {"project_id": "", "project_name": "", "client_id": "", "client_name": ""}
+
     return {
         "task_title": data.get("title", ""),
-        "project_id": data.get("project_id", ""),
-        "project_name": data.get("project_name", ""),
-        "client_id": data.get("client_id", ""),
-        "client_name": data.get("client_name", ""),
+        "project_id": chosen["project_id"],
+        "project_name": chosen["project_name"],
+        "client_id": chosen["client_id"],
+        "client_name": chosen["client_name"],
     }
+
+
+def _clean_project_id(value: Optional[str]) -> Optional[str]:
+    """Treat a blank or ``"null"`` project_id as not sent (an entry always has one)."""
+    if value is None:
+        return None
+    text = value.strip()
+    if not text or text.lower() == "null":
+        return None
+    return text
 
 
 def _validate_tracker(db, tracker_id: str) -> None:
@@ -336,16 +382,21 @@ async def create_session(
     - ``billable``   – (optional) defaults to true.
     - ``notes``      – (optional) free-text notes for the session.
     - ``tracker_id`` – (optional) link this session to an existing tracker.
+    - ``project_id`` – (optional) which of the task's projects this entry is
+      for; 400 if the task does not link it.  Omitted → the task's primary.
 
     Denormalised fields ``task_title``, ``project_id``, ``project_name``,
-    ``client_id``, and ``client_name`` are fetched from the task document
-    automatically.  ``duration_minutes`` is computed on read, and
+    ``client_id``, and ``client_name`` come from the task document — the
+    project chain is the entry's own project, taken from the task's
+    ``projects`` array.  ``duration_minutes`` is computed on read, and
     ``effective_hours`` resolves ``hours`` against it.  ``invoice_id`` and
     ``invoice_number`` are written only by the invoices router.
     """
     db = get_firestore_client()
 
-    task_fields = _fetch_task_fields(db, payload.task_id)
+    task_fields = _fetch_task_fields(
+        db, payload.task_id, _clean_project_id(payload.project_id)
+    )
 
     if payload.tracker_id:
         _validate_tracker(db, payload.tracker_id)
@@ -382,7 +433,12 @@ async def update_session(
     """
     Update an existing session.
 
-    - When ``task_id`` changes, denormalised task fields are refreshed.
+    - When ``task_id`` is sent, denormalised task fields are refreshed.  The
+      project is ``project_id`` when sent (must be linked to that task, else
+      400), else the entry's current project if the task links it, else the
+      task's primary project.
+    - ``project_id`` alone moves the entry to another of its task's projects
+      (400 if the task does not link it) and refreshes the project chain.
     - Pass ``end_time="null"`` or ``tracker_id="null"`` to clear those fields.
     - Only non-None fields in the payload are updated.
 
@@ -403,12 +459,25 @@ async def update_session(
             detail=f"Session '{session_id}' not found.",
         )
 
+    existing = doc.to_dict() or {}
     updates: dict = {}
 
+    new_project_id = _clean_project_id(payload.project_id)
     if payload.task_id is not None:
-        task_fields = _fetch_task_fields(db, payload.task_id)
+        task_fields = _fetch_task_fields(
+            db, payload.task_id, new_project_id, existing.get("project_id")
+        )
         updates["task_id"] = payload.task_id
         updates.update(task_fields)
+    elif new_project_id is not None:
+        if not existing.get("task_id"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Send 'task_id' with 'project_id': this entry has no task.",
+            )
+        task_fields = _fetch_task_fields(db, existing["task_id"], new_project_id)
+        for key in ("project_id", "project_name", "client_id", "client_name"):
+            updates[key] = task_fields[key]
 
     if payload.start_time is not None:
         updates["start_time"] = payload.start_time

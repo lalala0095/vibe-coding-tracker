@@ -15,6 +15,7 @@ import { Pressable, Text, View } from 'react-native';
 import { apiErrorMessage, getTasks } from '@/api';
 import { Button, ErrorNote, LoadingBlock, Select, TextField, type SelectOption } from '@/components';
 import { parseTaskList } from '@/lib/taskPaste';
+import { taskProjectsLabel } from '@/lib/taskProjects';
 import type { Project, Task, Tracker } from '@/types';
 
 import Sheet from './Sheet';
@@ -96,7 +97,7 @@ export default function AddTasksSheet({
     return tasks.filter(
       (task) =>
         task.title.toLowerCase().includes(needle) ||
-        task.project_name.toLowerCase().includes(needle),
+        taskProjectsLabel(task).toLowerCase().includes(needle),
     );
   }, [tasks, query]);
 
@@ -268,7 +269,7 @@ export default function AddTasksSheet({
                         {isOn ? '  (already added)' : ''}
                       </Text>
                       <Text className="text-xs text-slate-500" numberOfLines={1}>
-                        {[task.project_name, task.client_name].filter(Boolean).join(' · ') || '—'}
+                        {taskProjectsLabel(task) || '—'}
                       </Text>
                     </View>
                   </Pressable>

@@ -192,3 +192,38 @@ export function formatElapsed(fromIso: string | null | undefined, now: Date = ne
 
   return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
 }
+
+/**
+ * `8h 51m (8.85 h)` — a tracker's running total, shown beside its
+ * `start → end` line.
+ *
+ * `untilIso` null means still running: measured against `now`, which the
+ * caller refreshes (see `useTick`) so the figure ticks. "Xh Ym" is built from
+ * whole elapsed minutes (floored, so it never runs ahead of the clock); the
+ * decimal is elapsed hours rounded to 2 dp. Display only — not a billable
+ * number, and never an input to one.
+ *
+ * Like `formatElapsed`, a negative span (a start in the future, which the user
+ * may enter) reads as zero rather than as a negative total. `''` when the
+ * start will not parse, so callers can append it unconditionally.
+ */
+export function formatSpanTotal(
+  fromIso: string | null | undefined,
+  untilIso: string | null | undefined,
+  now: Date = new Date(),
+): string {
+  const start = parseSgt(fromIso);
+  if (!start) return '';
+  const end = untilIso ? parseSgt(untilIso) : now;
+  if (!end) return '';
+
+  const ms = Math.max(0, end.getTime() - start.getTime());
+  const totalMinutes = Math.floor(ms / 60_000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  // Integer hundredths first, so the 2 dp figure is not at the mercy of
+  // `toFixed`'s binary rounding.
+  const decimal = (Math.round(ms / 36_000) / 100).toFixed(2);
+
+  return `${hours}h ${minutes}m (${decimal} h)`;
+}

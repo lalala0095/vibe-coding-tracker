@@ -12,6 +12,7 @@
 // has to be refused here or not at all.
 
 import { parseSgt } from '@/lib/sgt';
+import { taskHasClient, taskHasProject } from '@/lib/taskProjects';
 import type { Task, TaskStatus } from '@/types';
 
 export type StatusFilter = TaskStatus | 'all';
@@ -42,8 +43,10 @@ function insertedAt(task: Task): number {
 }
 
 export function matchesFilters(task: Task, filters: TaskFilterState): boolean {
-  if (filters.clientId && task.client_id !== filters.clientId) return false;
-  if (filters.projectId && task.project_id !== filters.projectId) return false;
+  // By membership: a task links to one or more projects (and so possibly
+  // several clients), and matches a filter on any of them.
+  if (filters.clientId && !taskHasClient(task, filters.clientId)) return false;
+  if (filters.projectId && !taskHasProject(task, filters.projectId)) return false;
   if (filters.status !== 'all' && task.status !== filters.status) return false;
   return true;
 }

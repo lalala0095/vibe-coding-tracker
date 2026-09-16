@@ -35,8 +35,8 @@
 //   2. The provenance split is the most important thing on a card. Hours here
 //      come from two places: time entries, which are billed and invoiceable,
 //      and trackers that have not been billed yet, which `@/lib/weeklySummary`
-//      now prices by hopping `TrackerTaskRef.task_id` → `Task.project_id` — the
-//      same hop `bill_tracker` makes. Tracker time is therefore INSIDE every
+//      now prices by hopping `TrackerTaskRef.task_id` → the task's primary
+//      project (`project_ids[0]`) — the same hop `bill_tracker` makes. Tracker time is therefore INSIDE every
 //      figure on a card, not missing from it, and the card no longer reads low
 //      for someone who bills at month end. But it is a projection of a bill
 //      that has not been raised, so wherever a figure is mixed the card says

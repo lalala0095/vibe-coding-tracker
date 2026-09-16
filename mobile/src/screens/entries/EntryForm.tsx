@@ -16,6 +16,15 @@
 // `warning`; the save button's `loading` state is a double-submit guard and the
 // only disabled thing on screen.
 //
+// ── Which project ────────────────────────────────────────────────────────────
+//
+// A task links to one or more projects and each entry bills exactly one of
+// them. The Project picker appears only when the chosen task has more than
+// one; it defaults to the task's primary (or, when editing, the entry's own
+// project if the task still has it). With a single-project task nothing is
+// sent and the server files the entry under that project. The server rejects
+// a project the task does not have (400) — its message is shown verbatim.
+//
 // ── Clearing conventions ─────────────────────────────────────────────────────
 //
 // The form emits plain values. The screen maps them onto the two wire
@@ -44,6 +53,7 @@ import {
 } from '@/components';
 import { formatHoursLabel } from '@/lib/hours';
 import { nowSgt } from '@/lib/sgt';
+import { taskProjects, taskProjectsLabel } from '@/lib/taskProjects';
 import { theme } from '@/theme';
 import type { Task, TimeEntry } from '@/types';
 import { claimingInvoices } from './grouping';
@@ -51,6 +61,12 @@ import { claimingInvoices } from './grouping';
 /** Plain values. `null` means "cleared" — see the header. */
 export interface EntryFormValues {
   task_id: string;
+  /**
+   * The project these hours bill, when the task has more than one. `null`
+   * means "not chosen here" — omit it and let the server decide (the task's
+   * primary on create; unchanged, or the new task's primary, on update).
+   */
+  project_id: string | null;
   start_time: string;
   end_time: string | null;
   /** A manual override. `null` falls back to the timer. `0` is a real value. */
@@ -79,6 +95,8 @@ interface FieldErrors {
 
 export default function EntryForm({ entry, tasks, taskHint, onSubmit, onCancel }: EntryFormProps) {
   const [taskId, setTaskId] = useState<string | null>(entry?.task_id ?? null);
+  // Only meaningful while the chosen task has several projects — see the header.
+  const [projectId, setProjectId] = useState<string | null>(entry?.project_id ?? null);
   const [start, setStart] = useState<string | null>(entry?.start_time ?? nowSgt());
   const [end, setEnd] = useState<string | null>(entry?.end_time ?? null);
   // Held as text, not a number: "1." and "" are states a number cannot hold,
@@ -97,7 +115,7 @@ export default function EntryForm({ entry, tasks, taskHint, onSubmit, onCancel }
     const options = tasks.map((task) => ({
       label: task.title,
       value: task.id,
-      sublabel: `${task.client_name} / ${task.project_name}`,
+      sublabel: taskProjectsLabel(task),
     }));
 
     // The entry's own task must always be selectable, even if the loaded list
@@ -113,6 +131,37 @@ export default function EntryForm({ entry, tasks, taskHint, onSubmit, onCancel }
 
     return options;
   }, [tasks, entry]);
+
+  const selectedTask = useMemo(
+    () => (taskId ? (tasks.find((task) => task.id === taskId) ?? null) : null),
+    [tasks, taskId],
+  );
+  const choices = useMemo(() => (selectedTask ? taskProjects(selectedTask) : []), [selectedTask]);
+  const pickProject = choices.length > 1;
+  // What the picker shows: the held choice when the task has it, else the
+  // primary. Derived rather than synced in an effect, so switching task never
+  // leaves a project from the previous task selected.
+  const effectiveProjectId = pickProject
+    ? choices.some((ref) => ref.project_id === projectId)
+      ? projectId
+      : choices[0].project_id
+    : null;
+  const projectOptions: SelectOption[] = useMemo(
+    () =>
+      choices.map((ref, index) => ({
+        label: index === 0 ? `${ref.project_name} (primary)` : ref.project_name,
+        value: ref.project_id,
+        sublabel: ref.client_name,
+      })),
+    [choices],
+  );
+  // An entry whose stored project the task no longer links to. Allowed to
+  // exist; saving from here moves it to the project shown.
+  const projectMoved =
+    pickProject &&
+    entry !== null &&
+    entry.task_id === taskId &&
+    !choices.some((ref) => ref.project_id === entry.project_id);
 
   const running = end === null;
   const endsBeforeStart = start !== null && end !== null && end < start;
@@ -167,6 +216,7 @@ export default function EntryForm({ entry, tasks, taskHint, onSubmit, onCancel }
     try {
       await onSubmit({
         task_id: taskId,
+        project_id: effectiveProjectId,
         start_time: start,
         end_time: end,
         // Sent exactly as typed. The server owns rounding; rounding here would
@@ -231,6 +281,24 @@ export default function EntryForm({ entry, tasks, taskHint, onSubmit, onCancel }
           error={errors.task}
           hint={taskHint}
         />
+
+        {pickProject ? (
+          <Select
+            label="Project"
+            value={effectiveProjectId}
+            onChange={(value) => setProjectId(value)}
+            options={projectOptions}
+            searchable={false}
+            title="Project for these hours"
+            warning={
+              projectMoved
+                ? `This entry was on ${entry?.project_name || 'a project'}, which this task no longer links to. Saving files it under the project shown.`
+                : undefined
+            }
+            hint="This task spans several projects. These hours bill to one of them."
+            testID="entry-form-project"
+          />
+        ) : null}
 
         <DateTimeField
           label="Start"

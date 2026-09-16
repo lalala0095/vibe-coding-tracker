@@ -107,3 +107,34 @@ export function describeDateTime(value: string): string {
   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   return `${Number(d)} ${months[Number(mo) - 1] ?? mo} ${y}, ${h}:${mi}`;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Elapsed time on a tracker card
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A span as "8h 51m (8.85 h)" — the running total shown beside a tracker's
+ * `start → end` line.
+ *
+ * "Xh Ym" comes from whole elapsed minutes (floored, so a running tracker never
+ * shows a minute it has not reached); the decimal is the elapsed hours to 2 dp.
+ * A running tracker (`end` null) is measured against `now`, which the caller
+ * refreshes on an interval.
+ *
+ * Display only — billing still reads the tracker's own span server-side.
+ *
+ * @returns '' when either end does not parse or the span is negative, so the
+ *   caller can drop the suffix rather than print nonsense.
+ */
+export function formatElapsed(start: string, end: string | null, now: number = Date.now()): string {
+  const startMs = new Date(start).getTime();
+  const endMs = end ? new Date(end).getTime() : now;
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return '';
+  const ms = endMs - startMs;
+  if (ms < 0) return '';
+  const totalMinutes = Math.floor(ms / 60000);
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  const decimal = (Math.round((ms / 3600000) * 100) / 100).toFixed(2);
+  return `${h}h ${m}m (${decimal} h)`;
+}

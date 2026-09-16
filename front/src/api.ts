@@ -174,11 +174,26 @@ export async function getTask(id: string): Promise<Task> {
   return res.data;
 }
 
+// A task's projects travel in the multipart form as the `project_ids` field
+// repeated once per id, in order ([0] = primary) — the encoding back/routers/
+// tasks.py recommends (it also accepts one JSON-array string). When sent it
+// replaces the whole list; an empty list is a 400, and dropping a project this
+// task's time entries still use is a 409. The legacy scalar `project_id` is
+// sent only when no list is given — on update the server then keeps the
+// secondary projects, so moving a task wholesale must send `project_ids`.
+function appendProjectIds(form: FormData, payload: Partial<CreateTaskPayload>): void {
+  if (payload.project_ids !== undefined) {
+    for (const id of payload.project_ids) form.append('project_ids', id);
+  } else if (payload.project_id !== undefined) {
+    form.append('project_id', payload.project_id);
+  }
+}
+
 export async function createTask(payload: CreateTaskPayload, files: File[]): Promise<Task> {
   const form = new FormData();
   form.append('title', payload.title);
   if (payload.description) form.append('description', payload.description);
-  form.append('project_id', payload.project_id);
+  appendProjectIds(form, payload);
   if (payload.parent_task_id) form.append('parent_task_id', payload.parent_task_id);
   form.append('status', payload.status);
   form.append('priority', payload.priority);
@@ -207,7 +222,7 @@ export async function updateTask(
   const form = new FormData();
   if (payload.title !== undefined) form.append('title', payload.title);
   if (payload.description !== undefined) form.append('description', payload.description);
-  if (payload.project_id !== undefined) form.append('project_id', payload.project_id);
+  appendProjectIds(form, payload);
   if (payload.parent_task_id !== undefined) form.append('parent_task_id', payload.parent_task_id);
   if (payload.status !== undefined) form.append('status', payload.status);
   if (payload.priority !== undefined) form.append('priority', payload.priority);

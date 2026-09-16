@@ -1,7 +1,8 @@
 // Quick-add: the "in the moment" capture, deliberately not the web's 397-line
 // `TaskForm`.
 //
-// Title and project are the whole requirement; priority and due date are there
+// Title and project(s) are the whole requirement — a task may link several
+// projects, the first being the primary (`ProjectsField`); priority and due date are there
 // because they cost one tap each. No description, no attachments (v1 uploads no
 // files), no parent picker — sub-tasks are shown, not created here. Pasting a
 // list of tasks belongs to the tracker's Add-tasks flow and lives there only,
@@ -15,6 +16,7 @@ import { Button, DateTimeField, Select, TextField, type SelectOption } from '@/c
 import { parseSgt, sgtDay } from '@/lib/sgt';
 import type { CreateTaskPayload, Project, TaskPriority } from '@/types';
 
+import ProjectsField from './ProjectsField';
 import { PRIORITY_LABEL, PRIORITY_ORDER } from './taskMeta';
 
 export interface QuickAddSheetProps {
@@ -37,7 +39,7 @@ export default function QuickAddSheet({
   const { height } = useWindowDimensions();
 
   const [title, setTitle] = useState('');
-  const [projectId, setProjectId] = useState<string | null>(null);
+  const [projectIds, setProjectIds] = useState<string[]>([]);
   const [priority, setPriority] = useState<TaskPriority>('medium');
   // The picker speaks the wire timestamp format; `due_date` is the calendar
   // date pulled back out of it on save.
@@ -53,25 +55,13 @@ export default function QuickAddSheet({
   useEffect(() => {
     if (!open) return;
     setTitle('');
-    setProjectId(defaultProjectId);
+    setProjectIds(defaultProjectId ? [defaultProjectId] : []);
     setPriority('medium');
     setDueAt(null);
     setSubmitting(false);
     setError('');
     setAttempted(false);
   }, [open, defaultProjectId]);
-
-  const projectOptions = useMemo<SelectOption[]>(
-    () =>
-      projects
-        .map((project) => ({
-          label: project.name,
-          value: project.id,
-          sublabel: project.client_name,
-        }))
-        .sort((a, b) => a.label.localeCompare(b.label)),
-    [projects],
-  );
 
   const priorityOptions = useMemo<SelectOption[]>(
     () => PRIORITY_ORDER.map((value) => ({ label: PRIORITY_LABEL[value], value })),
@@ -82,7 +72,7 @@ export default function QuickAddSheet({
 
   const handleSubmit = async (): Promise<void> => {
     setAttempted(true);
-    if (!trimmedTitle || !projectId) return;
+    if (!trimmedTitle || projectIds.length === 0) return;
 
     // `sgtDay` on the parsed instant, never `.toISOString().slice(0, 10)`:
     // between midnight and 08:00 the UTC form is the previous day, and a due
@@ -95,7 +85,7 @@ export default function QuickAddSheet({
     try {
       await onCreate({
         title: trimmedTitle,
-        project_id: projectId,
+        project_ids: projectIds,
         status: 'todo',
         priority,
         ...(dueDate ? { due_date: dueDate } : {}),
@@ -138,15 +128,16 @@ export default function QuickAddSheet({
                 testID="task-quick-add-title"
               />
 
-              <Select
-                label="Project"
-                value={projectId}
-                onChange={setProjectId}
-                options={projectOptions}
-                placeholder="Choose a project"
-                title="Project"
-                emptyLabel="No projects yet — add one on the web."
-                error={attempted && !projectId ? 'A task needs a project.' : undefined}
+              <ProjectsField
+                value={projectIds}
+                onChange={setProjectIds}
+                projects={projects}
+                emptyLabel="No projects yet — add one under Clients."
+                error={
+                  attempted && projectIds.length === 0
+                    ? 'A task needs at least one project.'
+                    : undefined
+                }
                 testID="task-quick-add-project"
               />
 

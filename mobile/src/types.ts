@@ -66,10 +66,26 @@ export interface Project {
 export type TaskStatus = 'todo' | 'in_progress' | 'done';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'urgent';
 
+/** One of a task's projects, with its denormalised client chain. */
+export interface TaskProjectRef {
+  project_id: string;
+  project_name: string;
+  client_id: string;
+  client_name: string;
+}
+
 export interface Task {
   id: string;
   title: string;
   description: string;
+  // A task links to one or more projects. Ordered, non-empty, deduped; `[0]`
+  // is the PRIMARY project (the one tracker time prices through). Read these
+  // through `src/lib/taskProjects.ts`, which falls back to the scalars below.
+  project_ids: string[];
+  projects: TaskProjectRef[];      // same order as project_ids
+  client_ids: string[];            // distinct, first-seen order
+  // Legacy scalars, always mirroring the primary (`projects[0]`). Kept for old
+  // clients; new code should not filter on them.
   project_id: string;
   project_name: string;
   client_id: string;
@@ -86,7 +102,10 @@ export interface Task {
 export interface CreateTaskPayload {
   title: string;
   description?: string;
-  project_id: string;
+  // At least one; `[0]` becomes the primary. On update the list replaces the
+  // stored one — the server answers 409 if a removed project is still used by
+  // this task's time entries.
+  project_ids: string[];
   parent_task_id?: string;
   status: TaskStatus;
   priority: TaskPriority;
@@ -224,10 +243,16 @@ export interface CreateSessionPayload {
   billable?: boolean;
   notes?: string;
   tracker_id?: string;
+  // One of the task's `project_ids`; omitted → the task's primary project.
+  // Anything else is a 400 from the server.
+  project_id?: string;
 }
 
 export interface UpdateSessionPayload {
   task_id?: string;
+  // One of the (new) task's `project_ids`. Omitted while changing `task_id`:
+  // the server keeps the current project if the new task has it, else its primary.
+  project_id?: string;
   start_time?: string;
   end_time?: string;    // pass "null" to clear
   hours?: number | null;

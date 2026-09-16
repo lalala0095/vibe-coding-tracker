@@ -44,6 +44,7 @@ import {
 } from '@/api';
 import { Button, EmptyState, ErrorNote, LoadingBlock, Screen } from '@/components';
 import { todaySgt } from '@/lib/sgt';
+import { taskHasClient, taskHasProject } from '@/lib/taskProjects';
 import DeleteTaskSheet from '@/screens/tasks/DeleteTaskSheet';
 import QuickAddSheet from '@/screens/tasks/QuickAddSheet';
 import TaskDetailSheet from '@/screens/tasks/TaskDetailSheet';
@@ -159,8 +160,12 @@ export default function TasksScreen() {
    */
   const revealTask = useCallback((task: Task) => {
     setStatus((current) => (current === 'all' || current === task.status ? current : 'all'));
-    setClientId((current) => (current === null || current === task.client_id ? current : null));
-    setProjectId((current) => (current === null || current === task.project_id ? current : null));
+    // Membership, not the primary: a task on projects A and B is visible under
+    // either filter.
+    setClientId((current) => (current === null || taskHasClient(task, current) ? current : null));
+    setProjectId((current) =>
+      current === null || taskHasProject(task, current) ? current : null,
+    );
   }, []);
 
   const rows = useMemo<TaskRowItem[]>(
@@ -231,7 +236,7 @@ export default function TasksScreen() {
         // Optional fields are omitted rather than cleared: nothing exists yet
         // to clear, and `POST /tasks` reads a falsy value as "not set".
         ...(values.description ? { description: values.description } : {}),
-        project_id: values.project_id,
+        project_ids: values.project_ids,
         ...(values.parent_task_id ? { parent_task_id: values.parent_task_id } : {}),
         status: values.status,
         priority: values.priority,
@@ -251,7 +256,10 @@ export default function TasksScreen() {
         // `description` is a plain string server-side, not a nullable field:
         // "" is its cleared state, and no `"null"` is involved.
         description: values.description,
-        project_id: values.project_id,
+        // The whole ordered list, every save. The server answers 409 if a
+        // removed project is still used by this task's time entries; the form
+        // shows that message and stays open.
+        project_ids: values.project_ids,
         // The clearing convention. `"null"` is the literal string the server
         // compares against; a JSON null would arrive as the four characters
         // "None" through multipart, and omitting the key would leave the
@@ -282,6 +290,7 @@ export default function TasksScreen() {
 
   const today = todaySgt();
   // With a project pinned, every row would repeat the same breadcrumb.
+  // (A multi-project task still shows its other projects then — see TaskRow.)
   const showBreadcrumb = projectId === null;
 
   const openTask = useCallback((task: Task) => {

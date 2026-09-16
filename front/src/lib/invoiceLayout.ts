@@ -25,6 +25,16 @@
 // the tracker line unticked with the reason spelled out. Nothing is hidden or
 // blocked; a tracker only partly covered is left exactly as the server sent it.
 //
+// ── Multi-project tasks ─────────────────────────────────────────────────────
+//
+// A task can span several projects, and each time entry bills to one of them,
+// so one task yields one line PER PROJECT (per day, in the daily layout) — each
+// priced at its own project's rate. The print view shows consecutive lines of
+// the same task (and day) under one task heading with a project sub-row each,
+// so both layouts keep those lines adjacent: the daily sort breaks ties on
+// task id then project name, and the task layout runs
+// `keepTaskProjectLinesAdjacent`.
+//
 // Nothing about the stored invoice changes. A daily line is an ordinary
 // InvoiceLine whose date_from === date_to and whose session_ids are that day's
 // entries, so the server stores it, claims its entries and recomputes its
@@ -215,11 +225,42 @@ export function expandToDailyLines(
     }
   }
 
+  // Date, then task title, as the server sorts — then task id and project
+  // name, so two tasks sharing a title never interleave and one task's
+  // project lines for a day stay together.
   return result.sort(
     (a, b) =>
       byCodePoint(a.date_from ?? '', b.date_from ?? '') ||
-      byCodePoint(a.task_title ?? '', b.task_title ?? ''),
+      byCodePoint(a.task_title ?? '', b.task_title ?? '') ||
+      byCodePoint(a.task_id ?? '', b.task_id ?? '') ||
+      byCodePoint(a.project_name ?? '', b.project_name ?? ''),
   );
+}
+
+/**
+ * Pull every later time-entry line of a task up behind that task's first
+ * line, so a multi-project task's per-project lines sit together and print
+ * under one heading. Otherwise the order is untouched (stable): tracker lines
+ * and lines without a task never move and never gather others.
+ */
+export function keepTaskProjectLinesAdjacent<T extends InvoiceLine>(lines: T[]): T[] {
+  const buckets = new Map<string, T[]>();
+  const order: Array<T | T[]> = [];
+  for (const line of lines) {
+    if (line.tracker_id || !line.task_id) {
+      order.push(line);
+      continue;
+    }
+    const bucket = buckets.get(line.task_id);
+    if (bucket) {
+      bucket.push(line);
+    } else {
+      const fresh = [line];
+      buckets.set(line.task_id, fresh);
+      order.push(fresh);
+    }
+  }
+  return order.flatMap((item) => (Array.isArray(item) ? item : [item]));
 }
 
 /** Shown on a tracker line left off because its time entries bill the day. */

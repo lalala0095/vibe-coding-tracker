@@ -7,7 +7,7 @@ Guidance for Claude Code when working in this repository.
 A personal tracker for AI-assisted consulting work. Hierarchy:
 
 ```
-Client → Project → Task (self-nesting via parent_task_id)
+Client → Project ⇄ Task (a task links 1+ projects via project_ids, [0] = primary; self-nesting via parent_task_id)
                      ├── goals    (AI prompt/output records — labelled "Sessions" in the UI)
                      └── sessions (time entries: start/end — labelled "Time Entries" in the UI)
 Tracker → groups tasks and time entries into a work block
@@ -58,6 +58,7 @@ cd back  && ./deploy.sh      # Cloud Run
 - Timestamps: `_now_sgt()` returning `datetime.now(tz=SGT).isoformat()`. Every document carries `datetime_inserted`, and mutable ones also carry `datetime_updated`.
 - Every endpoint takes `_user: Annotated[dict, Depends(get_current_user)]`.
 - Doc → response conversion goes through a `_doc_to_x(doc)` helper using `data.get(key, default)` for every field, so older documents missing new fields never 500.
+- **Multi-project tasks.** A task stores `project_ids`/`projects`/`client_ids` plus legacy scalars mirroring the primary (kept for the installed mobile build). Each time entry carries ONE of its task's projects; the invoice preview's (task, project) grouping prices each separately, and the print view nests a task's project lines under one heading. Removing a project still used by entries is a 409.
 - **Denormalise names.** A project stores `client_name`, a task stores `project_name`/`client_name`, a session stores `task_title` and the whole project/client chain. Refresh them when the parent id changes.
 - Optional fields are cleared by sending the literal string `"null"` (see `sessions.py` update).
 - Child arrays are embedded on the parent document (`task.attachments`, `tracker.tasks`) rather than in subcollections.
@@ -79,7 +80,7 @@ cd back  && ./deploy.sh      # Cloud Run
 
 **The nav header is duplicated across six pages.** Adding a nav link currently means editing all six. `InvoicingPlan.md` WS-4 extracts it into `components/AppNav.tsx`; do that before adding links.
 
-**A tracker carries no billable time, and reaches a rate only through its tasks.** `Tracker` has a span but no `project_id`. Its `TrackerTaskRef` does carry `task_id` (the names beside it are denormalised display copies), so the only route from tracker hours to a rate is `task_id` → `Task.project_id` → project → client — the hop `bill_tracker` makes server-side in `_resolve_tracker_tasks`, and the one `weeklySummary.ts` makes client-side. A feature that prices tracker time and does not load the task list will silently report hours with no money against them.
+**A tracker carries no billable time, and reaches a rate only through its tasks.** `Tracker` has a span but no `project_id`. Its `TrackerTaskRef` does carry `task_id` (the names beside it are denormalised display copies), so the only route from tracker hours to a rate is `task_id` → the task's primary project (`project_ids[0]`, legacy `project_id`) → project → client — the hop `bill_tracker` makes server-side in `_resolve_tracker_tasks`, and the one `weeklySummary.ts` makes client-side. A feature that prices tracker time and does not load the task list will silently report hours with no money against them.
 
 **A tracker reaches an invoice by two routes, and code that knows only one under-reports.** `POST /trackers/{id}/bill` turns the span into `sessions` rows — but an invoice line can also carry a `tracker_id` and bill the span **directly**, creating no time entry at all (`Tracker.invoice_ids` records that claim). So "is this tracker billed?" cannot be answered from `sessions` alone; `weeklySummary.ts` reads non-void invoice lines too. Voiding does not release the claim, and a void invoice is deliberately *not* counted as billed — those hours genuinely still need invoicing.
 

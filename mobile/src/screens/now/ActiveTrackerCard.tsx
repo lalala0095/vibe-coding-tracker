@@ -5,7 +5,7 @@ import { Pressable, Text, View } from 'react-native';
 
 import { apiErrorMessage } from '@/api';
 import { Button, Card, Chip, ConfirmSheet } from '@/components';
-import { formatElapsed, formatSgtDateTime, parseSgt } from '@/lib/sgt';
+import { formatElapsed, formatSgtDateTime, formatSpanTotal, parseSgt } from '@/lib/sgt';
 import type { Tracker, TrackerTaskRef } from '@/types';
 
 import { isFuture } from './trackerTime';
@@ -37,6 +37,8 @@ export default function ActiveTrackerCard({
   const now = useTick(running);
   const until = running ? now : (parseSgt(tracker.end_time) ?? now);
   const elapsed = formatElapsed(tracker.start_time, until);
+  // ` · 8h 51m (8.85 h)` beside the span line, ticking with `now` while running.
+  const spanTotal = formatSpanTotal(tracker.start_time, tracker.end_time, now);
 
   // A start time in the future is the user's call (§ no locking). It is said
   // out loud rather than corrected — the clock reads 00:00:00 until it passes.
@@ -72,6 +74,7 @@ export default function ActiveTrackerCard({
         <Text className="text-xs text-slate-500">
           {formatSgtDateTime(tracker.start_time)}
           {tracker.end_time ? ` → ${formatSgtDateTime(tracker.end_time)}` : ' → now'}
+          {spanTotal ? ` · ${spanTotal}` : ''}
         </Text>
 
         {startInFuture ? (

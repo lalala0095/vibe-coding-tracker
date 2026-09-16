@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from datetime import datetime
@@ -5,6 +6,7 @@ from typing import Annotated, Optional
 
 import pytz
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import status as http_status  # update_task shadows ``status`` with a form field
 from pydantic import BaseModel
 
 from auth import get_current_user
@@ -33,9 +35,14 @@ class TaskBulkCreate(BaseModel):
 
     JSON rather than multipart because bulk-created tasks carry no
     attachments — the single-task endpoint stays the one that handles uploads.
+
+    Send ``project_ids`` (ordered, first = primary).  The legacy scalar
+    ``project_id`` is still accepted and means ``[project_id]``; when both are
+    sent ``project_ids`` wins.
     """
 
-    project_id: str
+    project_id: Optional[str] = None
+    project_ids: Optional[list[str]] = None
     titles: list[str]
     parent_task_id: Optional[str] = None
     status: str = "todo"
@@ -43,10 +50,30 @@ class TaskBulkCreate(BaseModel):
     due_date: Optional[str] = None
 
 
+class TaskProjectInfo(BaseModel):
+    """One of a task's projects, with its denormalised names."""
+
+    project_id: str
+    project_name: str
+    client_id: str
+    client_name: str
+
+
 class TaskResponse(BaseModel):
+    """
+    A task.  ``project_ids`` is ordered and non-empty for any well-formed task;
+    index 0 is the PRIMARY project.  ``projects`` is the same list with names,
+    ``client_ids`` the distinct clients in first-seen order.  The scalar
+    ``project_id``/``project_name``/``client_id``/``client_name`` are kept for
+    older clients and always mirror ``projects[0]``.
+    """
+
     id: str
     title: str
     description: str
+    project_ids: list[str]
+    projects: list[TaskProjectInfo]
+    client_ids: list[str]
     project_id: str
     project_name: str
     client_id: str
@@ -70,20 +97,100 @@ def _now_sgt() -> str:
     return datetime.now(tz=SGT).isoformat()
 
 
+def task_projects(data: dict) -> list[dict]:
+    """
+    Return a task document's projects as ``[{project_id, project_name,
+    client_id, client_name}, ...]``, primary first.
+
+    The one place that reads the multi-project fields, so every router agrees
+    on the rule for older documents:
+
+    - ``projects`` (the denormalised array) is used when present;
+    - else ``project_ids`` alone, with names taken from the legacy scalars for
+      the id they describe and left empty for the rest;
+    - else a legacy document with only the scalar ``project_id`` reads as a
+      one-project list;
+    - a document with no project at all reads as ``[]`` — never an error.
+    """
+    scalar = {
+        "project_id": data.get("project_id") or "",
+        "project_name": data.get("project_name") or "",
+        "client_id": data.get("client_id") or "",
+        "client_name": data.get("client_name") or "",
+    }
+
+    stored = data.get("projects") or []
+    ids = [pid for pid in (data.get("project_ids") or []) if pid]
+    by_id: dict = {}
+    for entry in stored:
+        if isinstance(entry, dict) and entry.get("project_id"):
+            by_id.setdefault(entry["project_id"], entry)
+    if not ids:
+        ids = list(by_id)
+    if not ids and scalar["project_id"]:
+        ids = [scalar["project_id"]]
+
+    result: list[dict] = []
+    for pid in dict.fromkeys(ids):
+        entry = by_id.get(pid)
+        if entry is None and pid == scalar["project_id"]:
+            entry = scalar
+        entry = entry or {}
+        result.append(
+            {
+                "project_id": pid,
+                "project_name": entry.get("project_name") or "",
+                "client_id": entry.get("client_id") or "",
+                "client_name": entry.get("client_name") or "",
+            }
+        )
+    return result
+
+
+def task_project_ids(data: dict) -> list[str]:
+    """Ordered project ids of a task document (index 0 = primary)."""
+    return [p["project_id"] for p in task_projects(data)]
+
+
+def task_client_ids(data: dict) -> list[str]:
+    """Distinct client ids of a task document's projects, first-seen order."""
+    return list(
+        dict.fromkeys(p["client_id"] for p in task_projects(data) if p["client_id"])
+    )
+
+
+def task_primary_project(data: dict) -> dict:
+    """
+    The task's primary project entry (``projects[0]``), or an all-empty entry.
+
+    Tracker pricing and ``POST /trackers/{id}/bill`` use this — a tracker span
+    has no per-entry project choice, so it bills under the primary.
+    """
+    projects = task_projects(data)
+    if projects:
+        return projects[0]
+    return {"project_id": "", "project_name": "", "client_id": "", "client_name": ""}
+
+
 def _doc_to_task(doc) -> TaskResponse:
-    data = doc.to_dict()
+    data = doc.to_dict() or {}
     attachments = [
-        AttachmentInfo(name=a["name"], gcs_url=a["gcs_url"])
+        AttachmentInfo(name=a.get("name", ""), gcs_url=a.get("gcs_url", ""))
         for a in data.get("attachments", [])
     ]
+    projects = task_projects(data)
+    primary = task_primary_project(data)
     return TaskResponse(
         id=doc.id,
         title=data.get("title", ""),
         description=data.get("description", ""),
-        project_id=data.get("project_id", ""),
-        project_name=data.get("project_name", ""),
-        client_id=data.get("client_id", ""),
-        client_name=data.get("client_name", ""),
+        project_ids=[p["project_id"] for p in projects],
+        projects=[TaskProjectInfo(**p) for p in projects],
+        client_ids=task_client_ids(data),
+        project_id=primary["project_id"],
+        project_name=primary["project_name"],
+        client_id=primary["client_id"],
+        client_name=primary["client_name"],
         parent_task_id=data.get("parent_task_id"),
         status=data.get("status", "todo"),
         priority=data.get("priority", "medium"),
@@ -113,6 +220,121 @@ def _fetch_project(db, project_id: str) -> dict:
         "client_id": data.get("client_id", ""),
         "client_name": data.get("client_name", ""),
     }
+
+
+def _clean_project_ids(project_ids) -> list[str]:
+    """Strip, drop blanks and de-duplicate, keeping the first occurrence."""
+    cleaned = [str(pid).strip() for pid in (project_ids or [])]
+    return list(dict.fromkeys(pid for pid in cleaned if pid))
+
+
+def _parse_form_project_ids(values: Optional[list[str]]) -> Optional[list[str]]:
+    """
+    Read ``project_ids`` from a multipart form.
+
+    Two encodings are accepted, so neither client has to fight its FormData:
+
+    - the field repeated once per id (``project_ids=a``, ``project_ids=b``);
+    - one field holding a JSON array string (``project_ids=["a","b"]``).
+
+    Returns None when the field was not sent at all.
+    """
+    if values is None:
+        return None
+    ids: list[str] = []
+    for value in values:
+        text = (value or "").strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Field 'project_ids' is not a valid JSON array.",
+                )
+            if not isinstance(parsed, list):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Field 'project_ids' is not a valid JSON array.",
+                )
+            ids.extend(str(item) for item in parsed if item is not None)
+        else:
+            ids.append(text)
+    return _clean_project_ids(ids)
+
+
+def _require_project_ids(project_ids: Optional[list[str]], project_id: Optional[str]) -> list[str]:
+    """
+    Resolve a create request's projects: a non-empty ``project_ids`` wins, else
+    the legacy scalar ``project_id`` means ``[project_id]``.  At least one is
+    required (400).
+    """
+    ids = _clean_project_ids(project_ids)
+    if not ids and project_id and project_id.strip():
+        ids = [project_id.strip()]
+    if not ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A task needs at least one project: send 'project_ids'.",
+        )
+    return ids
+
+
+def build_project_fields(db, project_ids: list[str]) -> dict:
+    """
+    Fetch every project (404 on the first missing one) and return the stored
+    task fields: ``project_ids``, ``projects``, ``client_ids`` and the legacy
+    scalars mirrored from the primary (index 0).
+    """
+    projects = []
+    for pid in project_ids:
+        project_data = _fetch_project(db, pid)
+        projects.append({"project_id": pid, **project_data})
+    primary = projects[0]
+    return {
+        "project_ids": [p["project_id"] for p in projects],
+        "projects": projects,
+        "client_ids": list(
+            dict.fromkeys(p["client_id"] for p in projects if p["client_id"])
+        ),
+        "project_id": primary["project_id"],
+        "project_name": primary["project_name"],
+        "client_id": primary["client_id"],
+        "client_name": primary["client_name"],
+    }
+
+
+def _check_removed_projects_unused(
+    db, task_id: str, current: list[dict], new_ids: list[str]
+) -> None:
+    """
+    Refuse (409) to unlink a project that time entries of this task still use.
+
+    Referential integrity, not a field lock: every time entry must point at one
+    of its task's projects.  Only projects actually being removed are checked,
+    so an entry already pointing somewhere odd never blocks an unrelated edit.
+    """
+    removed = [p for p in current if p["project_id"] not in set(new_ids)]
+    if not removed:
+        return
+    counts: dict = {}
+    for doc in db.collection("sessions").where("task_id", "==", task_id).stream():
+        pid = (doc.to_dict() or {}).get("project_id")
+        if pid:
+            counts[pid] = counts.get(pid, 0) + 1
+    problems = []
+    for project in removed:
+        count = counts.get(project["project_id"], 0)
+        if count:
+            noun = "time entry" if count == 1 else "time entries"
+            verb = "uses" if count == 1 else "use"
+            name = project["project_name"] or project["project_id"]
+            problems.append(f"{count} {noun} on this task {verb} {name}")
+    if problems:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="; ".join(problems) + " — move them to another project first.",
+        )
 
 
 def _blob_name_from_url(gcs_url: str, bucket_name: str) -> str:
@@ -154,7 +376,8 @@ async def list_tasks(
     """
     Return tasks with optional filters.
 
-    - ``project_id``     – filter by project.
+    - ``project_id``     – tasks linked to this project, i.e. whose
+                           ``project_ids`` contains it (primary or not).
     - ``parent_task_id`` – filter by parent task; pass the literal string
                            ``"null"`` to retrieve only top-level tasks
                            (where ``parent_task_id`` is ``None``).
@@ -166,9 +389,6 @@ async def list_tasks(
     """
     db = get_firestore_client()
     query = db.collection("tasks")
-
-    if project_id is not None:
-        query = query.where("project_id", "==", project_id)
 
     if parent_task_id is not None:
         if parent_task_id.lower() == "null":
@@ -182,7 +402,20 @@ async def list_tasks(
     if priority is not None:
         query = query.where("priority", "==", priority)
 
-    docs = query.stream()
+    if project_id is None:
+        docs = list(query.stream())
+    else:
+        # Membership via ``array_contains`` on ``project_ids``.  The legacy
+        # scalar query is unioned in so a task written before the backfill
+        # (``scripts/backfill_task_projects.py``) still matches; the scalar
+        # always mirrors the primary, so the union never over-matches.
+        by_id: dict = {}
+        for doc in query.where("project_ids", "array_contains", project_id).stream():
+            by_id[doc.id] = doc
+        for doc in query.where("project_id", "==", project_id).stream():
+            by_id.setdefault(doc.id, doc)
+        docs = list(by_id.values())
+
     tasks = [_doc_to_task(doc) for doc in docs]
     return _sort_tasks(tasks)
 
@@ -207,7 +440,8 @@ async def get_task(
 async def create_task(
     _user: Annotated[dict, Depends(get_current_user)],
     title: str = Form(...),
-    project_id: str = Form(...),
+    project_id: Optional[str] = Form(default=None),
+    project_ids: Optional[list[str]] = Form(default=None),
     description: str = Form(default=""),
     parent_task_id: Optional[str] = Form(default=None),
     status: str = Form(default="todo"),
@@ -220,7 +454,14 @@ async def create_task(
 
     Accepts ``multipart/form-data`` with:
     - ``title``          – task title.
-    - ``project_id``     – ID of an existing project document.
+    - ``project_ids``    – ordered ids of existing projects, first = primary.
+                           Either repeat the field once per id
+                           (``project_ids=p1``, ``project_ids=p2``) or send one
+                           field holding a JSON array (``project_ids=["p1","p2"]``).
+                           Blanks and duplicates are dropped.
+    - ``project_id``     – legacy: a single project, used only when
+                           ``project_ids`` is absent or empty.  One of the two
+                           is required (400), every id must exist (404).
     - ``description``    – (optional) task description, defaults to empty string.
     - ``parent_task_id`` – (optional) ID of a parent task; omit for top-level tasks.
     - ``status``         – (optional) ``todo`` | ``in_progress`` | ``done``, default ``todo``.
@@ -228,14 +469,17 @@ async def create_task(
     - ``due_date``       – (optional) ISO date string ``YYYY-MM-DD``.
     - ``attachments``    – (optional, repeatable) file uploads.
 
-    Denormalised fields ``project_name``, ``client_id``, and ``client_name`` are
-    fetched from the project document automatically.  Files are uploaded to GCS
+    ``projects`` (names per project), ``client_ids`` and the legacy scalars
+    ``project_name``/``client_id``/``client_name`` (mirroring the primary) are
+    fetched from the project documents automatically.  Files are uploaded to GCS
     under ``tasks/<task_id>/<original_filename>``.
     """
     db = get_firestore_client()
 
-    # Fetch project and denormalise fields
-    project_data = _fetch_project(db, project_id)
+    # Fetch the projects and denormalise their fields
+    project_fields = build_project_fields(
+        db, _require_project_ids(_parse_form_project_ids(project_ids), project_id)
+    )
 
     # Allocate the document ID up-front so we can use it in GCS paths
     doc_ref = db.collection("tasks").document()
@@ -259,10 +503,7 @@ async def create_task(
     task_data = {
         "title": title,
         "description": description,
-        "project_id": project_id,
-        "project_name": project_data["project_name"],
-        "client_id": project_data["client_id"],
-        "client_name": project_data["client_name"],
+        **project_fields,
         "parent_task_id": resolved_parent_task_id,
         "status": status,
         "priority": priority,
@@ -292,14 +533,18 @@ async def create_tasks_bulk(
 
     - ``titles``         – one task per entry.  Blank and duplicate titles are
       dropped, and the surviving order is preserved.
-    - ``project_id``     – ID of an existing project (required).
+    - ``project_ids``    – ordered ids of existing projects, first = primary.
+    - ``project_id``     – legacy single project, used when ``project_ids`` is
+      absent or empty.  One of the two is required (400).
     - ``parent_task_id`` – (optional) nest every created task under this one.
     - ``status`` / ``priority`` / ``due_date`` – applied to all of them.
 
     Returns the created tasks in the order they were given.
     """
     db = get_firestore_client()
-    project_data = _fetch_project(db, payload.project_id)
+    project_fields = build_project_fields(
+        db, _require_project_ids(payload.project_ids, payload.project_id)
+    )
 
     titles: list[str] = []
     seen: set[str] = set()
@@ -330,10 +575,7 @@ async def create_tasks_bulk(
                 {
                     "title": title,
                     "description": "",
-                    "project_id": payload.project_id,
-                    "project_name": project_data["project_name"],
-                    "client_id": project_data["client_id"],
-                    "client_name": project_data["client_name"],
+                    **project_fields,
                     "parent_task_id": payload.parent_task_id or None,
                     "status": payload.status,
                     "priority": payload.priority,
@@ -355,6 +597,7 @@ async def update_task(
     title: Optional[str] = Form(default=None),
     description: Optional[str] = Form(default=None),
     project_id: Optional[str] = Form(default=None),
+    project_ids: Optional[list[str]] = Form(default=None),
     parent_task_id: Optional[str] = Form(default=None),
     status: Optional[str] = Form(default=None),
     priority: Optional[str] = Form(default=None),
@@ -366,8 +609,15 @@ async def update_task(
 
     Accepts ``multipart/form-data``; all fields are optional.
 
-    - When ``project_id`` changes, ``project_name``, ``client_id``, and
-      ``client_name`` are refreshed automatically.
+    - ``project_ids`` (same two encodings as create) replaces the whole list;
+      order matters, first = primary.  An empty list is a 400.
+    - Legacy ``project_id`` alone: already one of the task's projects → no
+      change; otherwise it replaces the primary (index 0) and the other
+      projects stay.  Ignored when ``project_ids`` is sent.
+    - Whenever the projects are written, every project is re-read, so
+      ``projects``, ``client_ids`` and the legacy scalars are refreshed.
+    - Unlinking a project that time entries of this task still use is a 409
+      naming the project and the entry count — move those entries first.
     - New attachment files are uploaded to GCS and appended to the existing
       attachment list.
     - ``datetime_updated`` is always refreshed on a successful update.
@@ -377,7 +627,7 @@ async def update_task(
     doc = doc_ref.get()
     if not doc.exists:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Task '{task_id}' not found.",
         )
 
@@ -390,12 +640,28 @@ async def update_task(
     if description is not None:
         updates["description"] = description
 
-    if project_id is not None:
-        project_data = _fetch_project(db, project_id)
-        updates["project_id"] = project_id
-        updates["project_name"] = project_data["project_name"]
-        updates["client_id"] = project_data["client_id"]
-        updates["client_name"] = project_data["client_name"]
+    current_projects = task_projects(existing_data)
+    current_ids = [p["project_id"] for p in current_projects]
+    new_project_ids: Optional[list[str]] = None
+    parsed_ids = _parse_form_project_ids(project_ids)
+    if parsed_ids is not None:
+        if not parsed_ids:
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail="Field 'project_ids' must contain at least one project.",
+            )
+        new_project_ids = parsed_ids
+    elif project_id is not None and project_id.strip():
+        legacy_id = project_id.strip()
+        if legacy_id not in current_ids:
+            new_project_ids = [legacy_id] + [
+                pid for pid in current_ids[1:] if pid != legacy_id
+            ]
+
+    if new_project_ids is not None:
+        project_fields = build_project_fields(db, new_project_ids)
+        _check_removed_projects_unused(db, task_id, current_projects, new_project_ids)
+        updates.update(project_fields)
 
     if parent_task_id is not None:
         # Allow callers to clear parent by passing the literal string "null"

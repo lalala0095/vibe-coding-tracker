@@ -1,15 +1,18 @@
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { getInvoice } from '../api';
 import { formatHours, formatMoney, roundHours } from '../lib/money';
-import type { Invoice, InvoiceStatus } from '../types';
+import { groupLinesForPrint } from '../lib/invoicePrintGroups';
+import type { Invoice, InvoiceLine, InvoiceStatus } from '../types';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Formatting helpers
 //
 // Money formatting lives in ../lib/money so the print view, the builder and the
 // backend all agree. Nothing in this file does arithmetic: every figure shown
-// is a stored value off the invoice document.
+// is a stored value off the invoice document — except a multi-project task
+// group's heading hours, a display-only sum of stored line hours made in
+// ../lib/invoicePrintGroups.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MONTHS = [
@@ -69,6 +72,26 @@ function showsStatus(status: InvoiceStatus): boolean {
   return status !== 'draft';
 }
 
+/**
+ * A line's bullets. Read defensively and drop blanks: invoices stored before
+ * `sub_items` existed have none, and the editor allows an empty bullet.
+ */
+function SubItems({ line }: { line: InvoiceLine }) {
+  const subItems = (line.sub_items ?? []).filter((item) => item.trim());
+  if (subItems.length === 0) return null;
+  return (
+    <ul className="mt-1 list-disc space-y-0.5 pl-5 text-xs leading-snug text-slate-600">
+      {subItems.map((item, index) => (
+        // Titles are free text and can repeat, so the index is the only
+        // stable key. The list is render-only, never reordered.
+        <li key={index} className="break-words">
+          {item}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The document
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,6 +104,11 @@ function showsStatus(status: InvoiceStatus): boolean {
  * snapshotted, as are `bill_to` and `issued_by` — none of them are recomputed or
  * re-resolved here, so a historical invoice always prints the figures it was
  * saved with.
+ *
+ * Consecutive lines of one task (and one day, for daily lines) print under a
+ * single task heading with a sub-row per project — see
+ * `lib/invoicePrintGroups.ts`. The heading's hours are a display sum of the
+ * stored line hours; no amount is derived.
  *
  * The sheet is deliberately light-on-white on screen as well as on paper, so the
  * preview inside the dark app shell matches what actually comes out of the
@@ -267,46 +295,89 @@ export function InvoicePrintView({ invoice }: { invoice: Invoice }) {
             </tr>
           )}
 
-          {invoice.lines.map((line) => {
-            // Tracker-billed lines carry the tracker's task titles. Read
-            // defensively and drop blanks: invoices stored before the field
-            // existed have none, and the editor allows an empty bullet.
-            const subItems = (line.sub_items ?? []).filter((item) => item.trim());
+          {groupLinesForPrint(invoice.lines).map((group) => {
+            if (group.lines.length === 1) {
+              const line = group.lines[0];
+              return (
+                <tr key={line.line_id} className="border-b border-slate-200 align-top">
+                  <td className="py-2 pr-4 text-slate-900">
+                    {line.description || line.task_title}
+                    {line.project_name && (
+                      <span className="block text-xs text-slate-500">
+                        {line.project_name}
+                      </span>
+                    )}
+                    <SubItems line={line} />
+                  </td>
+                  <td className="py-2 pr-4 whitespace-nowrap text-slate-700">
+                    {formatDateRange(line.date_from, line.date_to) || '—'}
+                  </td>
+                  <td className="py-2 pr-4 text-right tabular-nums text-slate-900">
+                    {roundHours(line.hours).toFixed(2)}
+                  </td>
+                  <td className="py-2 pr-4 text-right tabular-nums text-slate-900">
+                    {formatMoney(line.rate, currency)}
+                  </td>
+                  <td className="py-2 text-right tabular-nums font-medium text-slate-900">
+                    {formatMoney(line.amount, currency)}
+                  </td>
+                </tr>
+              );
+            }
 
+            // One task over several projects: a heading row, then a sub-row
+            // per project line. Hours on the heading are a display sum of the
+            // stored line hours; rate and amount stay on the project rows.
+            const groupRange = formatDateRange(group.date_from, group.date_to);
             return (
-              <tr key={line.line_id} className="border-b border-slate-200 align-top">
-                <td className="py-2 pr-4 text-slate-900">
-                  {line.description || line.task_title}
-                  {line.project_name && (
-                    <span className="block text-xs text-slate-500">
-                      {line.project_name}
-                    </span>
-                  )}
-                  {subItems.length > 0 && (
-                    <ul className="mt-1 list-disc space-y-0.5 pl-5 text-xs leading-snug text-slate-600">
-                      {subItems.map((item, index) => (
-                        // Titles are free text and can repeat, so the index is the
-                        // only stable key. The list is render-only, never reordered.
-                        <li key={index} className="break-words">
-                          {item}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </td>
-                <td className="py-2 pr-4 whitespace-nowrap text-slate-700">
-                  {formatDateRange(line.date_from, line.date_to) || '—'}
-                </td>
-                <td className="py-2 pr-4 text-right tabular-nums text-slate-900">
-                  {roundHours(line.hours).toFixed(2)}
-                </td>
-                <td className="py-2 pr-4 text-right tabular-nums text-slate-900">
-                  {formatMoney(line.rate, currency)}
-                </td>
-                <td className="py-2 text-right tabular-nums font-medium text-slate-900">
-                  {formatMoney(line.amount, currency)}
-                </td>
-              </tr>
+              <Fragment key={group.key}>
+                <tr className="align-top">
+                  <td className="pt-2 pr-4 font-medium text-slate-900">{group.title}</td>
+                  <td className="pt-2 pr-4 whitespace-nowrap text-slate-700">
+                    {groupRange || '—'}
+                  </td>
+                  <td className="pt-2 pr-4 text-right tabular-nums text-slate-500">
+                    {group.hours.toFixed(2)}
+                  </td>
+                  <td className="pt-2 pr-4" />
+                  <td className="pt-2" />
+                </tr>
+                {group.lines.map((line, index) => {
+                  const isLast = index === group.lines.length - 1;
+                  const ownRange = formatDateRange(line.date_from, line.date_to);
+                  // A hand-edited description that no longer matches the task
+                  // title is printed under the project name, not lost.
+                  const description = line.description || line.task_title;
+                  return (
+                    <tr
+                      key={line.line_id}
+                      className={`align-top ${isLast ? 'border-b border-slate-200' : ''}`}
+                    >
+                      <td className={`pl-5 pr-4 text-slate-900 ${isLast ? 'pb-2' : 'pb-1'} pt-1`}>
+                        <span className="text-slate-700">
+                          {line.project_name || description}
+                        </span>
+                        {line.project_name && description && description !== group.title && (
+                          <span className="block text-xs text-slate-500">{description}</span>
+                        )}
+                        <SubItems line={line} />
+                      </td>
+                      <td className={`pr-4 whitespace-nowrap text-xs text-slate-500 ${isLast ? 'pb-2' : 'pb-1'} pt-1`}>
+                        {ownRange && ownRange !== groupRange ? ownRange : ''}
+                      </td>
+                      <td className={`pr-4 text-right tabular-nums text-slate-900 ${isLast ? 'pb-2' : 'pb-1'} pt-1`}>
+                        {roundHours(line.hours).toFixed(2)}
+                      </td>
+                      <td className={`pr-4 text-right tabular-nums text-slate-900 ${isLast ? 'pb-2' : 'pb-1'} pt-1`}>
+                        {formatMoney(line.rate, currency)}
+                      </td>
+                      <td className={`text-right tabular-nums font-medium text-slate-900 ${isLast ? 'pb-2' : 'pb-1'} pt-1`}>
+                        {formatMoney(line.amount, currency)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </Fragment>
             );
           })}
         </tbody>

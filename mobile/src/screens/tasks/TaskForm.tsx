@@ -21,8 +21,15 @@
 //
 // ── No locking (CLAUDE.md) ───────────────────────────────────────────────────
 //
-// Nothing here is read-only. A due date already in the past, or a parent in a
-// different project, gets a `warning` and saves exactly as entered. The save
+// Nothing here is read-only. A due date already in the past, or a parent that
+// shares none of this task's projects, gets a `warning` and saves exactly as
+// entered. Removing a project that time entries still use is not refused here
+// either — the server answers 409 naming the project and the entry count, and
+// that message is shown as-is.
+//
+// ── Projects ─────────────────────────────────────────────────────────────────
+//
+// A task has one or more projects (`ProjectsField`); the first is the primary. The save
 // button's `loading` state is a double-submit guard and the only inert thing on
 // the screen.
 
@@ -40,8 +47,10 @@ import {
   type SelectOption,
 } from '@/components';
 import { parseSgt, sgtDay, todaySgt } from '@/lib/sgt';
+import { taskProjectIds, taskProjects, taskProjectsLabel } from '@/lib/taskProjects';
 import type { Project, Task, TaskPriority, TaskStatus } from '@/types';
 
+import ProjectsField from './ProjectsField';
 import { descendantIds } from './rows';
 import { PRIORITY_LABEL, PRIORITY_ORDER, STATUS_LABEL, STATUS_ORDER } from './taskMeta';
 
@@ -49,7 +58,8 @@ import { PRIORITY_LABEL, PRIORITY_ORDER, STATUS_LABEL, STATUS_ORDER } from './ta
 export interface TaskFormValues {
   title: string;
   description: string;
-  project_id: string;
+  /** Ordered, non-empty; `[0]` is the primary. */
+  project_ids: string[];
   parent_task_id: string | null;
   status: TaskStatus;
   priority: TaskPriority;
@@ -87,9 +97,11 @@ export default function TaskForm({
 
   const [title, setTitle] = useState(task?.title ?? '');
   const [description, setDescription] = useState(task?.description ?? '');
-  const [projectId, setProjectId] = useState<string | null>(
-    task?.project_id ?? parent?.project_id ?? null,
-  );
+  // A sub-task starts with its parent's projects, primary included.
+  const [projectIds, setProjectIds] = useState<string[]>(() => {
+    const source = task ?? parent;
+    return source ? taskProjectIds(source) : [];
+  });
   const [parentId, setParentId] = useState<string | null>(
     task ? task.parent_task_id : (parent?.id ?? null),
   );
@@ -105,18 +117,6 @@ export default function TaskForm({
   const [errors, setErrors] = useState<FieldErrors>({});
   const [submitError, setSubmitError] = useState('');
   const [submitting, setSubmitting] = useState(false);
-
-  const projectOptions = useMemo<SelectOption[]>(
-    () =>
-      projects
-        .map((project) => ({
-          label: project.name,
-          value: project.id,
-          sublabel: project.client_name,
-        }))
-        .sort((a, b) => a.label.localeCompare(b.label)),
-    [projects],
-  );
 
   // The task itself and everything under it. Choosing any of them would make
   // the task its own ancestor, which the server would store and no reader of
@@ -135,7 +135,7 @@ export default function TaskForm({
         .map((candidate) => ({
           label: candidate.title,
           value: candidate.id,
-          sublabel: `${candidate.client_name} / ${candidate.project_name}`,
+          sublabel: taskProjectsLabel(candidate),
         }))
         .sort((a, b) => a.label.localeCompare(b.label)),
     [tasks, blockedParents],
@@ -156,8 +156,9 @@ export default function TaskForm({
     if (!parentTask) {
       return 'The parent this task points at no longer exists. Clear it to make this a top-level task.';
     }
-    if (projectId && parentTask.project_id !== projectId) {
-      return 'The parent sits in a different project. Saved as chosen — nothing is moved for you.';
+    const parentProjects = taskProjectIds(parentTask);
+    if (projectIds.length > 0 && !projectIds.some((id) => parentProjects.includes(id))) {
+      return 'The parent shares none of these projects. Saved as chosen — nothing is moved for you.';
     }
     return undefined;
   })();
@@ -171,10 +172,10 @@ export default function TaskForm({
     const trimmedTitle = title.trim();
 
     if (!trimmedTitle) next.title = 'A title is required.';
-    if (!projectId) next.project = 'A task needs a project.';
+    if (projectIds.length === 0) next.project = 'A task needs at least one project.';
 
     setErrors(next);
-    if (!trimmedTitle || !projectId) return;
+    if (!trimmedTitle || projectIds.length === 0) return;
 
     setSubmitError('');
     setSubmitting(true);
@@ -184,7 +185,7 @@ export default function TaskForm({
         // An empty description is the cleared state: `description` is a plain
         // string on the wire, not one of the nullable fields, so "" clears it.
         description: description.trim(),
-        project_id: projectId,
+        project_ids: projectIds,
         parent_task_id: parentId,
         status,
         priority,
@@ -248,19 +249,16 @@ export default function TaskForm({
           testID="task-form-description"
         />
 
-        <Select
-          label="Project"
-          value={projectId}
-          onChange={setProjectId}
-          options={projectOptions}
-          placeholder="Choose a project"
-          title="Project"
-          emptyLabel="No projects yet — add one under Clients."
+        <ProjectsField
+          value={projectIds}
+          onChange={setProjectIds}
+          projects={projects}
+          known={task ? taskProjects(task) : parent ? taskProjects(parent) : []}
           error={errors.project}
           hint={
             editing
-              ? 'Moving a task to another project moves it to that project’s client too.'
-              : undefined
+              ? 'The first project is the primary. A project still used by this task’s time entries cannot be removed until they move — the server will say which.'
+              : 'The first project is the primary. Time entries pick one of these.'
           }
           testID="task-form-project"
         />

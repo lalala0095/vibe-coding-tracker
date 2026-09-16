@@ -6,7 +6,7 @@ import type {
 import { previewInvoice, createInvoice, getSessions, getTrackers } from '../api';
 import { computeMoney, formatHours, formatMoney, type DiscountType } from '../lib/money';
 import {
-  attachNotesToTaskLines, expandToDailyLines, markTrackersCoveredByEntries, rememberLayout, rememberedLayout,
+  attachNotesToTaskLines, expandToDailyLines, keepTaskProjectLinesAdjacent, markTrackersCoveredByEntries, rememberLayout, rememberedLayout,
 } from '../lib/invoiceLayout';
 import type { InvoiceLineLayout } from '../lib/regenerate';
 import InvoiceLineTable from './InvoiceLineTable';
@@ -302,7 +302,7 @@ export async function applyLineLayout(
   const sessionsById = new Map(sessions.map((s) => [s.id, s]));
   const laidOut = layout === 'daily'
     ? expandToDailyLines(lines, sessionsById, source.for_invoice_id)
-    : attachNotesToTaskLines(lines, sessionsById);
+    : keepTaskProjectLinesAdjacent(attachNotesToTaskLines(lines, sessionsById));
 
   const trackerIds = new Set(laidOut.flatMap((l) => (l.tracker_id ? [l.tracker_id] : [])));
   if (trackerIds.size === 0) return laidOut;

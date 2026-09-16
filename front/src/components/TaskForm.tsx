@@ -1,11 +1,16 @@
 import { useState, useRef, useEffect } from 'react';
 import type { Task, Project, TaskStatus, TaskPriority, CreateTaskPayload } from '../types';
 import { getTasks } from '../api';
+import { errorDetail } from '../lib/apiError';
+import { taskProjectIds } from '../lib/taskProjectRefs';
 
 interface Props {
   projects: Project[];
   initialValues?: Partial<Task>;
   defaultProjectId?: string;
+  // Pre-selects several projects (e.g. a new subtask inherits its parent's).
+  // Wins over defaultProjectId.
+  defaultProjectIds?: string[];
   defaultParentTaskId?: string;
   onSubmit: (data: CreateTaskPayload & { files: File[] }) => Promise<void>;
   onCancel: () => void;
@@ -29,6 +34,7 @@ export default function TaskForm({
   projects,
   initialValues,
   defaultProjectId,
+  defaultProjectIds,
   defaultParentTaskId,
   onSubmit,
   onCancel,
@@ -36,9 +42,17 @@ export default function TaskForm({
 }: Props) {
   const [title, setTitle] = useState(initialValues?.title ?? '');
   const [description, setDescription] = useState(initialValues?.description ?? '');
-  const [projectId, setProjectId] = useState(
-    initialValues?.project_id ?? defaultProjectId ?? projects[0]?.id ?? ''
-  );
+  // Ordered; [0] is the primary project. A task needs at least one.
+  const [projectIds, setProjectIds] = useState<string[]>(() => {
+    if (initialValues?.project_id || initialValues?.project_ids?.length) {
+      return taskProjectIds(initialValues as Task);
+    }
+    if (defaultProjectIds && defaultProjectIds.length > 0) return defaultProjectIds;
+    const fallback = defaultProjectId ?? projects[0]?.id ?? '';
+    return fallback ? [fallback] : [];
+  });
+  // Parent-task options follow the primary project, as they did the single one.
+  const projectId = projectIds[0] ?? '';
   const [parentTaskId, setParentTaskId] = useState<string>(
     initialValues?.parent_task_id ?? defaultParentTaskId ?? ''
   );
@@ -71,11 +85,18 @@ export default function TaskForm({
       .finally(() => setLoadingParents(false));
   }, [projectId, initialValues?.id]);
 
-  // Reset parent task if project changes
-  const handleProjectChange = (id: string) => {
-    setProjectId(id);
-    setParentTaskId('');
+  // Reset parent task if the primary project changes
+  const setProjects = (next: string[]) => {
+    if ((next[0] ?? '') !== projectId) setParentTaskId('');
+    setProjectIds(next);
   };
+  const addProject = (id: string) => {
+    if (!id || projectIds.includes(id)) return;
+    setProjects([...projectIds, id]);
+  };
+  const removeProject = (id: string) => setProjects(projectIds.filter((p) => p !== id));
+  const makePrimary = (id: string) =>
+    setProjects([id, ...projectIds.filter((p) => p !== id)]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -85,8 +106,8 @@ export default function TaskForm({
       setError('Title cannot be empty.');
       return;
     }
-    if (!projectId) {
-      setError('Please select a project.');
+    if (projectIds.length === 0) {
+      setError('Please select at least one project.');
       return;
     }
 
@@ -95,7 +116,7 @@ export default function TaskForm({
       await onSubmit({
         title: title.trim(),
         description: description.trim() || undefined,
-        project_id: projectId,
+        project_ids: projectIds,
         parent_task_id: parentTaskId || undefined,
         status,
         priority,
@@ -103,8 +124,7 @@ export default function TaskForm({
         files,
       });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Something went wrong.';
-      setError(message);
+      setError(errorDetail(err, 'Something went wrong.'));
     } finally {
       setSubmitting(false);
     }
@@ -153,30 +173,83 @@ export default function TaskForm({
         />
       </div>
 
-      {/* Project */}
+      {/* Projects — one or more; the first is the primary */}
       <div className="flex flex-col gap-1.5">
         <label className="text-sm font-medium text-slate-300">
-          Project <span className="text-red-400">*</span>
+          Projects <span className="text-red-400">*</span>
         </label>
+        {projectIds.length > 0 && (
+          <ul className="flex flex-col gap-1">
+            {projectIds.map((id, i) => {
+              const p = projects.find((x) => x.id === id);
+              const ref = initialValues?.projects?.find((x) => x.project_id === id);
+              const label = p
+                ? `${p.client_name} / ${p.name}`
+                : ref
+                  ? `${ref.client_name} / ${ref.project_name}`
+                  : id;
+              return (
+                <li
+                  key={id}
+                  className="flex items-center gap-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm"
+                >
+                  <span className="text-slate-100 truncate flex-1">{label}</span>
+                  {i === 0 ? (
+                    <span className="text-[10px] uppercase tracking-wide text-violet-300 bg-violet-500/15 border border-violet-500/30 rounded px-1.5 py-0.5 shrink-0">
+                      Primary
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => makePrimary(id)}
+                      disabled={submitting}
+                      className="text-xs text-slate-400 hover:text-violet-300 transition-colors shrink-0 disabled:opacity-50"
+                    >
+                      Make primary
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => removeProject(id)}
+                    disabled={submitting}
+                    title="Remove project"
+                    className="text-slate-500 hover:text-red-400 transition-colors shrink-0 disabled:opacity-50"
+                  >
+                    ✕
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
         <select
-          value={projectId}
-          onChange={(e) => handleProjectChange(e.target.value)}
+          value=""
+          onChange={(e) => addProject(e.target.value)}
           disabled={submitting}
           className="w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-3 py-2 text-sm
                      focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent
                      disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          <option value="">Select a project…</option>
+          <option value="">
+            {projectIds.length === 0 ? 'Select a project…' : 'Add another project…'}
+          </option>
           {Object.values(clientGroups).map((group) => (
             <optgroup key={group.clientName} label={group.clientName}>
-              {group.projects.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {group.clientName} / {p.name}
-                </option>
-              ))}
+              {group.projects
+                .filter((p) => !projectIds.includes(p.id))
+                .map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {group.clientName} / {p.name}
+                  </option>
+                ))}
             </optgroup>
           ))}
         </select>
+        {projectIds.length > 1 && (
+          <p className="text-xs text-slate-500">
+            Each time entry is assigned to one of these. The primary project prices tracker hours.
+          </p>
+        )}
       </div>
 
       {/* Parent task */}

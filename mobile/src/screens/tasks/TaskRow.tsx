@@ -14,6 +14,7 @@ import { memo } from 'react';
 import { Text, View } from 'react-native';
 
 import { Card, Chip } from '@/components';
+import { taskProjectIds, taskProjectsLabel } from '@/lib/taskProjects';
 import type { Task } from '@/types';
 
 import {
@@ -31,7 +32,11 @@ export interface TaskRowProps {
   depth: number;
   /** A sub-task rendered at depth 0 because its parent is filtered out. */
   detached: boolean;
-  /** Off when a project filter already states the client and project. */
+  /**
+   * Off when a project filter already states the client and project. A task
+   * linked to several projects shows the breadcrumb regardless — the filter
+   * names only one of them.
+   */
   showBreadcrumb: boolean;
   /** Today's Singapore date, `YYYY-MM-DD`, for the overdue colour. */
   today: string;
@@ -78,9 +83,9 @@ function TaskRow({
           />
         </View>
 
-        {showBreadcrumb ? (
-          <Text className="text-xs text-slate-500" numberOfLines={1}>
-            {task.client_name} / {task.project_name}
+        {showBreadcrumb || taskProjectIds(task).length > 1 ? (
+          <Text className="text-xs text-slate-500" numberOfLines={2}>
+            {taskProjectsLabel(task)}
           </Text>
         ) : null}
 

@@ -10,6 +10,11 @@
 // sub-tasks are coming along, and moves them too. "Move the parent only" is
 // deliberately not offered: it produces invalid data.
 //
+// A task can link to several projects. Moving it to project P replaces the
+// whole list with `[P]`. If time entries on that task still use one of the
+// projects being dropped, the server refuses with a 409 whose message names the
+// project and the entry count; that message is reported per task, verbatim.
+//
 // The mirror-image break is a sub-task selected on its own, with its parent
 // left behind. That is the same broken shape, but it can also be exactly what
 // the owner meant (re-homing a branch). Per CLAUDE.md's no-locking principle it
@@ -24,6 +29,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import { getTasks, updateTask } from '../api';
 import type { Client, Project, Task } from '../types';
+import { taskProjectIds } from '../lib/taskProjectRefs';
 import Modal, {
   ButtonSpinner,
   MODAL_CANCEL_BUTTON,
@@ -192,9 +198,10 @@ export default function BulkMoveTasksModal({
   // only bumps `datetime_updated`.
   const moveList = useMemo(() => {
     if (!resolved || !destProjectId) return [];
-    return [...resolved.roots, ...resolved.descendants].filter(
-      (t) => t.project_id !== destProjectId
-    );
+    return [...resolved.roots, ...resolved.descendants].filter((t) => {
+      const ids = taskProjectIds(t);
+      return !(ids.length === 1 && ids[0] === destProjectId);
+    });
   }, [resolved, destProjectId]);
 
   const totalInScope = resolved
@@ -216,7 +223,7 @@ export default function BulkMoveTasksModal({
     // not fan a large selection at the API all at once.
     for (const task of moveList) {
       try {
-        await updateTask(task.id, { project_id: destProjectId }, []);
+        await updateTask(task.id, { project_ids: [destProjectId] }, []);
         moved += 1;
       } catch (e) {
         failures.push({

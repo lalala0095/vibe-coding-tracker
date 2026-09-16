@@ -10,6 +10,7 @@ import type {
   TimeEntry, CreateTimeEntryPayload, UpdateTimeEntryPayload,
   Client, Project, Task,
 } from '../types';
+import { taskHasClient, taskHasProject, taskProjectRefs, taskProjectsLabel } from '../lib/taskProjectRefs';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -98,10 +99,12 @@ export default function TimeEntriesPage() {
 
   const selectableTasks = useMemo(() => {
     let list = tasks;
-    if (projectId) list = list.filter((t) => t.project_id === projectId);
-    else if (clientId) list = list.filter((t) => t.client_id === clientId);
+    if (projectId) list = list.filter((t) => taskHasProject(t, projectId));
+    else if (clientId) list = list.filter((t) => taskHasClient(t, clientId));
     return list;
   }, [tasks, clientId, projectId]);
+
+  const newTask = tasks.find((t) => t.id === newTaskId) ?? null;
 
   const visible = useMemo(() => {
     let list = entries;
@@ -134,6 +137,9 @@ export default function TimeEntriesPage() {
       ...(v.end_time !== null ? { end_time: v.end_time } : {}),
       ...(v.hours !== null ? { hours: v.hours } : {}),
       ...(v.notes !== null ? { notes: v.notes } : {}),
+      // A multi-project task: the project picked in the form. Otherwise
+      // omitted and the server uses the task's primary project.
+      ...(v.project_id !== null ? { project_id: v.project_id } : {}),
     };
     const created = await createSession(payload);
     setEntries((prev) => newestFirst([created, ...prev]));
@@ -150,6 +156,7 @@ export default function TimeEntriesPage() {
       // Numeric: explicit null clears the override; 0 is a real value.
       hours: v.hours,
       billable: v.billable,
+      ...(v.project_id !== null && v.project_id !== entry.project_id ? { project_id: v.project_id } : {}),
     };
     const updated = await updateSession(entry.id, payload);
     setEntries((prev) => newestFirst(prev.map((e) => (e.id === updated.id ? updated : e))));
@@ -226,13 +233,16 @@ export default function TimeEntriesPage() {
               <option value="">Select a task…</option>
               {selectableTasks.map((t) => (
                 <option key={t.id} value={t.id}>
-                  {t.client_name} / {t.project_name} — {t.title}
+                  {taskProjectsLabel(t)} — {t.title}
                 </option>
               ))}
             </select>
 
             {newTaskId ? (
               <TimeEntryForm
+                // Keyed by task so switching task resets the project choice.
+                key={newTaskId}
+                taskProjects={newTask ? taskProjectRefs(newTask) : undefined}
                 onSubmit={handleCreate}
                 onCancel={() => { setAdding(false); setNewTaskId(''); }}
                 submitLabel="Log time"
@@ -296,6 +306,10 @@ export default function TimeEntriesPage() {
                             </p>
                             <TimeEntryForm
                               initial={e}
+                              taskProjects={(() => {
+                                const t = tasks.find((x) => x.id === e.task_id);
+                                return t ? taskProjectRefs(t) : undefined;
+                              })()}
                               onSubmit={(v) => handleUpdate(e, v)}
                               onCancel={() => setEditingId(null)}
                             />

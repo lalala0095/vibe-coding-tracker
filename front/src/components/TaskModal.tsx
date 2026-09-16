@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { Task, Project, TaskStatus, TaskPriority, CreateTaskPayload } from '../types';
 import { getTasks, updateTask, deleteTask, createTask } from '../api';
+import { taskProjectIds, taskProjectsLabel } from '../lib/taskProjectRefs';
 import TaskForm from './TaskForm';
 
 interface Props {
@@ -225,7 +226,7 @@ export default function TaskModal({ task, projects, onClose, onUpdated, onDelete
                   {task.title}
                 </h2>
                 <p className="text-sm text-slate-500 mt-1">
-                  {task.client_name} / {task.project_name}
+                  {taskProjectsLabel(task)}
                 </p>
               </div>
 
@@ -318,7 +319,7 @@ export default function TaskModal({ task, projects, onClose, onUpdated, onDelete
                   <div className="bg-slate-800 border border-slate-700 rounded-xl p-4 mb-3">
                     <TaskForm
                       projects={projects}
-                      defaultProjectId={task.project_id}
+                      defaultProjectIds={taskProjectIds(task)}
                       defaultParentTaskId={task.id}
                       onSubmit={handleSubtaskCreate}
                       onCancel={() => setShowSubtaskForm(false)}

@@ -32,7 +32,7 @@
 // invoice settings are the additions, and all three are fetched the first time
 // the tab is opened, so the Trackers tab costs exactly what it cost before
 // this tab existed. Tasks are there for one reason: a tracker has no project,
-// and `TrackerTaskRef.task_id` -> `Task.project_id` is the only route from a
+// and `TrackerTaskRef.task_id` -> the task's primary project is the only route from a
 // tracker's hours to a rate.
 //
 // ── The two rules this file is where they are kept ───────────────────────────
@@ -208,7 +208,7 @@ export default function TrackersScreen() {
   const [clients, setClients] = useState<Client[]>([]);
   // Load-bearing for the summary, not incidental. A tracker carries no
   // `project_id`, so the only way its unbilled hours reach a rate is
-  // `TrackerTaskRef.task_id` -> `Task.project_id` — the same hop
+  // `TrackerTaskRef.task_id` -> the task's primary project (`project_ids[0]`) — the same hop
   // `bill_tracker` makes on the server. Without this list every tracker hour
   // still shows up in the week's hours, but with no money against it.
   const [tasks, setTasks] = useState<Task[]>([]);

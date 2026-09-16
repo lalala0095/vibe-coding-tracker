@@ -7,6 +7,7 @@
 
 import {
   formatElapsed,
+  formatSpanTotal,
   formatSgtDate,
   formatSgtDateTime,
   formatSgtTime,
@@ -164,6 +165,15 @@ eq('todaySgt shape', /^\d{4}-\d{2}-\d{2}$/.test(todaySgt()), true);
 eq('nowSgt agrees with todaySgt', nowSgt().slice(0, 10), todaySgt());
 eq('nowSgt is parseable back to now (within 2s)',
    Math.abs(parseSgt(nowSgt())!.getTime() - Date.now()) < 2000, true);
+
+// ── formatSpanTotal — tracker running total ──────────────────────────────────
+eq('formatSpanTotal 8h51m', formatSpanTotal('2026-08-14T09:00:00+08:00', '2026-08-14T17:51:00+08:00'), '8h 51m (8.85 h)');
+eq('formatSpanTotal floors minutes', formatSpanTotal('2026-08-14T09:00:00+08:00', '2026-08-14T09:00:59+08:00'), '0h 0m (0.02 h)');
+eq('formatSpanTotal running uses now',
+   formatSpanTotal('2026-08-14T09:00:00+08:00', null, new Date('2026-08-14T02:30:00Z')), '1h 30m (1.50 h)');
+eq('formatSpanTotal crosses midnight', formatSpanTotal('2026-08-14T23:00:00+08:00', '2026-08-15T01:15:00+08:00'), '2h 15m (2.25 h)');
+eq('formatSpanTotal future start reads zero', formatSpanTotal('2026-08-14T10:00:00+08:00', '2026-08-14T09:00:00+08:00'), '0h 0m (0.00 h)');
+eq('formatSpanTotal unparseable', formatSpanTotal('nope', null), '');
 
 // ── hours.ts — display only ──────────────────────────────────────────────────
 eq('sumHours avoids float drift', sumHours([0.1, 0.2]), 0.3);

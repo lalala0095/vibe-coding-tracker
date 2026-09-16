@@ -56,10 +56,27 @@ export interface Project {
 export type TaskStatus = 'todo' | 'in_progress' | 'done';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'urgent';
 
+// One of a task's projects, denormalised the same way the legacy scalars are.
+export interface TaskProjectRef {
+  project_id: string;
+  project_name: string;
+  client_id: string;
+  client_name: string;
+}
+
 export interface Task {
   id: string;
   title: string;
   description: string;
+  // A task links to one or more projects. `project_ids[0]` is the PRIMARY
+  // project; `projects` is the same list denormalised, in the same order, and
+  // `client_ids` the distinct clients of those projects in first-seen order.
+  // Optional on the wire type because an older server omits them — read them
+  // through `lib/taskProjectRefs.ts`, which falls back to the scalars below.
+  project_ids?: string[];
+  projects?: TaskProjectRef[];
+  client_ids?: string[];
+  // Legacy scalars, always equal to the primary project (projects[0]).
   project_id: string;
   project_name: string;
   client_id: string;
@@ -76,7 +93,12 @@ export interface Task {
 export interface CreateTaskPayload {
   title: string;
   description?: string;
-  project_id: string;
+  // Ordered, non-empty; [0] is the primary project. Replaces the whole list
+  // on update. Removing a project that this task's time entries still use is
+  // answered with a 409 whose `detail` says so.
+  project_ids: string[];
+  // Legacy single-project form. Prefer `project_ids`.
+  project_id?: string;
   parent_task_id?: string;
   status: TaskStatus;
   priority: TaskPriority;
@@ -88,7 +110,8 @@ export interface UpdateTaskPayload extends Partial<CreateTaskPayload> {}
 // Several tasks from one pasted list. JSON, not multipart — bulk-created tasks
 // carry no attachments.
 export interface BulkCreateTasksPayload {
-  project_id: string;
+  project_id?: string;       // legacy single project
+  project_ids?: string[];    // ordered, [0] = primary; wins over project_id
   titles: string[];
   parent_task_id?: string;
   status?: TaskStatus;
@@ -208,6 +231,9 @@ export interface Session {
 
 export interface CreateSessionPayload {
   task_id: string;
+  // One of the task's `project_ids`; omitted → the task's primary project.
+  // A project not linked to the task is rejected with a 400.
+  project_id?: string;
   start_time: string;
   end_time?: string;
   hours?: number;
@@ -218,6 +244,9 @@ export interface CreateSessionPayload {
 
 export interface UpdateSessionPayload {
   task_id?: string;
+  // One of the task's `project_ids`. Omitted while changing `task_id` → the
+  // server keeps the current project if the new task has it, else its primary.
+  project_id?: string;
   start_time?: string;
   end_time?: string;    // pass "null" to clear
   hours?: number | null;

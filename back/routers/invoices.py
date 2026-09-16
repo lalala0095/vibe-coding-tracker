@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from auth import get_current_user
 from routers.sessions import compute_effective_hours, invoice_claims
+from routers.tasks import task_client_ids, task_project_ids, task_projects
 from routers.settings import get_invoice_settings
 from routers.trackers import _tracker_hours
 from services.firestore_service import get_firestore_client
@@ -384,8 +385,9 @@ def _tracker_candidates(
     A tracker document carries no ``client_id`` or ``project_id`` of its own —
     only a list of TaskRefs — so who it bills to has to come from its tasks.
     Every task across every in-period tracker is read in one bulk ``get_all``,
-    then each tracker keeps only the tasks matching the client, and the project
-    filter when one is set.  A tracker with no surviving task is dropped: it
+    then each tracker keeps only the tasks linked to the client (``client_id``
+    in the task's ``client_ids``), and — when a project filter is set — linked
+    to at least one of the filtered projects.  A tracker with no surviving task is dropped: it
     belongs to somebody else's invoice.
 
     The period filter is applied in Python on the same inclusive string
@@ -432,7 +434,8 @@ def _tracker_candidates(
     for doc, data, task_refs in candidates:
         # Read the tasks fresh rather than trusting the TaskRefs on the tracker:
         # a TaskRef carries no client_id or project_id, and a task deleted since
-        # is simply absent from the map.
+        # is simply absent from the map.  Membership, not the primary: a task
+        # linked to several projects belongs to every client among them.
         matched = [
             tasks[ref.get("task_id", "")]
             for ref in task_refs
@@ -441,24 +444,48 @@ def _tracker_candidates(
         matched = [
             task
             for task in matched
-            if task.get("client_id") == client_id
-            and (not project_filter or task.get("project_id") in project_filter)
+            if client_id in task_client_ids(task)
+            and (
+                not project_filter
+                or any(pid in project_filter for pid in task_project_ids(task))
+            )
         ]
         if matched:
             resolved.append((doc, data, matched))
     return resolved
 
 
-def _single_project_id(task_datas) -> Optional[str]:
+def _tracker_projects(task_datas, client_id: str, project_filter: set) -> dict:
     """
-    Return the one project every task shares, or None when they differ.
+    The union of every task's projects that can bill on this invoice, keyed by
+    project id in first-seen order: projects of this client (an entry whose
+    client is unknown is kept) and inside the project filter when one is set.
+    """
+    union: dict = {}
+    for task in task_datas:
+        for project in task_projects(task):
+            if project["client_id"] and project["client_id"] != client_id:
+                continue
+            if project_filter and project["project_id"] not in project_filter:
+                continue
+            union.setdefault(project["project_id"], project)
+    return union
 
-    A tracker spanning two projects has no single project to bill under, so its
-    line carries none and the rate falls back to the client's.
+
+def _single_project_id(
+    task_datas, client_id: str = "", project_filter: Optional[set] = None
+) -> Optional[str]:
     """
-    project_ids = {task.get("project_id") for task in task_datas}
-    if len(project_ids) == 1:
-        return next(iter(project_ids)) or None
+    Return the one project a tracker's tasks bill under, or None.
+
+    Takes the union of every task's ``project_ids`` (see ``_tracker_projects``
+    for the client/filter narrowing).  Exactly one project in that union → it;
+    otherwise a tracker spanning two projects has no single project to bill
+    under, so its line carries none and the rate falls back to the client's.
+    """
+    union = _tracker_projects(task_datas, client_id, project_filter or set())
+    if len(union) == 1:
+        return next(iter(union)) or None
     return None
 
 
@@ -1249,7 +1276,10 @@ async def preview_invoice(
     projects = _fetch_projects(
         db,
         [key[1] for key in groups]
-        + [_single_project_id(tasks) for _, _, tasks in tracker_candidates],
+        + [
+            _single_project_id(tasks, payload.client_id, project_filter)
+            for _, _, tasks in tracker_candidates
+        ],
     )
     settings_default_rate = settings_data.get("default_rate")
 
@@ -1286,14 +1316,13 @@ async def preview_invoice(
         if not payload.include_invoiced and claim_ids:
             continue
 
-        project_id = _single_project_id(task_datas)
-        project_name = next(
-            (
-                task.get("project_name", "")
-                for task in task_datas
-                if project_id and task.get("project_id") == project_id
-            ),
-            "",
+        project_id = _single_project_id(task_datas, payload.client_id, project_filter)
+        project_name = (
+            _tracker_projects(task_datas, payload.client_id, project_filter)
+            .get(project_id, {})
+            .get("project_name", "")
+            if project_id
+            else ""
         )
 
         title = data.get("title", "")

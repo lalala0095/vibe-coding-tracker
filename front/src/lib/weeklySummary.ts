@@ -21,7 +21,9 @@
 // `project_id` — which is exactly the hop `bill_tracker` makes on the server
 // (`_resolve_tracker_tasks`, which re-reads the tasks precisely because "a time
 // entry needs project_id and client_id, which the TaskRef does not carry").
-// `summariseWeeks` therefore takes the task list and makes the same hop.
+// `summariseWeeks` therefore takes the task list and makes the same hop. A task
+// linked to several projects prices through its PRIMARY one (`project_ids[0]`,
+// falling back to `project_id`) — the same choice `bill_tracker` makes.
 //
 // When the task has been deleted, the TaskRef's `project_name` + `client_name`
 // are tried against the loaded projects as a fallback. When neither resolves,
@@ -741,7 +743,9 @@ export function summariseWeeks({
     for (const share of contribution.shares) {
       const task = taskById.get(share.task_id) ?? null;
       const project =
-        (task ? projectById.get(task.project_id) : null) ??
+        // The PRIMARY project, as `bill_tracker` chooses for a multi-project
+        // task; `project_id` covers a server that predates `project_ids`.
+        (task ? projectById.get(task.project_ids?.[0] ?? task.project_id) : null) ??
         projectByName.get(`${share.client_name} ${share.project_name}`) ??
         null;
       const client = project ? clientById.get(project.client_id) ?? null : null;
