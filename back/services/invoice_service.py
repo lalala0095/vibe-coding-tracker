@@ -270,7 +270,8 @@ def next_sequence(
     advances by one.
 
     Args:
-        counter_data: The stored ``settings/invoice_counter`` dict, or None.
+        counter_data: The stored ``settings/invoice_counter_<owner_id>`` dict,
+            or None.
         year: The year the invoice is being numbered under.
         reset_sequence_yearly: Whether the sequence restarts each year.
 
@@ -301,6 +302,7 @@ def format_invoice_number(prefix: str, year: int, seq: int) -> str:
 def _allocate_number(
     transaction,
     counter_ref,
+    owner_id: str,
     prefix: str,
     year: int,
     reset_sequence_yearly: bool,
@@ -315,19 +317,35 @@ def _allocate_number(
     counter_data = snapshot.to_dict() if snapshot.exists else None
 
     seq = next_sequence(counter_data, year, reset_sequence_yearly)
-    transaction.set(counter_ref, {"year": year, "seq": seq})
+    transaction.set(counter_ref, {"owner_id": owner_id, "year": year, "seq": seq})
 
     return format_invoice_number(prefix, year, seq)
 
 
-def assign_invoice_number(db, settings_data: Optional[dict] = None) -> str:
+def invoice_counter_doc_id(owner_id: str) -> str:
     """
-    Allocate the next invoice number, transactionally.
+    The per-user invoice number counter: ``settings/invoice_counter_<owner_id>``.
+
+    Each user numbers their own invoices from 1; the old global
+    ``settings/invoice_counter`` is read by nobody (the backfill copies it).
+    Same ``<kind>_<owner_id>`` shape as ``routers.settings.settings_doc_id``.
+    """
+    if not owner_id:
+        raise ValueError("owner_id is required for the invoice counter.")
+    return f"invoice_counter_{owner_id}"
+
+
+def assign_invoice_number(
+    db, owner_id: str, settings_data: Optional[dict] = None
+) -> str:
+    """
+    Allocate the caller's next invoice number, transactionally.
 
     Args:
         db: Firestore client.
-        settings_data: The ``settings/invoice`` dict, supplying
-            ``invoice_prefix`` and ``reset_sequence_yearly``.
+        owner_id: The signed-in user's ``sub``; selects their own counter.
+        settings_data: The caller's ``settings/invoice_<owner_id>`` dict,
+            supplying ``invoice_prefix`` and ``reset_sequence_yearly``.
 
     Returns:
         The allocated invoice number, e.g. ``INV-2026-013``.
@@ -337,11 +355,11 @@ def assign_invoice_number(db, settings_data: Optional[dict] = None) -> str:
     reset_sequence_yearly = settings_data.get("reset_sequence_yearly", True)
     year = datetime.now(tz=SGT).year
 
-    counter_ref = db.collection("settings").document("invoice_counter")
+    counter_ref = db.collection("settings").document(invoice_counter_doc_id(owner_id))
     transaction = db.transaction()
 
     return _allocate_number(
-        transaction, counter_ref, prefix, year, reset_sequence_yearly
+        transaction, counter_ref, owner_id, prefix, year, reset_sequence_yearly
     )
 
 
@@ -377,7 +395,7 @@ def build_issued_by(settings_data: Optional[dict]) -> dict:
     Build the issuer block snapshotted onto an invoice at creation.
 
     Args:
-        settings_data: The ``settings/invoice`` dict, or None.
+        settings_data: The caller's ``settings/invoice_<owner_id>`` dict, or None.
 
     Returns:
         A dict with ``business_name``, ``contact_name``, ``address``, and

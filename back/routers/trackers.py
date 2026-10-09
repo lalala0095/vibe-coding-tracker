@@ -5,10 +5,15 @@ import pytz
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from auth import get_current_user
+from auth import get_current_user, owner_id_of
 from routers.sessions import SessionResponse, _doc_to_session
 from routers.tasks import build_project_fields, task_primary_project
-from services.firestore_service import get_firestore_client
+from services.firestore_service import (
+    get_firestore_client,
+    get_owned_doc,
+    get_owned_docs,
+    owned_query,
+)
 
 router = APIRouter(prefix="/trackers", tags=["trackers"])
 
@@ -215,7 +220,7 @@ def _validate_task_priority(value: str) -> str:
     return value
 
 
-def _existing_tracker_task_ids(db, tracker_id: str) -> set:
+def _existing_tracker_task_ids(db, tracker_id: str, owner_id: str) -> set:
     """
     Return the task ids that already have a time entry for this tracker.
 
@@ -223,18 +228,20 @@ def _existing_tracker_task_ids(db, tracker_id: str) -> set:
     what the first one wrote.  Entries the user has since deleted are billed
     again, which is the intent.
     """
-    docs = db.collection("sessions").where("tracker_id", "==", tracker_id).stream()
+    docs = (
+        owned_query(db, "sessions", owner_id)
+        .where("tracker_id", "==", tracker_id)
+        .stream()
+    )
     return {(doc.to_dict() or {}).get("task_id") for doc in docs}
 
 
-def _fetch_task_ref(db, task_id: str) -> dict:
-    """Fetch a task and return its denormalized fields. Raises 404 if not found."""
-    doc = db.collection("tasks").document(task_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task '{task_id}' not found.",
-        )
+def _fetch_task_ref(db, task_id: str, owner_id: str) -> dict:
+    """
+    Fetch one of the caller's tasks and return its denormalized fields.
+    Raises 404 if the task does not exist or is not theirs.
+    """
+    doc = get_owned_doc(db, "tasks", task_id, owner_id, "Task")
     data = doc.to_dict() or {}
     # A TaskRef has room for one project; it shows the task's primary, the
     # same project ``bill_tracker`` bills the span under.
@@ -247,12 +254,14 @@ def _fetch_task_ref(db, task_id: str) -> dict:
     }
 
 
-def _resolve_tracker_tasks(db, task_refs: list[dict]) -> list[tuple[str, dict]]:
+def _resolve_tracker_tasks(
+    db, task_refs: list[dict], owner_id: str
+) -> list[tuple[str, dict]]:
     """
     Resolve a tracker's TaskRefs to live task documents in one round trip.
 
-    Returns ``[(task_id, task_data), ...]`` for the tasks that still exist, in
-    the order they appear on the tracker.  Deleting a task does not strip its
+    Returns ``[(task_id, task_data), ...]`` for the tasks that still exist and
+    belong to ``owner_id``, in the order they appear on the tracker.  Deleting a task does not strip its
     TaskRef from ``tracker.tasks``, so a tracker routinely points at documents
     that are gone; those are dropped here rather than by the caller.
 
@@ -260,15 +269,7 @@ def _resolve_tracker_tasks(db, task_refs: list[dict]) -> list[tuple[str, dict]]:
     were passed, hence the id-keyed map and the re-walk of ``task_refs``.
     """
     ordered_ids = [t.get("task_id", "") for t in task_refs]
-    unique_ids = [tid for tid in dict.fromkeys(ordered_ids) if tid]
-    if not unique_ids:
-        return []
-
-    refs = [db.collection("tasks").document(tid) for tid in unique_ids]
-    tasks: dict = {}
-    for snapshot in db.get_all(refs):
-        if snapshot.exists:
-            tasks[snapshot.id] = snapshot.to_dict() or {}
+    tasks = get_owned_docs(db, "tasks", ordered_ids, owner_id)
 
     return [(tid, tasks[tid]) for tid in ordered_ids if tid in tasks]
 
@@ -290,11 +291,9 @@ async def list_trackers(
     - ``active_only=false`` – only completed trackers.
     """
     db = get_firestore_client()
-    docs = list(
-        db.collection("trackers")
-        .order_by("start_time", direction="DESCENDING")
-        .stream()
-    )
+    # Sorted in Python: owner_id == plus order_by would need a composite index.
+    docs = list(owned_query(db, "trackers", owner_id_of(_user)).stream())
+    docs.sort(key=lambda d: (d.to_dict() or {}).get("start_time", ""), reverse=True)
     trackers = [_doc_to_tracker(doc) for doc in docs]
     if active_only is True:
         trackers = [t for t in trackers if t.end_time is None]
@@ -310,12 +309,7 @@ async def get_tracker(
 ) -> TrackerResponse:
     """Return a single tracker by its Firestore document ID."""
     db = get_firestore_client()
-    doc = db.collection("trackers").document(tracker_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tracker '{tracker_id}' not found.",
-        )
+    doc = get_owned_doc(db, "trackers", tracker_id, owner_id_of(_user), "Tracker")
     return _doc_to_tracker(doc)
 
 
@@ -339,13 +333,16 @@ async def create_tracker(
     A tracker on its own carries no billable time; giving it a task is what
     makes its hours reachable from an invoice.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
 
     # Validate everything before writing anything, so a bad request cannot
     # leave a half-created task/tracker pair behind.
     new_task_project: Optional[dict] = None
     if payload.new_task is not None:
-        new_task_project = build_project_fields(db, [payload.new_task.project_id])
+        new_task_project = build_project_fields(
+            db, [payload.new_task.project_id], owner_id
+        )
         _validate_task_status(payload.new_task.status)
         _validate_task_priority(payload.new_task.priority)
 
@@ -354,7 +351,7 @@ async def create_tracker(
     for task_id in payload.task_ids:
         if task_id in seen_ids:
             continue
-        task_refs.append(_fetch_task_ref(db, task_id))
+        task_refs.append(_fetch_task_ref(db, task_id, owner_id))
         seen_ids.add(task_id)
 
     now = _now_sgt()
@@ -365,6 +362,7 @@ async def create_tracker(
         new_task_title = (payload.new_task.title or "").strip() or payload.title
         new_task_ref.set(
             {
+                "owner_id": owner_id,
                 "title": new_task_title,
                 "description": payload.notes or "",
                 **new_task_project,
@@ -391,6 +389,7 @@ async def create_tracker(
     try:
         _, doc_ref = db.collection("trackers").add(
             {
+                "owner_id": owner_id,
                 "title": payload.title,
                 "start_time": payload.start_time,
                 "end_time": payload.end_time,
@@ -425,14 +424,10 @@ async def update_tracker(
     Pass ``end_time=null`` as the literal string ``"null"`` to clear it
     (mark tracker as active again).  Only non-None fields are updated.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref = db.collection("trackers").document(tracker_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tracker '{tracker_id}' not found.",
-        )
+    doc = get_owned_doc(db, "trackers", tracker_id, owner_id, "Tracker")
+    doc_ref = doc.reference
 
     updates: dict = {}
 
@@ -467,14 +462,10 @@ async def add_tasks_to_tracker(
 
     Duplicate task IDs (already present) are silently ignored.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref = db.collection("trackers").document(tracker_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tracker '{tracker_id}' not found.",
-        )
+    doc = get_owned_doc(db, "trackers", tracker_id, owner_id, "Tracker")
+    doc_ref = doc.reference
 
     existing_tasks: list[dict] = doc.to_dict().get("tasks", [])
     existing_ids = {t["task_id"] for t in existing_tasks}
@@ -483,7 +474,7 @@ async def add_tasks_to_tracker(
     for task_id in payload.task_ids:
         if task_id in existing_ids:
             continue
-        new_refs.append(_fetch_task_ref(db, task_id))
+        new_refs.append(_fetch_task_ref(db, task_id, owner_id))
         existing_ids.add(task_id)
 
     if new_refs:
@@ -535,14 +526,9 @@ async def bill_tracker(
     """
     _validate_split(payload.split)
 
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref = db.collection("trackers").document(tracker_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tracker '{tracker_id}' not found.",
-        )
+    doc = get_owned_doc(db, "trackers", tracker_id, owner_id, "Tracker")
 
     data = doc.to_dict() or {}
     tracker_tasks: list[dict] = data.get("tasks", [])
@@ -573,7 +559,7 @@ async def bill_tracker(
             )
         total_hours = derived
 
-    already_billed = _existing_tracker_task_ids(db, tracker_id)
+    already_billed = _existing_tracker_task_ids(db, tracker_id, owner_id)
     pending = [t for t in tracker_tasks if t.get("task_id") not in already_billed]
     if not pending:
         return []
@@ -587,7 +573,7 @@ async def bill_tracker(
     # carry.  Do not move the split back above this call.  A task linked to
     # several projects bills the span under its PRIMARY project (index 0 of
     # ``project_ids``) — the same choice the weekly summary prices with.
-    resolved = _resolve_tracker_tasks(db, pending)
+    resolved = _resolve_tracker_tasks(db, pending, owner_id)
     if not resolved:
         return []
 
@@ -599,6 +585,7 @@ async def bill_tracker(
         primary = task_primary_project(task_data)
         _, session_ref = db.collection("sessions").add(
             {
+                "owner_id": owner_id,
                 "task_id": task_id,
                 "task_title": task_data.get("title", ""),
                 "project_id": primary["project_id"],
@@ -633,14 +620,10 @@ async def remove_task_from_tracker(
     _user: Annotated[dict, Depends(get_current_user)],
 ) -> TrackerResponse:
     """Remove a task from a tracker's task list."""
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref = db.collection("trackers").document(tracker_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tracker '{tracker_id}' not found.",
-        )
+    doc = get_owned_doc(db, "trackers", tracker_id, owner_id, "Tracker")
+    doc_ref = doc.reference
 
     existing_tasks: list[dict] = doc.to_dict().get("tasks", [])
     filtered = [t for t in existing_tasks if t["task_id"] != task_id]
@@ -662,12 +645,8 @@ async def delete_tracker(
     _user: Annotated[dict, Depends(get_current_user)],
 ) -> None:
     """Delete a tracker. Does not cascade to sessions."""
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref = db.collection("trackers").document(tracker_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tracker '{tracker_id}' not found.",
-        )
+    doc = get_owned_doc(db, "trackers", tracker_id, owner_id, "Tracker")
+    doc_ref = doc.reference
     doc_ref.delete()

@@ -2,11 +2,11 @@ from datetime import datetime
 from typing import Annotated, Optional
 
 import pytz
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel
 
-from auth import get_current_user
-from services.firestore_service import get_firestore_client
+from auth import get_current_user, owner_id_of
+from services.firestore_service import get_firestore_client, get_owned_doc, owned_query
 
 router = APIRouter(prefix="/clients", tags=["clients"])
 
@@ -75,9 +75,13 @@ def _doc_to_client(doc) -> ClientResponse:
 async def list_clients(
     _user: Annotated[dict, Depends(get_current_user)],
 ) -> list[ClientResponse]:
-    """Return all clients sorted by name ascending."""
+    """Return the caller's clients sorted by name ascending."""
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    docs = db.collection("clients").order_by("name").stream()
+    # Owner filter in Firestore, sort in Python — owner_id == plus order_by on
+    # another field would need a composite index.
+    docs = list(owned_query(db, "clients", owner_id).stream())
+    docs.sort(key=lambda d: (d.to_dict() or {}).get("name", ""))
     return [_doc_to_client(doc) for doc in docs]
 
 
@@ -88,12 +92,7 @@ async def get_client(
 ) -> ClientResponse:
     """Return a single client by its Firestore document ID."""
     db = get_firestore_client()
-    doc = db.collection("clients").document(client_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Client '{client_id}' not found.",
-        )
+    doc = get_owned_doc(db, "clients", client_id, owner_id_of(_user), "Client")
     return _doc_to_client(doc)
 
 
@@ -111,9 +110,11 @@ async def create_client(
     - ``billing_email``   – (optional) email used for billing.
     - ``billing_address`` – (optional) multi-line address used in invoice Bill-To.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
     _, doc_ref = db.collection("clients").add(
         {
+            "owner_id": owner_id,
             "name": payload.name,
             "default_rate": payload.default_rate,
             "currency": payload.currency,
@@ -142,13 +143,8 @@ async def update_client(
     - Only fields present in the payload are updated.
     """
     db = get_firestore_client()
-    doc_ref = db.collection("clients").document(client_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Client '{client_id}' not found.",
-        )
+    doc = get_owned_doc(db, "clients", client_id, owner_id_of(_user), "Client")
+    doc_ref = doc.reference
 
     updates: dict = {}
 
@@ -189,11 +185,6 @@ async def delete_client(
 ) -> None:
     """Delete a client entry. Does not cascade to related projects or tasks."""
     db = get_firestore_client()
-    doc_ref = db.collection("clients").document(client_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Client '{client_id}' not found.",
-        )
+    doc = get_owned_doc(db, "clients", client_id, owner_id_of(_user), "Client")
+    doc_ref = doc.reference
     doc_ref.delete()

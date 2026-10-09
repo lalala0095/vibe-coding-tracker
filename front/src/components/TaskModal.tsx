@@ -277,10 +277,11 @@ export default function TaskModal({ task, projects, onClose, onUpdated, onDelete
                     Attachments ({task.attachments.length})
                   </p>
                   <ul className="flex flex-col gap-1.5">
-                    {task.attachments.map((att) => (
-                      <li key={att.gcs_url}>
+                    {task.attachments.map((att, i) => (
+                      <li key={i}>
                         <a
-                          href={att.gcs_url}
+                          href={att.gcs_url ?? undefined}
+                          title={att.gcs_url ? undefined : 'Link unavailable, reload to retry'}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="flex items-center gap-2 px-3 py-2 bg-slate-800 rounded-lg text-sm

@@ -2,11 +2,11 @@ from datetime import datetime
 from typing import Annotated, Optional
 
 import pytz
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel
 
-from auth import get_current_user
-from services.firestore_service import get_firestore_client
+from auth import get_current_user, owner_id_of
+from services.firestore_service import get_firestore_client, get_owned_doc, owned_query
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -60,14 +60,9 @@ def _doc_to_project(doc) -> ProjectResponse:
     )
 
 
-def _fetch_client_name(db, client_id: str) -> str:
-    """Fetch the client name from Firestore. Raises 404 if not found."""
-    doc = db.collection("clients").document(client_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Client '{client_id}' not found.",
-        )
+def _fetch_client_name(db, client_id: str, owner_id: str) -> str:
+    """Fetch the caller's client name. Raises 404 if missing or not theirs."""
+    doc = get_owned_doc(db, "clients", client_id, owner_id, "Client")
     return (doc.to_dict() or {}).get("name", "")
 
 
@@ -81,17 +76,16 @@ async def list_projects(
     _user: Annotated[dict, Depends(get_current_user)],
     client_id: Optional[str] = None,
 ) -> list[ProjectResponse]:
-    """Return all projects, optionally filtered by client_id, sorted by name."""
+    """Return the caller's projects, optionally filtered by client_id, sorted by name."""
     db = get_firestore_client()
-    query = db.collection("projects")
+    query = owned_query(db, "projects", owner_id_of(_user))
 
-    # Apply the equality filter in Firestore and sort in Python, rather than
+    # Apply the equality filters in Firestore and sort in Python, rather than
     # combining where() with order_by() — that pairing needs a composite index.
     if client_id is not None:
-        docs = list(query.where("client_id", "==", client_id).stream())
-        docs.sort(key=lambda d: (d.to_dict() or {}).get("name", ""))
-    else:
-        docs = list(query.order_by("name").stream())
+        query = query.where("client_id", "==", client_id)
+    docs = list(query.stream())
+    docs.sort(key=lambda d: (d.to_dict() or {}).get("name", ""))
 
     return [_doc_to_project(doc) for doc in docs]
 
@@ -103,12 +97,7 @@ async def get_project(
 ) -> ProjectResponse:
     """Return a single project by its Firestore document ID."""
     db = get_firestore_client()
-    doc = db.collection("projects").document(project_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project '{project_id}' not found.",
-        )
+    doc = get_owned_doc(db, "projects", project_id, owner_id_of(_user), "Project")
     return _doc_to_project(doc)
 
 
@@ -126,11 +115,13 @@ async def create_project(
     ``rate`` is an optional hourly rate that overrides the client default when
     an invoice line is built.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    client_name = _fetch_client_name(db, payload.client_id)
+    client_name = _fetch_client_name(db, payload.client_id, owner_id)
 
     _, doc_ref = db.collection("projects").add(
         {
+            "owner_id": owner_id,
             "name": payload.name,
             "client_id": payload.client_id,
             "client_name": client_name,
@@ -156,14 +147,10 @@ async def update_project(
     clear the project rate so it falls back to the client default; omitting it
     leaves the rate unchanged.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref = db.collection("projects").document(project_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project '{project_id}' not found.",
-        )
+    doc = get_owned_doc(db, "projects", project_id, owner_id, "Project")
+    doc_ref = doc.reference
 
     updates: dict = {}
 
@@ -171,7 +158,7 @@ async def update_project(
         updates["name"] = payload.name
 
     if payload.client_id is not None:
-        client_name = _fetch_client_name(db, payload.client_id)
+        client_name = _fetch_client_name(db, payload.client_id, owner_id)
         updates["client_id"] = payload.client_id
         updates["client_name"] = client_name
 
@@ -194,11 +181,5 @@ async def delete_project(
 ) -> None:
     """Delete a project entry. Does not cascade to related tasks."""
     db = get_firestore_client()
-    doc_ref = db.collection("projects").document(project_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project '{project_id}' not found.",
-        )
-    doc_ref.delete()
+    doc = get_owned_doc(db, "projects", project_id, owner_id_of(_user), "Project")
+    doc.reference.delete()

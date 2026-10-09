@@ -5,9 +5,9 @@ import pytz
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from auth import get_current_user
+from auth import get_current_user, owner_id_of
 from routers.tasks import task_projects
-from services.firestore_service import get_firestore_client
+from services.firestore_service import get_firestore_client, get_owned_doc, owned_query
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -195,6 +195,7 @@ def _doc_to_session(doc) -> SessionResponse:
 def _fetch_task_fields(
     db,
     task_id: str,
+    owner_id: str,
     project_id: Optional[str] = None,
     keep_project_id: Optional[str] = None,
 ) -> dict:
@@ -208,14 +209,9 @@ def _fetch_task_fields(
     - else ``keep_project_id`` (the entry's current project) when the task has it;
     - else the task's primary project.
 
-    Raises 404 if the task does not exist.
+    Raises 404 if the task does not exist or is not the caller's.
     """
-    doc = db.collection("tasks").document(task_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task '{task_id}' not found.",
-        )
+    doc = get_owned_doc(db, "tasks", task_id, owner_id, "Task")
     data = doc.to_dict() or {}
     projects = task_projects(data)
     by_id = {p["project_id"]: p for p in projects}
@@ -253,14 +249,9 @@ def _clean_project_id(value: Optional[str]) -> Optional[str]:
     return text
 
 
-def _validate_tracker(db, tracker_id: str) -> None:
-    """Raise 404 if the tracker does not exist."""
-    doc = db.collection("trackers").document(tracker_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tracker '{tracker_id}' not found.",
-        )
+def _validate_tracker(db, tracker_id: str, owner_id: str) -> None:
+    """Raise 404 if the tracker does not exist or is not the caller's."""
+    get_owned_doc(db, "trackers", tracker_id, owner_id, "Tracker")
 
 
 # ---------------------------------------------------------------------------
@@ -294,11 +285,12 @@ async def list_sessions(
     - ``uninvoiced_only`` – when true, drop sessions already on an invoice.
     """
     db = get_firestore_client()
-    query = db.collection("sessions")
+    query = owned_query(db, "sessions", owner_id_of(_user))
 
-    # Apply a single equality filter in Firestore — most selective first — to
-    # avoid a composite index requirement; every remaining filter and the sort
-    # are applied in Python.
+    # Apply the owner filter plus at most one more equality filter in Firestore
+    # — most selective first — to avoid a composite index requirement (equality
+    # filters alone merge single-field indexes); every remaining filter and the
+    # sort are applied in Python.
     equality_filters = (
         ("task_id", task_id),
         ("tracker_id", tracker_id),
@@ -313,7 +305,9 @@ async def list_sessions(
             docs = list(query.where(field, "==", value).stream())
             break
     if docs is None:
-        docs = list(query.order_by("start_time", direction="DESCENDING").stream())
+        # Sorted below in Python: owner_id == plus order_by would need a
+        # composite index.
+        docs = list(query.stream())
 
     remaining_filters = [
         (field, value)
@@ -357,12 +351,7 @@ async def get_session(
 ) -> SessionResponse:
     """Return a single session by its Firestore document ID."""
     db = get_firestore_client()
-    doc = db.collection("sessions").document(session_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session '{session_id}' not found.",
-        )
+    doc = get_owned_doc(db, "sessions", session_id, owner_id_of(_user), "Session")
     return _doc_to_session(doc)
 
 
@@ -392,18 +381,20 @@ async def create_session(
     ``effective_hours`` resolves ``hours`` against it.  ``invoice_id`` and
     ``invoice_number`` are written only by the invoices router.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
 
     task_fields = _fetch_task_fields(
-        db, payload.task_id, _clean_project_id(payload.project_id)
+        db, payload.task_id, owner_id, _clean_project_id(payload.project_id)
     )
 
     if payload.tracker_id:
-        _validate_tracker(db, payload.tracker_id)
+        _validate_tracker(db, payload.tracker_id, owner_id)
 
     now = _now_sgt()
     _, doc_ref = db.collection("sessions").add(
         {
+            "owner_id": owner_id,
             "task_id": payload.task_id,
             **task_fields,
             "tracker_id": payload.tracker_id,
@@ -450,14 +441,10 @@ async def update_session(
     already carrying an ``invoice_id`` stays fully editable — only a negative
     value is refused.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref = db.collection("sessions").document(session_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session '{session_id}' not found.",
-        )
+    doc = get_owned_doc(db, "sessions", session_id, owner_id, "Session")
+    doc_ref = doc.reference
 
     existing = doc.to_dict() or {}
     updates: dict = {}
@@ -465,7 +452,7 @@ async def update_session(
     new_project_id = _clean_project_id(payload.project_id)
     if payload.task_id is not None:
         task_fields = _fetch_task_fields(
-            db, payload.task_id, new_project_id, existing.get("project_id")
+            db, payload.task_id, owner_id, new_project_id, existing.get("project_id")
         )
         updates["task_id"] = payload.task_id
         updates.update(task_fields)
@@ -475,7 +462,9 @@ async def update_session(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Send 'task_id' with 'project_id': this entry has no task.",
             )
-        task_fields = _fetch_task_fields(db, existing["task_id"], new_project_id)
+        task_fields = _fetch_task_fields(
+            db, existing["task_id"], owner_id, new_project_id
+        )
         for key in ("project_id", "project_name", "client_id", "client_name"):
             updates[key] = task_fields[key]
 
@@ -498,7 +487,7 @@ async def update_session(
         if payload.tracker_id.lower() == "null":
             updates["tracker_id"] = None
         else:
-            _validate_tracker(db, payload.tracker_id)
+            _validate_tracker(db, payload.tracker_id, owner_id)
             updates["tracker_id"] = payload.tracker_id
 
     if updates:
@@ -516,11 +505,5 @@ async def delete_session(
 ) -> None:
     """Delete a session."""
     db = get_firestore_client()
-    doc_ref = db.collection("sessions").document(session_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session '{session_id}' not found.",
-        )
-    doc_ref.delete()
+    doc = get_owned_doc(db, "sessions", session_id, owner_id_of(_user), "Session")
+    doc.reference.delete()

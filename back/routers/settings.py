@@ -7,14 +7,16 @@ import pytz
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from auth import get_current_user
+from auth import get_current_user, owner_id_of
 from services.firestore_service import get_firestore_client
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 SGT = pytz.timezone("Asia/Singapore")
 
-# The singleton document holding issuer details and invoice defaults.
+# The per-user document holding issuer details and invoice defaults lives at
+# ``settings/invoice_<owner_id>`` (see ``settings_doc_id``).  The bare id was the
+# pre-multi-user global singleton; ``scripts/backfill_owner_id.py`` copies it.
 SETTINGS_DOC_ID = "invoice"
 
 DEFAULT_SETTINGS: dict = {
@@ -59,7 +61,7 @@ MAX_ROUNDING_INCREMENT = 24.0
 # type.  Letters only — a code with a digit or a space in it is a typo.
 CURRENCY_CODE_RE = re.compile(r"^[A-Z]{2,5}$")
 
-# The singleton document holding tracker defaults.
+# The per-user document holding tracker defaults: ``settings/tracker_<owner_id>``.
 TRACKER_SETTINGS_DOC_ID = "tracker"
 
 DEFAULT_TRACKER_SETTINGS: dict = {
@@ -154,6 +156,37 @@ class TrackerSettingsResponse(BaseModel):
 def _now_sgt() -> str:
     """Return current datetime as ISO-8601 string in Singapore time (UTC+8)."""
     return datetime.now(tz=SGT).isoformat()
+
+
+def settings_doc_id(kind: str, owner_id: str) -> str:
+    """
+    Return the per-user settings document id, e.g. ``invoice_<owner_id>``.
+
+    Each signed-in user has their own settings documents; the old global
+    singletons (``invoice``, ``tracker``, ``invoice_counter``) are read by
+    nobody.  Shared with the invoice number allocator and the backfill script.
+    """
+    if not owner_id:
+        raise ValueError("owner_id is required for a settings document.")
+    return f"{kind}_{owner_id}"
+
+
+def _get_or_create_settings(db, kind: str, owner_id: str, defaults: dict) -> dict:
+    """Read a per-user settings document, creating it from ``defaults`` if absent."""
+    doc_ref = db.collection("settings").document(settings_doc_id(kind, owner_id))
+    doc = doc_ref.get()
+    if doc.exists:
+        return doc.to_dict() or {}
+
+    now = _now_sgt()
+    data = {
+        **defaults,
+        "owner_id": owner_id,
+        "datetime_inserted": now,
+        "datetime_updated": now,
+    }
+    doc_ref.set(data)
+    return data
 
 
 def _data_to_settings(data: dict) -> InvoiceSettingsResponse:
@@ -286,32 +319,22 @@ def _validate_payout_currency(value: str) -> str:
     return normalised
 
 
-def get_invoice_settings(db) -> dict:
+def get_invoice_settings(db, owner_id: str) -> dict:
     """
-    Return the invoice settings document, creating it with defaults if absent.
+    Return the caller's invoice settings document, creating it with defaults
+    if absent.
 
     Shared with the invoice router, which needs the issuer snapshot and the
     numbering defaults without going through the HTTP layer.
 
     Args:
         db: Firestore client.
+        owner_id: The signed-in user's ``sub``.
 
     Returns:
         The raw settings dict.
     """
-    doc_ref = db.collection("settings").document(SETTINGS_DOC_ID)
-    doc = doc_ref.get()
-    if doc.exists:
-        return doc.to_dict() or {}
-
-    now = _now_sgt()
-    data = {
-        **DEFAULT_SETTINGS,
-        "datetime_inserted": now,
-        "datetime_updated": now,
-    }
-    doc_ref.set(data)
-    return data
+    return _get_or_create_settings(db, SETTINGS_DOC_ID, owner_id, DEFAULT_SETTINGS)
 
 
 def _data_to_tracker_settings(data: dict) -> TrackerSettingsResponse:
@@ -393,32 +416,24 @@ def _validate_name_template(value: str) -> str:
     return value
 
 
-def get_tracker_settings(db) -> dict:
+def get_tracker_settings(db, owner_id: str) -> dict:
     """
-    Return the tracker settings document, creating it with defaults if absent.
+    Return the caller's tracker settings document, creating it with defaults
+    if absent.
 
     Mirrors :func:`get_invoice_settings` so callers that need the naming
     defaults can read them without going through the HTTP layer.
 
     Args:
         db: Firestore client.
+        owner_id: The signed-in user's ``sub``.
 
     Returns:
         The raw settings dict.
     """
-    doc_ref = db.collection("settings").document(TRACKER_SETTINGS_DOC_ID)
-    doc = doc_ref.get()
-    if doc.exists:
-        return doc.to_dict() or {}
-
-    now = _now_sgt()
-    data = {
-        **DEFAULT_TRACKER_SETTINGS,
-        "datetime_inserted": now,
-        "datetime_updated": now,
-    }
-    doc_ref.set(data)
-    return data
+    return _get_or_create_settings(
+        db, TRACKER_SETTINGS_DOC_ID, owner_id, DEFAULT_TRACKER_SETTINGS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -431,12 +446,12 @@ async def get_settings(
     _user: Annotated[dict, Depends(get_current_user)],
 ) -> InvoiceSettingsResponse:
     """
-    Return the invoice settings singleton.
+    Return the caller's invoice settings.
 
     The document is created with defaults on first read, so this never 404s.
     """
     db = get_firestore_client()
-    return _data_to_settings(get_invoice_settings(db))
+    return _data_to_settings(get_invoice_settings(db, owner_id_of(_user)))
 
 
 @router.put("/invoice", response_model=InvoiceSettingsResponse)
@@ -445,7 +460,7 @@ async def update_settings(
     _user: Annotated[dict, Depends(get_current_user)],
 ) -> InvoiceSettingsResponse:
     """
-    Update the invoice settings singleton.
+    Update the caller's invoice settings.
 
     - Creates the document with defaults first if it does not exist yet.
     - Pass ``logo_url="null"`` to clear the logo.
@@ -479,9 +494,12 @@ async def update_settings(
         else _validate_payout_currency(payload.payout_currency)
     )
 
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref = db.collection("settings").document(SETTINGS_DOC_ID)
-    get_invoice_settings(db)  # Ensure the document exists before updating.
+    doc_ref = db.collection("settings").document(
+        settings_doc_id(SETTINGS_DOC_ID, owner_id)
+    )
+    get_invoice_settings(db, owner_id)  # Ensure the document exists before updating.
 
     updates: dict = {}
 
@@ -532,12 +550,12 @@ async def get_tracker_settings_endpoint(
     _user: Annotated[dict, Depends(get_current_user)],
 ) -> TrackerSettingsResponse:
     """
-    Return the tracker settings singleton.
+    Return the caller's tracker settings.
 
     The document is created with defaults on first read, so this never 404s.
     """
     db = get_firestore_client()
-    return _data_to_tracker_settings(get_tracker_settings(db))
+    return _data_to_tracker_settings(get_tracker_settings(db, owner_id_of(_user)))
 
 
 @router.put("/tracker", response_model=TrackerSettingsResponse)
@@ -546,7 +564,7 @@ async def update_tracker_settings(
     _user: Annotated[dict, Depends(get_current_user)],
 ) -> TrackerSettingsResponse:
     """
-    Update the tracker settings singleton.
+    Update the caller's tracker settings.
 
     - Creates the document with defaults first if it does not exist yet.
     - Only fields present in the payload are updated.
@@ -561,9 +579,12 @@ async def update_tracker_settings(
     if payload.auto_name_template is not None:
         _validate_name_template(payload.auto_name_template)
 
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref = db.collection("settings").document(TRACKER_SETTINGS_DOC_ID)
-    get_tracker_settings(db)  # Ensure the document exists before updating.
+    doc_ref = db.collection("settings").document(
+        settings_doc_id(TRACKER_SETTINGS_DOC_ID, owner_id)
+    )
+    get_tracker_settings(db, owner_id)  # Ensure the document exists before updating.
 
     updates: dict = {}
 

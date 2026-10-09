@@ -5,7 +5,7 @@ export interface Model {
 
 export interface Attachment {
   name: string;
-  gcs_url: string;
+  gcs_url: string | null; // short-lived signed URL (about an hour); null if signing failed
 }
 
 export interface Goal {

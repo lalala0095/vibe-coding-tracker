@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 from datetime import datetime
 from typing import Annotated, Optional
 
@@ -9,9 +8,14 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from fastapi import status as http_status  # update_task shadows ``status`` with a form field
 from pydantic import BaseModel
 
-from auth import get_current_user
-from services.firestore_service import get_firestore_client
-from services.storage_service import delete_file, upload_file
+from auth import get_current_user, owner_id_of
+from services.firestore_service import get_firestore_client, get_owned_doc, owned_query
+from services.storage_service import (
+    delete_attachments,
+    owned_blob_name,
+    signed_attachments,
+    upload_file,
+)
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -26,7 +30,9 @@ logger = logging.getLogger(__name__)
 
 class AttachmentInfo(BaseModel):
     name: str
-    gcs_url: str
+    # A short-lived signed URL (the bucket is private), minted on every read.
+    # ``None`` when it could not be signed.  Never stored.
+    gcs_url: Optional[str] = None
 
 
 class TaskBulkCreate(BaseModel):
@@ -175,8 +181,10 @@ def task_primary_project(data: dict) -> dict:
 def _doc_to_task(doc) -> TaskResponse:
     data = doc.to_dict() or {}
     attachments = [
-        AttachmentInfo(name=a.get("name", ""), gcs_url=a.get("gcs_url", ""))
-        for a in data.get("attachments", [])
+        AttachmentInfo(**a)
+        for a in signed_attachments(
+            data.get("attachments", []), data.get("owner_id"), "tasks", doc.id
+        )
     ]
     projects = task_projects(data)
     primary = task_primary_project(data)
@@ -201,20 +209,15 @@ def _doc_to_task(doc) -> TaskResponse:
     )
 
 
-def _fetch_project(db, project_id: str) -> dict:
+def _fetch_project(db, project_id: str, owner_id: str) -> dict:
     """
-    Fetch a project document from Firestore.
+    Fetch one of the caller's project documents from Firestore.
 
     Returns a dict with keys: project_name, client_id, client_name.
-    Raises 404 if the project does not exist.
+    Raises 404 if the project does not exist or belongs to someone else.
     """
-    doc = db.collection("projects").document(project_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project '{project_id}' not found.",
-        )
-    data = doc.to_dict()
+    doc = get_owned_doc(db, "projects", project_id, owner_id, "Project")
+    data = doc.to_dict() or {}
     return {
         "project_name": data.get("name", ""),
         "client_id": data.get("client_id", ""),
@@ -280,15 +283,22 @@ def _require_project_ids(project_ids: Optional[list[str]], project_id: Optional[
     return ids
 
 
-def build_project_fields(db, project_ids: list[str]) -> dict:
+def _validate_parent_task(db, parent_task_id: Optional[str], owner_id: str) -> None:
+    """404 unless ``parent_task_id`` (when set) is one of the caller's tasks."""
+    if parent_task_id:
+        get_owned_doc(db, "tasks", parent_task_id, owner_id, "Task")
+
+
+def build_project_fields(db, project_ids: list[str], owner_id: str) -> dict:
     """
-    Fetch every project (404 on the first missing one) and return the stored
+    Fetch every project (404 on the first one that is missing or not the
+    caller's) and return the stored
     task fields: ``project_ids``, ``projects``, ``client_ids`` and the legacy
     scalars mirrored from the primary (index 0).
     """
     projects = []
     for pid in project_ids:
-        project_data = _fetch_project(db, pid)
+        project_data = _fetch_project(db, pid, owner_id)
         projects.append({"project_id": pid, **project_data})
     primary = projects[0]
     return {
@@ -305,7 +315,7 @@ def build_project_fields(db, project_ids: list[str]) -> dict:
 
 
 def _check_removed_projects_unused(
-    db, task_id: str, current: list[dict], new_ids: list[str]
+    db, task_id: str, owner_id: str, current: list[dict], new_ids: list[str]
 ) -> None:
     """
     Refuse (409) to unlink a project that time entries of this task still use.
@@ -318,7 +328,8 @@ def _check_removed_projects_unused(
     if not removed:
         return
     counts: dict = {}
-    for doc in db.collection("sessions").where("task_id", "==", task_id).stream():
+    sessions = owned_query(db, "sessions", owner_id).where("task_id", "==", task_id)
+    for doc in sessions.stream():
         pid = (doc.to_dict() or {}).get("project_id")
         if pid:
             counts[pid] = counts.get(pid, 0) + 1
@@ -335,15 +346,6 @@ def _check_removed_projects_unused(
             status_code=status.HTTP_409_CONFLICT,
             detail="; ".join(problems) + " — move them to another project first.",
         )
-
-
-def _blob_name_from_url(gcs_url: str, bucket_name: str) -> str:
-    """Extract the blob path from a public GCS URL."""
-    prefix = f"https://storage.googleapis.com/{bucket_name}/"
-    if gcs_url.startswith(prefix):
-        return gcs_url[len(prefix):]
-    # Fallback: strip everything up to the bucket name segment
-    return gcs_url.split(f"/{bucket_name}/", 1)[-1]
 
 
 def _sort_tasks(tasks: list[TaskResponse]) -> list[TaskResponse]:
@@ -388,7 +390,10 @@ async def list_tasks(
     ``datetime_inserted`` ascending.
     """
     db = get_firestore_client()
-    query = db.collection("tasks")
+    # Only equality filters go to Firestore (served by merging single-field
+    # indexes, so no composite index is needed); project membership is checked
+    # in Python below.
+    query = owned_query(db, "tasks", owner_id_of(_user))
 
     if parent_task_id is not None:
         if parent_task_id.lower() == "null":
@@ -402,19 +407,17 @@ async def list_tasks(
     if priority is not None:
         query = query.where("priority", "==", priority)
 
-    if project_id is None:
-        docs = list(query.stream())
-    else:
-        # Membership via ``array_contains`` on ``project_ids``.  The legacy
-        # scalar query is unioned in so a task written before the backfill
-        # (``scripts/backfill_task_projects.py``) still matches; the scalar
-        # always mirrors the primary, so the union never over-matches.
-        by_id: dict = {}
-        for doc in query.where("project_ids", "array_contains", project_id).stream():
-            by_id[doc.id] = doc
-        for doc in query.where("project_id", "==", project_id).stream():
-            by_id.setdefault(doc.id, doc)
-        docs = list(by_id.values())
+    docs = list(query.stream())
+    if project_id is not None:
+        # Membership in Python rather than ``array_contains``: combined with
+        # the owner equality filter that is not guaranteed to be servable
+        # without a composite index.  ``task_project_ids`` reads ``project_ids``
+        # and falls back to the legacy scalar, so a task written before
+        # ``scripts/backfill_task_projects.py`` still matches.
+        docs = [
+            doc for doc in docs
+            if project_id in task_project_ids(doc.to_dict() or {})
+        ]
 
     tasks = [_doc_to_task(doc) for doc in docs]
     return _sort_tasks(tasks)
@@ -427,12 +430,7 @@ async def get_task(
 ) -> TaskResponse:
     """Return a single task by its Firestore document ID."""
     db = get_firestore_client()
-    doc = db.collection("tasks").document(task_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task '{task_id}' not found.",
-        )
+    doc = get_owned_doc(db, "tasks", task_id, owner_id_of(_user), "Task")
     return _doc_to_task(doc)
 
 
@@ -472,13 +470,16 @@ async def create_task(
     ``projects`` (names per project), ``client_ids`` and the legacy scalars
     ``project_name``/``client_id``/``client_name`` (mirroring the primary) are
     fetched from the project documents automatically.  Files are uploaded to GCS
-    under ``tasks/<task_id>/<original_filename>``.
+    under ``<owner_id>/tasks/<task_id>/<original_filename>``.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
 
     # Fetch the projects and denormalise their fields
     project_fields = build_project_fields(
-        db, _require_project_ids(_parse_form_project_ids(project_ids), project_id)
+        db,
+        _require_project_ids(_parse_form_project_ids(project_ids), project_id),
+        owner_id,
     )
 
     # Allocate the document ID up-front so we can use it in GCS paths
@@ -487,6 +488,7 @@ async def create_task(
 
     # Normalise empty string parent_task_id to None
     resolved_parent_task_id: Optional[str] = parent_task_id if parent_task_id else None
+    _validate_parent_task(db, resolved_parent_task_id, owner_id)
 
     # Upload attachments to GCS
     attachment_records: list[dict] = []
@@ -494,13 +496,14 @@ async def create_task(
         if not upload.filename:
             continue
         file_bytes = await upload.read()
-        blob_name = f"tasks/{task_id}/{upload.filename}"
+        blob_name = owned_blob_name(owner_id, "tasks", task_id, upload.filename)
         content_type = upload.content_type or "application/octet-stream"
-        public_url = upload_file(file_bytes, blob_name, content_type)
-        attachment_records.append({"name": upload.filename, "gcs_url": public_url})
+        upload_file(file_bytes, blob_name, content_type)
+        attachment_records.append({"name": upload.filename, "blob_name": blob_name})
 
     now = _now_sgt()
     task_data = {
+        "owner_id": owner_id,
         "title": title,
         "description": description,
         **project_fields,
@@ -541,10 +544,12 @@ async def create_tasks_bulk(
 
     Returns the created tasks in the order they were given.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
     project_fields = build_project_fields(
-        db, _require_project_ids(payload.project_ids, payload.project_id)
+        db, _require_project_ids(payload.project_ids, payload.project_id), owner_id
     )
+    _validate_parent_task(db, payload.parent_task_id, owner_id)
 
     titles: list[str] = []
     seen: set[str] = set()
@@ -573,6 +578,7 @@ async def create_tasks_bulk(
             batch.set(
                 doc_ref,
                 {
+                    "owner_id": owner_id,
                     "title": title,
                     "description": "",
                     **project_fields,
@@ -622,16 +628,12 @@ async def update_task(
       attachment list.
     - ``datetime_updated`` is always refreshed on a successful update.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref = db.collection("tasks").document(task_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND,
-            detail=f"Task '{task_id}' not found.",
-        )
+    doc = get_owned_doc(db, "tasks", task_id, owner_id, "Task")
+    doc_ref = doc.reference
 
-    existing_data = doc.to_dict()
+    existing_data = doc.to_dict() or {}
     updates: dict = {}
 
     if title is not None:
@@ -659,13 +661,19 @@ async def update_task(
             ]
 
     if new_project_ids is not None:
-        project_fields = build_project_fields(db, new_project_ids)
-        _check_removed_projects_unused(db, task_id, current_projects, new_project_ids)
+        project_fields = build_project_fields(db, new_project_ids, owner_id)
+        _check_removed_projects_unused(
+            db, task_id, owner_id, current_projects, new_project_ids
+        )
         updates.update(project_fields)
 
     if parent_task_id is not None:
         # Allow callers to clear parent by passing the literal string "null"
-        updates["parent_task_id"] = None if parent_task_id.lower() == "null" else parent_task_id
+        if parent_task_id.lower() == "null":
+            updates["parent_task_id"] = None
+        else:
+            _validate_parent_task(db, parent_task_id, owner_id)
+            updates["parent_task_id"] = parent_task_id
 
     if status is not None:
         updates["status"] = status
@@ -683,10 +691,10 @@ async def update_task(
         if not upload.filename:
             continue
         file_bytes = await upload.read()
-        blob_name = f"tasks/{task_id}/{upload.filename}"
+        blob_name = owned_blob_name(owner_id, "tasks", task_id, upload.filename)
         content_type = upload.content_type or "application/octet-stream"
-        public_url = upload_file(file_bytes, blob_name, content_type)
-        new_attachment_records.append({"name": upload.filename, "gcs_url": public_url})
+        upload_file(file_bytes, blob_name, content_type)
+        new_attachment_records.append({"name": upload.filename, "blob_name": blob_name})
 
     if new_attachment_records:
         existing_attachments = existing_data.get("attachments", [])
@@ -711,27 +719,12 @@ async def delete_task(
     document from being removed.
     """
     db = get_firestore_client()
-    doc_ref = db.collection("tasks").document(task_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task '{task_id}' not found.",
-        )
+    owner_id = owner_id_of(_user)
+    doc = get_owned_doc(db, "tasks", task_id, owner_id, "Task")
+    doc_ref = doc.reference
 
-    data = doc.to_dict()
-    bucket_name = os.getenv("GCS_BUCKET_NAME", "")
-
-    # Delete GCS attachments
-    for attachment in data.get("attachments", []):
-        gcs_url = attachment.get("gcs_url", "")
-        if not gcs_url:
-            continue
-        blob_name = _blob_name_from_url(gcs_url, bucket_name)
-        try:
-            delete_file(blob_name)
-        except Exception as exc:
-            logger.warning("Failed to delete GCS blob '%s': %s", blob_name, exc)
+    data = doc.to_dict() or {}
+    delete_attachments(data.get("attachments", []), owner_id, "tasks", task_id)
 
     # Delete Firestore document
     doc_ref.delete()

@@ -59,3 +59,24 @@ async def get_current_user(
         )
 
     return decoded
+
+
+def owner_id_of(user: dict) -> str:
+    """
+    Return the stable owner key for the signed-in user: the Google ``sub``.
+
+    Every document the app writes carries ``owner_id`` set from this, and every
+    read is scoped to it.  Keyed on ``sub`` rather than ``email`` because a
+    Google account's email can change while its ``sub`` never does.
+
+    Raises HTTP 401 when the payload carries no ``sub`` — a token without one
+    cannot be scoped to anybody, so it must not be allowed to read anything.
+    """
+    sub = (user or {}).get("sub")
+    if not isinstance(sub, str) or not sub:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session token has no user id. Please sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return sub

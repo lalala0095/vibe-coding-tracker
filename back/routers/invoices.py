@@ -8,12 +8,18 @@ import pytz
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from auth import get_current_user
+from auth import get_current_user, owner_id_of
 from routers.sessions import compute_effective_hours, invoice_claims
 from routers.tasks import task_client_ids, task_project_ids, task_projects
 from routers.settings import get_invoice_settings
 from routers.trackers import _tracker_hours
-from services.firestore_service import get_firestore_client
+from services.firestore_service import (
+    get_firestore_client,
+    get_owned_doc,
+    get_owned_docs,
+    owned_query,
+    require_owned_ids,
+)
 from services.invoice_service import (
     assign_invoice_number,
     build_bill_to,
@@ -342,38 +348,67 @@ def _clear_sentinel(value: str) -> Optional[str]:
     return None if value.lower() == "null" else value
 
 
-def _fetch_client(db, client_id: str) -> dict:
-    """Fetch a client document. Raises 404 if not found."""
-    doc = db.collection("clients").document(client_id).get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Client '{client_id}' not found.",
-        )
-    return doc.to_dict() or {}
+def _fetch_client(db, client_id: str, owner_id: str) -> dict:
+    """Fetch one of the caller's clients. Raises 404 if missing or not theirs."""
+    return get_owned_doc(db, "clients", client_id, owner_id, "Client").to_dict() or {}
 
 
-def _fetch_projects(db, project_ids) -> dict:
+def _fetch_projects(db, project_ids, owner_id: str) -> dict:
     """
-    Fetch several projects in one round trip.
+    Fetch several of the caller's projects in one round trip.
 
     Keyed by project id so the line builder can resolve rates without a
-    Firestore read per line.  Missing projects are simply absent from the map.
+    Firestore read per line.  Missing projects — and any not owned by the
+    caller — are simply absent from the map.
     """
-    unique_ids = [pid for pid in dict.fromkeys(project_ids) if pid]
-    if not unique_ids:
-        return {}
+    return get_owned_docs(db, "projects", project_ids, owner_id)
 
-    refs = [db.collection("projects").document(pid) for pid in unique_ids]
-    projects: dict = {}
-    for snapshot in db.get_all(refs):
-        if snapshot.exists:
-            projects[snapshot.id] = snapshot.to_dict() or {}
-    return projects
+
+def _validate_line_refs(
+    db,
+    owner_id: str,
+    lines,
+    existing_lines=None,
+    extra_project_ids=(),
+) -> None:
+    """
+    404 unless every document a request's lines reference is the caller's.
+
+    Checked: each line's ``task_id``, ``project_id``, ``tracker_id`` and
+    ``session_ids``, plus ``extra_project_ids`` (``InvoiceCreate.project_ids``).
+    A missing id and another user's id get the same 404.
+
+    Ids already on the stored invoice (``existing_lines``) are exempt: they
+    were checked when they were added, and a line is a snapshot that must stay
+    saveable after its task, tracker or entries are deleted.  Nothing read or
+    written on the strength of a reference skips the owner check anyway — the
+    claim sync and the project-name lookup are both owner-scoped.
+    """
+    known: dict = {"tasks": set(), "projects": set(), "trackers": set(), "sessions": set()}
+    for line in existing_lines or []:
+        if not isinstance(line, dict):
+            continue
+        known["tasks"].add(line.get("task_id"))
+        known["projects"].add(line.get("project_id"))
+        known["trackers"].add(line.get("tracker_id"))
+        known["sessions"].update(line.get("session_ids") or [])
+
+    wanted: dict = {"tasks": [], "projects": list(extra_project_ids or []), "trackers": [], "sessions": []}
+    for line in lines:
+        wanted["tasks"].append(line.get("task_id"))
+        wanted["projects"].append(line.get("project_id"))
+        wanted["trackers"].append(line.get("tracker_id"))
+        wanted["sessions"].extend(line.get("session_ids") or [])
+
+    labels = {"tasks": "Task", "projects": "Project", "trackers": "Tracker", "sessions": "Session"}
+    for collection, ids in wanted.items():
+        new_ids = [i for i in ids if i and i not in known[collection]]
+        require_owned_ids(db, collection, new_ids, owner_id, labels[collection])
 
 
 def _tracker_candidates(
     db,
+    owner_id: str,
     client_id: str,
     project_filter: set,
     period_start: str,
@@ -397,11 +432,10 @@ def _tracker_candidates(
         ``[(tracker_doc, tracker_data, [task_data, ...]), ...]`` with the tasks
         in the order the tracker lists them.
     """
-    docs = list(
-        db.collection("trackers")
-        .order_by("start_time", direction="DESCENDING")
-        .stream()
-    )
+    # Owner filter in Firestore, sort in Python: owner_id == plus order_by
+    # would need a composite index.
+    docs = list(owned_query(db, "trackers", owner_id).stream())
+    docs.sort(key=lambda d: (d.to_dict() or {}).get("start_time", ""), reverse=True)
 
     candidates = []
     for doc in docs:
@@ -422,13 +456,7 @@ def _tracker_candidates(
     ordered_ids = [
         ref.get("task_id", "") for _, _, task_refs in candidates for ref in task_refs
     ]
-    unique_ids = [tid for tid in dict.fromkeys(ordered_ids) if tid]
-    tasks: dict = {}
-    if unique_ids:
-        refs = [db.collection("tasks").document(tid) for tid in unique_ids]
-        for snapshot in db.get_all(refs):
-            if snapshot.exists:
-                tasks[snapshot.id] = snapshot.to_dict() or {}
+    tasks = get_owned_docs(db, "tasks", ordered_ids, owner_id)
 
     resolved = []
     for doc, data, task_refs in candidates:
@@ -541,7 +569,7 @@ def _claim_labels(claim_ids, claim_numbers) -> list:
     return labels
 
 
-def _current_claims(db, collection: str, doc_ids) -> dict:
+def _current_claims(db, collection: str, doc_ids, owner_id: str) -> dict:
     """
     Return ``{doc_id: (invoice_ids, invoice_numbers)}`` for live documents.
 
@@ -554,17 +582,14 @@ def _current_claims(db, collection: str, doc_ids) -> dict:
 
     Sessions and trackers carry the identical claim shape, so one reader serves
     both collections.
-    """
-    unique_ids = [did for did in dict.fromkeys(doc_ids) if did]
-    if not unique_ids:
-        return {}
 
-    refs = [db.collection(collection).document(did) for did in unique_ids]
-    claims: dict = {}
-    for snapshot in db.get_all(refs):
-        if snapshot.exists:
-            claims[snapshot.id] = invoice_claims(snapshot.to_dict() or {})
-    return claims
+    Only the caller's documents are returned, so an id belonging to another
+    user is treated exactly like a deleted one and never written to.
+    """
+    return {
+        doc_id: invoice_claims(data)
+        for doc_id, data in get_owned_docs(db, collection, doc_ids, owner_id).items()
+    }
 
 
 def _claim_payload(ids, numbers) -> dict:
@@ -585,6 +610,7 @@ def _claim_payload(ids, numbers) -> dict:
 def _sync_claim_links(
     db,
     collection: str,
+    owner_id: str,
     invoice_id: str,
     invoice_number: Optional[str],
     set_ids,
@@ -608,6 +634,7 @@ def _sync_claim_links(
         db: Firestore client.
         collection: ``"sessions"`` or ``"trackers"`` — both carry the same
             claim fields, so the reconciliation is identical either way.
+        owner_id: The caller's ``sub``.  Only their documents are touched.
         invoice_id: The invoice being reconciled.  Added for ``set_ids`` and
             removed for ``clear_ids``, so it is always the real id — including
             on delete, where nothing is added.
@@ -619,7 +646,7 @@ def _sync_claim_links(
     clear_ids = [did for did in dict.fromkeys(clear_ids) if did and did not in set_ids]
 
     # One bulk read serves both the existence filter and the current claims.
-    claims = _current_claims(db, collection, set_ids + clear_ids)
+    claims = _current_claims(db, collection, set_ids + clear_ids, owner_id)
     operations = []
 
     for did in set_ids:
@@ -655,17 +682,21 @@ def _sync_claim_links(
 
 def _sync_session_links(
     db,
+    owner_id: str,
     invoice_id: str,
     invoice_number: Optional[str],
     set_ids,
     clear_ids,
 ) -> None:
     """Reconcile this invoice's back-links on the time entries it bills."""
-    _sync_claim_links(db, "sessions", invoice_id, invoice_number, set_ids, clear_ids)
+    _sync_claim_links(
+        db, "sessions", owner_id, invoice_id, invoice_number, set_ids, clear_ids
+    )
 
 
 def _sync_tracker_links(
     db,
+    owner_id: str,
     invoice_id: str,
     invoice_number: Optional[str],
     set_ids,
@@ -678,7 +709,9 @@ def _sync_tracker_links(
     nothing to warn about it — the preview reads these claims exactly as it
     reads a time entry's.
     """
-    _sync_claim_links(db, "trackers", invoice_id, invoice_number, set_ids, clear_ids)
+    _sync_claim_links(
+        db, "trackers", owner_id, invoice_id, invoice_number, set_ids, clear_ids
+    )
 
 
 def _line_session_ids(lines) -> list:
@@ -884,16 +917,13 @@ def _doc_to_invoice(doc) -> InvoiceResponse:
     )
 
 
-def _fetch_invoice_ref(db, invoice_id: str):
-    """Return an invoice doc ref and its snapshot. Raises 404 if not found."""
-    doc_ref = db.collection("invoices").document(invoice_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Invoice '{invoice_id}' not found.",
-        )
-    return doc_ref, doc
+def _fetch_invoice_ref(db, invoice_id: str, owner_id: str):
+    """
+    Return one of the caller's invoices as (doc ref, snapshot).
+    Raises 404 if it does not exist or is not theirs.
+    """
+    doc = get_owned_doc(db, "invoices", invoice_id, owner_id, "Invoice")
+    return doc.reference, doc
 
 
 def _validate_status(value: str) -> str:
@@ -1108,14 +1138,13 @@ async def list_invoices(
     - ``status``    – filter by ``draft``, ``sent``, ``paid``, or ``void``.
     """
     db = get_firestore_client()
-    query = db.collection("invoices")
+    query = owned_query(db, "invoices", owner_id_of(_user))
 
-    # Apply a single equality filter in Firestore and sort in Python, so no
+    # Apply only equality filters in Firestore and sort in Python, so no
     # composite index is needed.
     if client_id is not None:
-        docs = list(query.where("client_id", "==", client_id).stream())
-    else:
-        docs = list(query.stream())
+        query = query.where("client_id", "==", client_id)
+    docs = list(query.stream())
 
     if status_filter is not None:
         docs = [doc for doc in docs if (doc.to_dict() or {}).get("status") == status_filter]
@@ -1131,7 +1160,7 @@ async def get_invoice(
 ) -> InvoiceResponse:
     """Return a single invoice by its Firestore document ID."""
     db = get_firestore_client()
-    _, doc = _fetch_invoice_ref(db, invoice_id)
+    _, doc = _fetch_invoice_ref(db, invoice_id, owner_id_of(_user))
     return _doc_to_invoice(doc)
 
 
@@ -1175,14 +1204,19 @@ async def preview_invoice(
     invoice keeps listing it in ``lines`` and keeps billing it, while the entry's
     back-link reports only the most recent claimant.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    settings_data = get_invoice_settings(db)
-    client_data = _fetch_client(db, payload.client_id)
+    settings_data = get_invoice_settings(db, owner_id)
+    client_data = _fetch_client(db, payload.client_id, owner_id)
+    if payload.for_invoice_id:
+        _fetch_invoice_ref(db, payload.for_invoice_id, owner_id)
 
-    # One equality filter in Firestore, everything else in Python — the same
+    # Equality filters only in Firestore, everything else in Python — the same
     # approach sessions.py uses to stay off composite indexes.
     docs = list(
-        db.collection("sessions").where("client_id", "==", payload.client_id).stream()
+        owned_query(db, "sessions", owner_id)
+        .where("client_id", "==", payload.client_id)
+        .stream()
     )
 
     project_filter = set(payload.project_ids or [])
@@ -1263,6 +1297,7 @@ async def preview_invoice(
     tracker_candidates = (
         _tracker_candidates(
             db,
+            owner_id,
             payload.client_id,
             project_filter,
             payload.period_start,
@@ -1280,6 +1315,7 @@ async def preview_invoice(
             _single_project_id(tasks, payload.client_id, project_filter)
             for _, _, tasks in tracker_candidates
         ],
+        owner_id,
     )
     settings_default_rate = settings_data.get("default_rate")
 
@@ -1426,9 +1462,10 @@ async def create_invoice(
       the same ``"null"`` sentinel, so an explicitly empty value is never
       replaced by a default.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    settings_data = get_invoice_settings(db)
-    client_data = _fetch_client(db, payload.client_id)
+    settings_data = get_invoice_settings(db, owner_id)
+    client_data = _fetch_client(db, payload.client_id, owner_id)
 
     _validate_status(payload.status)
 
@@ -1463,20 +1500,22 @@ async def create_invoice(
         tax_percent = _value_or(settings_data, "default_tax_percent", 0.0)
 
     lines = _build_lines(payload.lines)
+    _validate_line_refs(db, owner_id, lines, extra_project_ids=payload.project_ids)
     money = compute_money(lines, discount_type, payload.discount_value, tax_percent)
     project_ids, project_names = _derive_projects(money["lines"], payload.project_ids)
     if project_ids and not any(project_names):
         # Fallback path: the ids came from the request, so resolve their names in
         # one bulk read rather than storing a list of blanks.
-        projects_by_id = _fetch_projects(db, project_ids)
+        projects_by_id = _fetch_projects(db, project_ids, owner_id)
         project_names = [
             (projects_by_id.get(pid) or {}).get("name", "") for pid in project_ids
         ]
 
-    invoice_number = assign_invoice_number(db, settings_data)
+    invoice_number = assign_invoice_number(db, owner_id, settings_data)
     now = _now_sgt()
 
     doc_data = {
+        "owner_id": owner_id,
         "invoice_number": invoice_number,
         "client_id": payload.client_id,
         "client_name": client_data.get("name", ""),
@@ -1520,6 +1559,7 @@ async def create_invoice(
 
     _sync_session_links(
         db,
+        owner_id,
         doc_ref.id,
         invoice_number,
         _line_session_ids(money["lines"]),
@@ -1527,6 +1567,7 @@ async def create_invoice(
     )
     _sync_tracker_links(
         db,
+        owner_id,
         doc_ref.id,
         invoice_number,
         _line_tracker_ids(money["lines"]),
@@ -1560,8 +1601,9 @@ async def update_invoice(
       ``client_name`` and ``bill_to``.  Off by default: both are snapshots and
       only an explicit request may move them.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
+    doc_ref, doc = _fetch_invoice_ref(db, invoice_id, owner_id)
     existing = doc.to_dict() or {}
 
     updates: dict = {}
@@ -1574,15 +1616,14 @@ async def update_invoice(
     # Read directly rather than through ``_fetch_client``, which raises 404 on
     # a missing client.  Deleting a client must not make its past invoices
     # unsaveable — snapshots exist precisely so an invoice outlives the record
-    # it was built from.  A missing client therefore leaves both fields
-    # untouched and the edit goes through.
+    # it was built from.  A missing client — or one that is not the caller's,
+    # which is treated identically — leaves both fields untouched and the edit
+    # goes through.
     if payload.refresh_client_snapshot:
         client_id = existing.get("client_id", "")
-        client_doc = (
-            db.collection("clients").document(client_id).get() if client_id else None
-        )
-        if client_doc is not None and client_doc.exists:
-            client_data = client_doc.to_dict() or {}
+        client_doc = get_owned_docs(db, "clients", [client_id], owner_id)
+        if client_id in client_doc:
+            client_data = client_doc[client_id]
             updates["client_name"] = client_data.get("name", "")
             updates["bill_to"] = build_bill_to(client_data)
 
@@ -1641,6 +1682,7 @@ async def update_invoice(
         if payload.lines is not None
         else existing.get("lines", []) or []
     )
+    _validate_line_refs(db, owner_id, lines, existing.get("lines", []) or [])
     discount_type = updates.get("discount_type", existing.get("discount_type"))
     # _value_or, not .get: a document damaged before the guard was fixed holds
     # a present null here, and a PUT must repair it rather than trip over it.
@@ -1680,6 +1722,7 @@ async def update_invoice(
     old_session_ids = _line_session_ids(existing.get("lines", []) or [])
     _sync_session_links(
         db,
+        owner_id,
         invoice_id,
         existing.get("invoice_number", ""),
         new_session_ids,
@@ -1690,6 +1733,7 @@ async def update_invoice(
     old_tracker_ids = _line_tracker_ids(existing.get("lines", []) or [])
     _sync_tracker_links(
         db,
+        owner_id,
         invoice_id,
         existing.get("invoice_number", ""),
         new_tracker_ids,
@@ -1718,8 +1762,9 @@ async def update_invoice_status(
     and a deposit, a write-off or a paid-in-cash invoice would all fight a
     derived value.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
+    doc_ref, doc = _fetch_invoice_ref(db, invoice_id, owner_id)
     existing = doc.to_dict() or {}
 
     updates = {
@@ -1766,8 +1811,9 @@ async def create_payment(
     - Pass ``notes="null"`` to store no note.  ``received_currency`` does *not*
       take that sentinel and rejects it — see ``_validate_received_currency``.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
+    doc_ref, doc = _fetch_invoice_ref(db, invoice_id, owner_id)
     existing = doc.to_dict() or {}
 
     # Validate everything before touching the document, so a bad request 400s
@@ -1778,7 +1824,7 @@ async def create_payment(
 
     invoice_currency = _value_or(existing, "currency", "")
     received_currency = _resolve_received_currency(
-        payload.received_currency, get_invoice_settings(db), invoice_currency
+        payload.received_currency, get_invoice_settings(db, owner_id), invoice_currency
     )
     notes = None if payload.notes is None else _clear_sentinel(payload.notes)
 
@@ -1823,8 +1869,9 @@ async def update_payment(
     - ``received_currency`` rejects that sentinel and ignores a blank string,
       leaving the stored currency in place: there is no "no currency" state.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
+    doc_ref, doc = _fetch_invoice_ref(db, invoice_id, owner_id)
     existing = doc.to_dict() or {}
 
     payments = _stored_payments(existing)
@@ -1868,8 +1915,9 @@ async def delete_payment(
     The derived figures are recomputed from what remains.  The status is not
     touched — deleting the last payment does not un-mark a paid invoice.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
+    doc_ref, doc = _fetch_invoice_ref(db, invoice_id, owner_id)
     existing = doc.to_dict() or {}
 
     payments = _stored_payments(existing)
@@ -1890,12 +1938,14 @@ async def delete_invoice(
     Only documents still linked to this invoice are cleared — any that have
     since been pulled onto another invoice keep that newer link.
     """
+    owner_id = owner_id_of(_user)
     db = get_firestore_client()
-    doc_ref, doc = _fetch_invoice_ref(db, invoice_id)
+    doc_ref, doc = _fetch_invoice_ref(db, invoice_id, owner_id)
     existing = doc.to_dict() or {}
 
     _sync_session_links(
         db,
+        owner_id,
         invoice_id,
         existing.get("invoice_number", ""),
         [],
@@ -1903,6 +1953,7 @@ async def delete_invoice(
     )
     _sync_tracker_links(
         db,
+        owner_id,
         invoice_id,
         existing.get("invoice_number", ""),
         [],

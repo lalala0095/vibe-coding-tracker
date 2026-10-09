@@ -157,7 +157,8 @@ export default function GoalModal({ goal, models, onClose, onDeleted, onUpdated 
                     {goal.attachments.map((att, i) => (
                       <li key={i}>
                         <a
-                          href={att.gcs_url}
+                          href={att.gcs_url ?? undefined}
+                          title={att.gcs_url ? undefined : 'Link unavailable, reload to retry'}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="inline-flex items-center gap-2 text-sm text-violet-400
