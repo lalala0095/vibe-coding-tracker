@@ -16,6 +16,7 @@ import { parseTaskList } from '../lib/taskPaste';
 import { renderTrackerName } from '../lib/trackerName';
 import { recentWeekStarts } from '../lib/week';
 import { summariseWeeks } from '../lib/weeklySummary';
+import { filterTrackersByProject } from '../lib/trackerFilter';
 import { formatElapsed } from '../lib/datetime';
 import { useNow } from '../lib/useNow';
 import { taskHasProject, taskProjectsLabel } from '../lib/taskProjectRefs';
@@ -102,6 +103,43 @@ function elapsedHours(tracker: Tracker): number | null {
   if (Number.isNaN(start) || Number.isNaN(end)) return null;
   return Math.round(((end - start) / 3600000) * 100) / 100;
 }
+
+// ── Client/Project filter persistence ─────────────────────────────────────────
+
+const FILTER_STORAGE_KEY = 'trackers.projectFilter';
+
+interface StoredFilter { clientId: string; projectId: string }
+
+// Best-effort: private windows and blocked storage throw, and a garbled value
+// is simply ignored.
+function readStoredFilter(): StoredFilter {
+  try {
+    const raw = localStorage.getItem(FILTER_STORAGE_KEY);
+    if (!raw) return { clientId: '', projectId: '' };
+    const parsed: unknown = JSON.parse(raw);
+    const obj = (parsed && typeof parsed === 'object' ? parsed : {}) as Record<string, unknown>;
+    return {
+      clientId: typeof obj.clientId === 'string' ? obj.clientId : '',
+      projectId: typeof obj.projectId === 'string' ? obj.projectId : '',
+    };
+  } catch {
+    return { clientId: '', projectId: '' };
+  }
+}
+
+function writeStoredFilter(filter: StoredFilter) {
+  try {
+    if (!filter.clientId && !filter.projectId) localStorage.removeItem(FILTER_STORAGE_KEY);
+    else localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(filter));
+  } catch {
+    // Not remembered this time; the filter itself still works.
+  }
+}
+
+// Same field style as the Client/Project filter on the Time Entries page.
+const FILTER_FIELD =
+  'w-full min-w-0 bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-2.5 py-1.5 text-sm ' +
+  'focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent disabled:opacity-50';
 
 // ── Tracker Form Modal ────────────────────────────────────────────────────────
 
@@ -1227,6 +1265,15 @@ export default function TrackersPage() {
 
   const [filterActive, setFilterActive] = useState<'all' | 'active' | 'done'>('all');
 
+  // Client/Project filter, remembered per browser. Stored ids are checked
+  // against the loaded lists below, so a deleted client or project drops out.
+  const [filterClientId, setFilterClientId] = useState(() => readStoredFilter().clientId);
+  const [filterProjectId, setFilterProjectId] = useState(() => readStoredFilter().projectId);
+  // True once tasks, clients and projects have all loaded. Until then the
+  // filter cannot be applied honestly (or its stored ids validated).
+  const [lookupsLoaded, setLookupsLoaded] = useState(false);
+  const [lookupError, setLookupError] = useState('');
+
   const [selectedTracker, setSelectedTracker] = useState<Tracker | null>(null);
 
   const [modal, setModal] = useState<ModalState>({ kind: 'none' });
@@ -1238,17 +1285,31 @@ export default function TrackersPage() {
   const fetchData = useCallback(async () => {
     setLoading(true);
     setError('');
+    setLookupError('');
     try {
-      const [trackersData, tasksData, clientsData, projectsData] = await Promise.all([
+      // Settled one by one: the trackers are the list, and only their failure
+      // is fatal. Tasks, clients and projects feed the Client/Project filter
+      // and the modals; losing one of them disables the filter and says so,
+      // but leaves the tracker list usable.
+      const [trackersRes, tasksRes, clientsRes, projectsRes] = await Promise.allSettled([
         getTrackers(),
         getTasks(),
         getClients(),
         getProjects(),
       ]);
-      setTrackers(trackersData);
-      setTasks(tasksData);
-      setClients(clientsData);
-      setProjects(projectsData);
+      if (trackersRes.status === 'rejected') throw trackersRes.reason;
+      setTrackers(trackersRes.value);
+      if (tasksRes.status === 'fulfilled') setTasks(tasksRes.value);
+      if (clientsRes.status === 'fulfilled') setClients(clientsRes.value);
+      if (projectsRes.status === 'fulfilled') setProjects(projectsRes.value);
+      const lookupsOk =
+        tasksRes.status === 'fulfilled' &&
+        clientsRes.status === 'fulfilled' &&
+        projectsRes.status === 'fulfilled';
+      setLookupsLoaded(lookupsOk);
+      if (!lookupsOk) {
+        setLookupError('Clients, projects or tasks could not be loaded, so the Client and Project filters are off.');
+      }
       // Kept out of the Promise.all: the naming template is a convenience, and
       // losing it must not cost the page its trackers or block creating one.
       try {
@@ -1405,11 +1466,65 @@ export default function TrackersPage() {
     setSelectedTracker(t);
   }
 
-  const filteredTrackers = trackers.filter(t => {
-    if (filterActive === 'active') return !t.end_time;
-    if (filterActive === 'done') return !!t.end_time;
-    return true;
-  });
+  // Drop stored (or stale) ids that no longer exist, and a project that does
+  // not belong to the chosen client. Only once the lists have really loaded —
+  // an empty list mid-load would wipe a perfectly good selection.
+  useEffect(() => {
+    if (!lookupsLoaded) return;
+    if (filterClientId && !clients.some(c => c.id === filterClientId)) {
+      setFilterClientId('');
+      return;
+    }
+    if (filterProjectId) {
+      const project = projects.find(p => p.id === filterProjectId);
+      if (!project || (filterClientId && project.client_id !== filterClientId)) {
+        setFilterProjectId('');
+      }
+    }
+  }, [lookupsLoaded, clients, projects, filterClientId, filterProjectId]);
+
+  useEffect(() => {
+    writeStoredFilter({ clientId: filterClientId, projectId: filterProjectId });
+  }, [filterClientId, filterProjectId]);
+
+  // Choosing a client narrows the project choices; a project that no longer
+  // fits is reset rather than silently kept.
+  function changeFilterClient(clientId: string) {
+    setFilterClientId(clientId);
+    if (clientId && filterProjectId) {
+      const project = projects.find(p => p.id === filterProjectId);
+      if (project?.client_id !== clientId) setFilterProjectId('');
+    }
+  }
+
+  function clearFilters() {
+    setFilterClientId('');
+    setFilterProjectId('');
+    setFilterActive('all');
+  }
+
+  const filterProjects = filterClientId
+    ? projects.filter(p => p.client_id === filterClientId)
+    : projects;
+
+  // Applied only when the lookups loaded; otherwise the filter is shown as off
+  // (with the reason) instead of hiding every tracker.
+  const projectFilterOn = lookupsLoaded && !!(filterClientId || filterProjectId);
+
+  const filteredTrackers = useMemo(() => {
+    const byStatus = trackers.filter(t => {
+      if (filterActive === 'active') return !t.end_time;
+      if (filterActive === 'done') return !!t.end_time;
+      return true;
+    });
+    if (!projectFilterOn) return byStatus;
+    return filterTrackersByProject(byStatus, {
+      tasks,
+      projects,
+      clientId: filterClientId,
+      projectId: filterProjectId,
+    });
+  }, [trackers, filterActive, projectFilterOn, tasks, projects, filterClientId, filterProjectId]);
 
   // Ticks the list's running totals while any tracker is still running.
   const now = useNow(trackers.some(t => !t.end_time));
@@ -1567,6 +1682,45 @@ export default function TrackersPage() {
           </div>
         </div>
 
+        {/* Client / Project filter */}
+        <div className="flex flex-col gap-2 px-4 pt-2.5">
+          <div className="flex gap-2">
+            <select
+              aria-label="Filter by client"
+              value={filterClientId}
+              onChange={e => changeFilterClient(e.target.value)}
+              disabled={!lookupsLoaded}
+              className={FILTER_FIELD}
+            >
+              <option value="">All clients</option>
+              {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+            <select
+              aria-label="Filter by project"
+              value={filterProjectId}
+              onChange={e => setFilterProjectId(e.target.value)}
+              disabled={!lookupsLoaded}
+              className={FILTER_FIELD}
+            >
+              <option value="">All projects</option>
+              {filterProjects.map(p => (
+                <option key={p.id} value={p.id}>
+                  {/* Names repeat across clients, so the client is shown until one is chosen. */}
+                  {filterClientId ? p.name : `${p.client_name} / ${p.name}`}
+                </option>
+              ))}
+            </select>
+          </div>
+          {lookupError && (
+            <p className="text-xs text-amber-300">
+              {lookupError}{' '}
+              <button onClick={fetchData} className="text-blue-400 hover:text-blue-300 underline transition-colors">
+                Retry
+              </button>
+            </p>
+          )}
+        </div>
+
         {/* Filters */}
         <div className="flex gap-1 px-4 py-2.5 border-b border-slate-800/60">
           {(['all', 'active', 'done'] as const).map(f => (
@@ -1590,6 +1744,16 @@ export default function TrackersPage() {
             <div className="p-6 text-sm text-slate-500">Loading…</div>
           ) : error ? (
             <div className="p-6 text-sm text-red-400">{error}</div>
+          ) : filteredTrackers.length === 0 && projectFilterOn && trackers.length > 0 ? (
+            <div className="p-6 text-sm text-slate-500 flex flex-col items-start gap-2">
+              <span>No trackers match these filters.</span>
+              <button
+                onClick={clearFilters}
+                className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+              >
+                Clear filters
+              </button>
+            </div>
           ) : filteredTrackers.length === 0 ? (
             <div className="p-6 text-sm text-slate-500">
               {filterActive === 'all' ? 'No trackers yet. Create one!' : 'No trackers here.'}
